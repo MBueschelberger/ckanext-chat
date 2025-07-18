@@ -87,15 +87,53 @@ ckanext.chat.completion_url="https://your-subscription.openai.azure.com/"
 ckanext.chat.deployment="gpt-4o"
 ckanext.chat.api_token="your-api-token"
 ```
+## Timeouts
+To not run into api call timeouts the proxy infromt of ckan must be set to allow long running api calls for nginx
+```conf
+proxy_connect_timeout 3600s;
+proxy_read_timeout 3600s;
+proxy_send_timeout 3000s;
+send_timeout 3000;
+```
 
+for production if ure using the official docker containers of ckan the harakiri options must be set. For this edit the start_ckan.sh script:
+```bash
+UWSGI_OPTS="--socket /tmp/uwsgi.sock \
+            --wsgi-file /srv/app/wsgi.py \
+            --module wsgi:application \
+            --http 0.0.0.0:5000 \
+            --master --enable-threads \
+            --lazy-apps \
+            -p 2 -L -b 32768 --vacuum \
+            --harakiri-verbose \
+            --socket-timeout $UWSGI_HARAKIRI \
+            --harakiri $UWSGI_HARAKIRI \
+            --http-timeout $UWSGI_HARAKIRI"
+```
+set in.env
+```bash
+UWSGI_HARAKIRI="3000"
+```
+
+## Milvus Rag
+if your also setup an Milvus vector database for rag search of documents or alike there is options you can set
+```ini
+ckanext.chat.embedding_mode=<embedding model name to request from the embedding api>
+ckanext.chat.embedding_api=<api endpoint to send text to and to return an embeding>
+ckanext.chat.milvus_url=<url to milvus server>
+ckanext.chat.collection_name=<name of milvus collection
+```
+.
+You might need to lookup and change the exact embedding api generation because no api standard applies!
+If you dont set this options the literature_search agent will rely on the package_search action!
 
 ## Developer installation
 
 To install ckanext-csvtocsvw for development, activate your CKAN virtualenv and
 do:
 ```bash
-git clone https://github.com/Mat-O-Lab/ckanext-csvtocsvw.git
-cd ckanext-csvtocsvw
+git clone https://github.com/Mat-O-Lab/ckanext-chat.git
+cd ckanext-chat
 python setup.py develop
 pip install -r dev-requirements.txt
 ```

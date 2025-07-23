@@ -58,7 +58,7 @@ rag_model_settings = OpenAIModelSettings(
     # openai_reasoning_effort= "low"
 )
 model = OpenAIModel(
-    "gpt-4o",
+    "gpt-4o-mini",
     provider=AzureProvider(
         azure_endpoint=toolkit.config.get(
             "ckanext.chat.completion_url", "https://your.chat.api"
@@ -295,7 +295,7 @@ doc_prompt = (
 # --------------------- Updated Front Agent ---------------------
 front_agent_prompt = (
 "You are a coordinator agent.\\n"
-"- For any question not directly related to CKAN entities (datasets, resources, organizations), begin with `literature_search`.\\n"
+"- For any question not directly related to CKAN entities (datasets (also called packages), resources, organizations), begin with `literature_search`.\\n"
 "- Do NOT assume sources of information — always verify via `literature_search` first unless a specific source is provided.\\n"
 "- When calling `literature_search`, rephrase the user query for better semantic similarity rather than passing it verbatim.\\n"
 "- If the user asks a specific question, apply `literature_analyse` to each result from `literature_search` and use the returned links (ending in `/highlight/<start:int>/<end:int>`) to cite relevant evidence.\\n"

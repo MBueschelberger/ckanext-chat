@@ -135,6 +135,11 @@ class Deps:
     #file: Optional[TextResource] = None
 
 @dataclass
+class StringSlice:
+    start: int
+    end: int
+
+@dataclass
 class TextSlice:
     url: HttpUrl
     text: str
@@ -196,6 +201,8 @@ class TextResource:
 class VectorMeta(BaseModel):
     id: int
     # chunk_id: Optional[int] = None
+    start: Optional[int] = None
+    end: Optional[int] = None
     # chunks: Optional[HttpUrl] = None
     dataset_id: Optional[str] = None
     # dataset_url: Optional[HttpUrl] = None
@@ -216,6 +223,7 @@ class LitResult(BaseModel):
     title: str = ""
     summary: str = ""
     authors: str = ""
+    string_slices: Optional[list[StringSlice]]
     source: Optional[HttpUrl] = None
     #view_url: Optional[list[HttpUrl]] = None
 
@@ -246,6 +254,7 @@ rag_prompt = (
     "You perform literature retrieval using a vector store and return scientific citations in markdown format.\n"
     "- Use rag_search with the original question.\n"
     "- Aggregate results by `source` into LitResult objects. Use the source field in the vector meta data.\n"
+    "- Fill in start and end of RagHit.entities of the rag_search into the list of string_slices of the matching LitResult objects if possible.\n"
     "- For each source, return a markdown citation in the format: [1](url)\n"
     "- Add a summary why the source is relevant.\n"
     "- Retry search if fewer than N distinct sources are returned.\n"
@@ -257,8 +266,8 @@ doc_prompt = (
     "Role:\n\n"
     "You are a document analysis agent tasked with answering a question based on a long document `doc`. "
     "Your goal is to find and cite the most relevant passages from anywhere in the document — not just the beginning — "
-    "using an adaptive strategy like a human researcher would.\n\n"
-
+    "using an adaptive strategy like a human researcher would.\n"
+    "Try to precise the relevant text_slice by calling 'get_text_slice' and use the returned text_slice if possible. Never change the text_slice.url it generated o point to a document view page that highlights text_slice in th overall document.\n\n"
     "Instructions:\n\n"
     "1. Begin by searching for a **Table of Contents** (ToC) or **summary sections**.\n"
     "   - Use `get_text_slice(doc, offset=0, length=10000)` to fetch the beginning for this purpose.\n"
@@ -275,6 +284,7 @@ doc_prompt = (
     "   - Never return a passage that is covering the text of the table of contents, if not told so. Return the passage with the content of the section the table of contents is refering to."
     "   - Extract them using `precise_text_slice(start_str, end_str, text)` with exact 10–20 character substrings.\n"
     "   - Record them as `text_slice` objects.\n\n"
+    "   - You MUST use the the 'text_slice.url' to cite the relevant passages in your answer!"
 
     "4. Write your answer:\n"
     "   - Synthesize the findings into a coherent response.\n"
@@ -297,10 +307,10 @@ front_agent_prompt = (
 "You are a coordinator agent.\\n"
 "- For any question not directly related to CKAN entities (datasets (also called packages), resources, organizations), begin with `literature_search`.\\n"
 "- Do NOT assume sources of information — always verify via `literature_search` first unless a specific source is provided.\\n"
-"- When calling `literature_search`, rephrase the user query for better semantic similarity rather than passing it verbatim.\\n"
-"- If the user asks a specific question, apply `literature_analyse` to each result from `literature_search` and use the returned links (ending in `/highlight/<start:int>/<end:int>`) to cite relevant evidence.\\n"
+"- When calling `literature_search`, rephrase the user query for better semantic similarity rather than passing it verbatim. Call the tool only once if enough hits are returned!\\n"
+"- Apply `literature_analyse` to a result from `literature_search` only if u cant formulate a comprehensive answer and use the returned links (ending in `/highlight/<start:int>/<end:int>`) to cite relevant evidence.\\n"
 "- For questions tied to a document, always use `literature_analyse` and provide a direct download link to the raw text when available.\\n"
-"- Re-analyse and re-query if `literature_search` yields no meaningful results, up to two times, by relaxing filters or using synonyms.\\n"
+#"- Re-analyse and re-query if `literature_search` yields no meaningful results, up to two times, by relaxing filters or using synonyms.\\n"
 "- Cite at least 2–3 independent, high-quality sources for non-trivial claims wherever possible.\\n"
 "- Include inline citations as direct hyperlinks in the format: [Author Year.](<highlight-link>), e.g., [Andersson 2001.](https://.../highlight/123/456). Do not use numbered references like [1] or [^1^]. If author/year is missing, use source name as link text.\\n"
 "- Use LaTeX math formatting with `$$` delimiters (no code boxes).\\n"
@@ -320,30 +330,30 @@ front_agent_prompt = (
 "Avoid Assumptions:\\n"
 "- Do not fabricate links, citations, or outputs. Only cite retrieved, verified material.\\n"
 "- Never guess formats, content, or metadata. Confirm all via actual tool results.\\n"
+"- NEVER change any data returned by tool call, especially urls!\n\n"
 "- Always prioritize clarity, traceability, and verifiability in responses.\\n"
 )
 
-# --------------------- Updated Research Agent ---------------------
 research_agent_prompt = (
 "You are a coordinator agent, designed to deeply analyze user questions and systematically extract insights through literature exploration and reporting.\\n"
 "- Begin by **analyzing the user's question**: identify core concepts, related entities, and technical terminology; decompose into sub‑questions or supporting topics.\\n"
-"- **Meta‑reasoning checkpoints**: after each major step (analysis, search, API call), summarize key findings, note open questions, and plan your next action.\\n"
-"- **Success criteria**: aim to reference at least 3 distinct, high‑quality sources for each non‑trivial claim before concluding.\\n"
+"- **Meta‑reasoning checkpoints**: after each major step (`literature_search`, `literature_analyse`, `ckan_run`), summarize key findings, note open questions, and plan your next action.\\n"
+"- **Success criteria**: aim to reference at least 5 distinct, high‑quality sources for each non‑trivial claim before concluding.\\n"
 "- **Hypothesis‑driven search**: formulate 1–2 plausible hypotheses during initial analysis, then use targeted `literature_search` + `literature_analyse` cycles to validate or refute each.\\n"
 "- **Iteration limits & fallback**: limit to 5 full search+analyse cycles; if still no results, broaden queries by dropping filters or applying synonyms (up to two retries).\\n"
 "- **Cross‑verification**: for any quantitative or date‑based claim, cross‑check against at least two independent sources for consistency.\\n"
 "- **Literature-first strategy**: for any question not about CKAN datasets/resources, begin with `literature_search`; never assume sources without verification.\\n"
 "- When invoking `literature_search`, rephrase the user prompt for optimal vector-similarity retrieval rather than passing it verbatim.\\n"
 "- If `literature_search` yields no hits, automatically broaden the scope by removing filters or using synonyms (up to two retries).\\n"
-"- Apply `literature_analyse` to each result from `literature_search` to extract precise answers; use returned links (`/highlight/<start:int>/<end:int>`) to cite evidence.\\n"
-"- Use the links returned by 'literature_analyse' to point to the passages most relavant in your answer. They usually end with /highlight/<start:int>/<end:int>.\n"
-"- Refine citations of relevant passaged by using 'literature_analyse' again to get the exact text passage and a link to it."
-"- **Output structure**: organize each response into the following sections, use proper markdown syntax as suggested:\n"
+"- You MUST apply `literature_analyse` to each result from `literature_search` to extract precise answers; use returned links (`/highlight/<start:int>/<end:int>`) to cite evidence.\\n"
+"- Use the links returned by 'literature_analyse' to point to the passages most relevant in your answer. They usually end with /highlight/<start:int>/<end:int>.\\n"
+"- Refine citations of relevant passages by using 'literature_analyse' again to get the exact text passage and a link to it.\\n"
+"- **Output structure**: organize each response into the following sections, use proper markdown syntax as suggested:\\n"
 "   Executive Summary: (<3 sentences)\\n"
-"   Detailed Findings Report:\n"
-"      - Use clear subsections (e.g., 2.1, 2.2, etc.) for each major theme or aspect discovered.\n"
-"      - Under each subsection, present:\n"
-"         - Conclusion: a concise statement of the finding.\n"
+"   Detailed Findings Report:\\n"
+"      - Use clear subsections (e.g., 2.1, 2.2, etc.) for each major theme or aspect discovered.\\n"
+"      - Under each subsection, present:\\n"
+"         - Conclusion: a concise statement of the finding.\\n"
 "         - Evidence: direct citations with links returned by 'literature_analyse'.\\n"
 "   Evidence & Citations: a numbered list of all sources referenced.\\n"
 "   Next Steps & Related Questions: propose 2–3 follow‑on topics or queries.\\n"
@@ -353,13 +363,13 @@ research_agent_prompt = (
 "- **Avoid assumptions**: do not fabricate sources, links, or data; base all statements on verified literature or user‑provided content.\\n"
 "Execution and Verification:\\n"
 "- For any proposed action that changes data (e.g., via CKAN), present your plan and request explicit user confirmation.\\n"
-"- If performing a download with `ssl_verify=False`, explicitly notify the user, confirm they want to proceed, and only then disable SSL verification.\n"
+"- NEVER change any data returned by tool call, especially urls!\\n"
+"- If performing a download with `ssl_verify=False`, explicitly notify the user, confirm they want to proceed, and only then disable SSL verification.\\n"
 "Guidelines:\\n"
 "- If a tool call (e.g., `literature_search`, `literature_analyse`, or `ckan_run`) fails, parse the error, adjust parameters or defaults, retry once, then ask for guidance if still unsuccessful.\\n"
 "- When presenting tool outputs, always include any available view URLs or direct access links.\\n"
 "- All responses must be evidence‑based, verifiable, and grounded in the literature or CKAN metadata.\\n"
 )
-
 # --------------------- System Prompt & Agent ---------------------
 
 ckan_agent_prompt = (
@@ -410,7 +420,7 @@ rag_agent = Agent(
     deps_type=Deps,
     output_type=LitSearchResult,
     system_prompt="".join(rag_prompt),
-    retries=3,
+    #retries=3,
     model_settings=rag_model_settings,
     # model_settings=OpenAIModelSettings(openai_reasoning_effort= "low")
 )
@@ -590,11 +600,12 @@ def extract_dataset_uuid(input_string: str) -> str:
     else:
         return None
 
-#@agent.tool_plain
-@rag_agent.tool_plain
+@agent.tool_plain
+@research_agent.tool_plain
+#@rag_agent.tool_plain
 async def get_resource_file_contents(
     resource_url: str,
-    ssl_verify=True,
+    ssl_verify=False,
 ) -> TextResource:
     """
     Retrieves the content of a resource stored in filetore, allows setting max_length of output and offset to extract a slice of content
@@ -609,7 +620,8 @@ async def get_resource_file_contents(
     try:
         resource = TextResource(url=resource_url)
         resource_id = extract_resource_uuid(resource_url)
-        
+        log.debug(ckan_url)
+        log.debug(resource_url)
         if ckan_url in resource_url and resource_id:
             storage_path = toolkit.config.get("ckan.storage_path", "/var/lib/ckan/default")
 
@@ -859,7 +871,8 @@ async def literature_search(
     return r.data.json()
 
 @agent.tool_plain
-async def literature_analyse(doc: TextResource, question: str, ssl_verify=True) -> list[str]:
+@research_agent.tool_plain
+async def literature_analyse(doc: TextResource, question: str, ssl_verify=False) -> list[str]:
     try:
         doc=await get_resource_file_contents(resource_url=str(doc.url),ssl_verify=ssl_verify)
     except Exception as e:
@@ -867,12 +880,7 @@ async def literature_analyse(doc: TextResource, question: str, ssl_verify=True) 
     prompt = (
         f"Analyze the provided TextResource to determine whether it contains an answer to the question below.\n\n"
         f"**Question:** {question}\n\n"
-        "Use an intelligent document navigation strategy:\n"
-        "- Identify a Table of Contents or structural headings to guide your search.\n"
-        "- Explore the full document as needed — do not rely only on the beginning.\n"
-        "- Extract exact passages that support your answer, and cite them clearly.\n\n"
-        "Return your response with inline citations and a concise conclusion."
-    )   
+    )
     try:
         r = await asyncio.wait_for(
             doc_agent.run(

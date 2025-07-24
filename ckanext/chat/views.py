@@ -13,6 +13,8 @@ from flask import Blueprint, current_app, jsonify, request
 from flask.views import MethodView
 from loguru import logger
 from pydantic_ai.messages import TextPart
+from pydantic_ai.usage import UsageLimits
+
 
 # from ckanext.chat.bot.agent import (Deps, async_agent_response,
 #                                     exception_to_model_response,
@@ -140,12 +142,14 @@ async def _agent_worker(prompt: str, history: str, user_id: str, research: bool 
             user_prompt=prompt,
             message_history=msg_history,
             deps=deps,
+            usage_limits=UsageLimits(request_limit=10,total_tokens_limit=1000000),
         )
     else:
         r = agent.run(
             user_prompt=prompt,
             message_history=msg_history,
             deps=deps,
+            usage_limits=UsageLimits(request_limit=5,total_tokens_limit=128000),
         )
 
     logger.debug(f"Worker done, result: {r}")

@@ -558,7 +558,7 @@ ckan.module("chat-module", function ($, _) {
 
         if (!chatHistory.length) {
           $.post("chat/ask", {
-            text: "Output only a 3-word title for this question: " + text,
+            text: "Output only a 3-word title for this question: " + text +". Return only the 3-word title as plain text, with no explanations, punctuation, or formatting.",
           })
             .done(function (data) {
               var label = self.getLastEntryText(data.response);

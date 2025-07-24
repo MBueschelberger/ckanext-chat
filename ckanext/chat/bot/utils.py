@@ -100,7 +100,19 @@ class FuncSignature(BaseModel):
 CKAN_ACTIONS: Dict[str, FuncSignature] = {}
 
 
-def get_ckan_action(action: str = "") -> FuncSignature:
+def get_ckan_actions() -> Dict[str,str]:
+    global CKAN_ACTIONS
+    if not CKAN_ACTIONS:
+        from ckan.logic import _actions
+        from ckan.logic.action.get import help_show
+
+        actions = [key for key in _actions.keys() if "_update" not in key]
+        for item in actions:
+            doc = help_show({}, {"name": item})
+            CKAN_ACTIONS[item] = FuncSignature(doc=doc).model_dump()
+    return {k: v["doc"].strip().splitlines()[0] if v.get("doc") else "" for k, v in CKAN_ACTIONS.items()}
+
+def get_ckan_action(action: str) -> FuncSignature:
     global CKAN_ACTIONS
     if not CKAN_ACTIONS:
         from ckan.logic import _actions
@@ -113,7 +125,7 @@ def get_ckan_action(action: str = "") -> FuncSignature:
     if action in CKAN_ACTIONS.keys():
         return CKAN_ACTIONS[action]
     else:
-        return CKAN_ACTIONS
+        return None
 
 
 # --------------------- CKAN Routing and URL Helpers ---------------------
@@ -247,12 +259,9 @@ def process_entity(data: Any, depth: int = 0, max_depth: int = 4) -> Any:
     #log.debug(f"{type(data)},{depth},{max_depth}")
     if depth > max_depth:
         log.warning("Max recursion depth reached")
-        #data=truncate_by_depth(data,max_depth)
         return None
-
+    data = unpack_lazy_json(data)
     if isinstance(data, dict):
-        data = unpack_lazy_json(data)
-        #log.debug(data.keys())
         if "resources" in data:
             try:
                 #log.debug("Dataset")

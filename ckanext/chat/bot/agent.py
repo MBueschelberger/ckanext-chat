@@ -31,7 +31,7 @@ from pydantic_ai.models.openai import OpenAIModel, OpenAIModelSettings
 from pydantic_ai.providers.azure import AzureProvider
 from pydantic_ai.usage import UsageLimits
 from pymilvus import MilvusClient
-from ckanext.chat.bot.utils import process_entity, unpack_lazy_json, RouteModel, get_ckan_url_patterns, CKAN_ACTIONS, get_ckan_action, fuzzy_search_early_cancel, FuncSignature
+from ckanext.chat.bot.utils import process_entity, unpack_lazy_json, RouteModel, get_ckan_url_patterns, get_ckan_action, get_ckan_actions, fuzzy_search_early_cancel, FuncSignature
 
 
 log = logger.bind(module=__name__)
@@ -317,7 +317,7 @@ front_agent_prompt = (
 "- Suggest next Steps or Related Questions: Suggest 2–3 follow-up directions or questions.\\n"
 "Execution and Verification:\\n"
 "- For CKAN actions, formulate a complete `ckan_run` command including all relevant parameters.\\n"
-"- Use `get_ckan_actions` to explore available API calls and parameter signatures.\\n"
+"- Use `get_ckan_action_names` to get a list of available CKAN actions and `get_ckan_action_details` on specific actions to get the doc string.\\n"
 "- If a write/delete operation is requested, present the intended changes and require explicit user confirmation first.\\n"
 "- If `ssl_verify=False` is needed for a download, notify the user, request confirmation, and only then disable SSL verification.\\n"
 "Error Handling:\\n"
@@ -368,6 +368,7 @@ research_agent_prompt = (
 "Guidelines:\\n"
 "- If a tool call (e.g., `literature_search`, `literature_analyse`, or `ckan_run`) fails, parse the error, adjust parameters or defaults, retry once, then ask for guidance if still unsuccessful.\\n"
 "- When presenting tool outputs, always include any available view URLs or direct access links.\\n"
+"- Use `get_ckan_action_names` to get a list of available CKAN actions and `get_ckan_action_details` on specific actions to get the doc string.\\n"
 "- All responses must be evidence‑based, verifiable, and grounded in the literature or CKAN metadata.\\n"
 )
 # --------------------- System Prompt & Agent ---------------------
@@ -384,7 +385,8 @@ ckan_agent_prompt = (
     "- If the action fails or is invalid:\n"
     "  - If the action fails because of missing parameters, run the actions again with the default parameters form the documentation.\n"
     "  - return the results but mentions the corrections you made and what can be improved on next call."
-    "  - Use `get_ckan_actions` to explain what the suggested action does.\n"
+    "  - Use `get_ckan_action_details` to explain what the suggested action does.\n"
+    "  - when patching datasets (packages) or resources ALWAYS confirm that the changes where applied by running the corresponding _show action again. If it fails suggest the necessarry call updated coresponding to the metadata schema returned by the _show call.\n"
     "- If your action returns datasets or other CKAN objects, suggest relevant follow-up actions, e.g., "
     "- **Do not output internal reasoning. Focus only on clean, result-oriented output.**\n\n"
     "Data Search:\n"
@@ -468,7 +470,7 @@ async def ckan_run(ctx: RunContext[Deps], command: str, parameters: dict={}) -> 
         r = await asyncio.wait_for(
             ckan_agent.run(
                 f"Run the CKAN action: '{command}' with the parameters: {parameters}. "
-                "If the action fails, suggest the correct action and explain it using 'get_action_info'.",
+                "If the action fails, suggest the correct action and explain it using 'get_action_details'.",
                 deps=ctx.deps,
                 usage_limits=UsageLimits(request_limit=10,total_tokens_limit=128000),
             ),
@@ -522,13 +524,24 @@ def build_ckan_url(route: RouteModel, fill: Optional[Dict[str, Any]] = None) -> 
 @agent.tool_plain
 @research_agent.tool_plain
 @ckan_agent.tool_plain
-def get_ckan_actions() -> Dict[str, FuncSignature]:
+def get_ckan_action_names() -> Dict[str,str]:
     """Lists all avalable CKAN actions by action name
 
     Returns:
         List[str]: List of names of CKAN actions
     """
-    return get_ckan_action()
+    return get_ckan_actions()
+
+# @agent.tool_plain
+# @research_agent.tool_plain
+@ckan_agent.tool_plain
+def get_ckan_action_details(action: str) -> FuncSignature:
+    """Returns the doc string of a CKAN action by action name
+
+    Returns:
+        FuncSignature: Doc string of the CKAN action
+    """
+    return get_ckan_action(action=action)
 
 
 # @ckan_agent.tool_plain
@@ -575,8 +588,7 @@ def run_action(ctx: RunContext[Deps], action_name: str, parameters: Dict) -> Any
         response = toolkit.get_action(action_name)(context, parameters)
     except Exception as e:
         return {"error": str(e)}
-    unpacked_response = unpack_lazy_json(response)
-    clean_response = process_entity(unpacked_response)
+    clean_response = process_entity(response)
     #log.debug(clean_response)
     #log.debug("{} -> {}".format(len(str(response)), len(str(clean_response))))
     return clean_response
@@ -620,8 +632,6 @@ async def get_resource_file_contents(
     try:
         resource = TextResource(url=resource_url)
         resource_id = extract_resource_uuid(resource_url)
-        log.debug(ckan_url)
-        log.debug(resource_url)
         if ckan_url in resource_url and resource_id:
             storage_path = toolkit.config.get("ckan.storage_path", "/var/lib/ckan/default")
 

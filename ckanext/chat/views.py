@@ -74,7 +74,7 @@ class ChatView(MethodView):
         )
 
 def ask():
-    logger.debug(request.form)
+    #logger.debug(request.form)
     user_input = request.form.get("text")
     history = request.form.get("history", "")
     research= request.form.get("reserach", False)

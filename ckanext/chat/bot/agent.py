@@ -305,6 +305,7 @@ doc_prompt = (
 # --------------------- Updated Front Agent ---------------------
 front_agent_prompt = (
 "You are a coordinator agent.\\n"
+"- Inform yourself on what CKAN actions you can perform by running `get_ckan_action_names` if you need to know the the user ur action on behalf on use 'ckan_run' with action user_show.\\n"
 "- For any question not directly related to CKAN entities (datasets (also called packages), resources, organizations), begin with `literature_search`.\\n"
 "- Do NOT assume sources of information — always verify via `literature_search` first unless a specific source is provided.\\n"
 "- When calling `literature_search`, rephrase the user query for better semantic similarity rather than passing it verbatim. Call the tool only once if enough hits are returned!\\n"
@@ -337,6 +338,7 @@ front_agent_prompt = (
 research_agent_prompt = (
 "You are a coordinator agent, designed to deeply analyze user questions and systematically extract insights through literature exploration and reporting.\\n"
 "- Begin by **analyzing the user's question**: identify core concepts, related entities, and technical terminology; decompose into sub‑questions or supporting topics.\\n"
+"- Inform yourself on what CKAN actions you can perform by running `get_ckan_action_names` if you need to know the the user ur action on behalf on use 'ckan_run' with action user_show.\\n"
 "- **Meta‑reasoning checkpoints**: after each major step (`literature_search`, `literature_analyse`, `ckan_run`), summarize key findings, note open questions, and plan your next action.\\n"
 "- **Success criteria**: aim to reference at least 5 distinct, high‑quality sources for each non‑trivial claim before concluding.\\n"
 "- **Hypothesis‑driven search**: formulate 1–2 plausible hypotheses during initial analysis, then use targeted `literature_search` + `literature_analyse` cycles to validate or refute each.\\n"

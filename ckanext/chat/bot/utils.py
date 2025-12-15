@@ -128,6 +128,210 @@ def get_ckan_action(action: str) -> FuncSignature:
         return None
 
 
+def parse_default_value(value_str: str) -> Any:
+    """Convert string representation of default value to actual Python type"""
+    value_str = value_str.strip()
+    
+    # Remove markdown/rst backticks that CKAN uses in docstrings
+    value_str = value_str.replace('``', '').strip()
+    
+    # Remove surrounding quotes
+    if value_str.startswith(("'", '"')) and value_str.endswith(("'", '"')):
+        value_str = value_str[1:-1].strip()
+    
+    # Boolean values
+    if value_str.lower() in ('true', 'false'):
+        return value_str.lower() == 'true'
+    
+    # None/null values
+    if value_str.lower() in ('none', 'null'):
+        return None
+    
+    # Integer values
+    try:
+        return int(value_str)
+    except ValueError:
+        pass
+    
+    # Float values
+    try:
+        return float(value_str)
+    except ValueError:
+        pass
+    
+    # If it still looks like a quoted string, unwrap again
+    if value_str.startswith(("'", '"')) and value_str.endswith(("'", '"')):
+        value_str = value_str[1:-1]
+    
+    # Return as-is if we can't parse it
+    return value_str
+
+
+def extract_param_defaults(action_doc: str) -> Dict[str, Any]:
+    """
+    Parse CKAN action docstring to extract parameter defaults.
+    
+    Looks for patterns like:
+    - :param name: (optional, default: value)
+    - :param name: description (default: value)
+    - (default: value)
+    
+    Args:
+        action_doc: The docstring from help_show()
+        
+    Returns:
+        Dictionary mapping parameter names to their default values
+    """
+    if not action_doc:
+        return {}
+    
+    defaults = {}
+    
+    # Try multiple patterns to match different docstring formats
+    patterns = [
+        # Pattern 1: :param name: ... (default: value)
+        r':param\s+(\w+):\s*[^:]*?\(default:\s*([^)]+)\)',
+        # Pattern 2: :param name: ... default: value
+        r':param\s+(\w+):\s*[^:]*?default:\s*([^),\n]+)',
+        # Pattern 3: (optional, default: value) anywhere after param
+        r':param\s+(\w+):[^:]*?\(optional[^)]*default:\s*([^)]+)\)',
+    ]
+    
+    for pattern in patterns:
+        for match in re.finditer(pattern, action_doc, re.MULTILINE | re.IGNORECASE):
+            param_name = match.group(1)
+            if param_name not in defaults:  # Don't override if already found
+                default_value_str = match.group(2).strip().rstrip(')')
+                defaults[param_name] = parse_default_value(default_value_str)
+    
+    # Add common CKAN defaults that are typically used
+    common_defaults = {
+        'include_private': True,  # For search operations
+        'limit': 1000,  # For list operations
+        'offset': 0,  # For pagination
+    }
+    
+    # Only add common defaults if they match the action pattern
+    action_lower = action_doc.lower() if action_doc else ""
+    if 'search' in action_lower and 'include_private' not in defaults:
+        defaults['include_private'] = True
+    if 'list' in action_lower and 'limit' not in defaults:
+        defaults['limit'] = 1000
+    
+    return defaults
+
+
+def merge_with_smart_defaults(action: str, provided_params: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Merge provided parameters with defaults extracted from action signature.
+    
+    This function:
+    1. Gets the cached action documentation
+    2. Extracts default values from the docstring
+    3. Merges with provided params (provided params take precedence)
+    
+    Args:
+        action: The CKAN action name
+        provided_params: Parameters provided by the user/agent
+        
+    Returns:
+        Merged dictionary with defaults filled in
+    """
+    action_info = get_ckan_action(action)
+    
+    if not action_info or not action_info.get('doc'):
+        return provided_params
+    
+    # Extract defaults from docstring
+    defaults = extract_param_defaults(action_info['doc'])
+    
+    # Merge: provided params override defaults
+    merged = {**defaults, **provided_params}
+    
+    log.debug(f"merge_with_smart_defaults: action={action}, defaults={defaults}, merged={merged}")
+    
+    return merged
+
+
+def detect_pagination_params(action_doc: str) -> Optional[Dict[str, str]]:
+    """
+    Detect pagination parameters from CKAN action documentation.
+    
+    Looks for common pagination patterns:
+    - limit/offset
+    - rows/start
+    - per_page/page
+    
+    Args:
+        action_doc: The docstring from help_show()
+        
+    Returns:
+        Dict with 'limit' and 'offset' keys mapping to actual parameter names,
+        or None if no pagination params found
+    """
+    if not action_doc:
+        return None
+    
+    pagination_keywords = {
+        'limit': ['limit', 'rows', 'per_page'],
+        'offset': ['offset', 'start', 'page']
+    }
+    
+    found_params = {}
+    doc_lower = action_doc.lower()
+    
+    # Check for each pagination keyword
+    for param_type, keywords in pagination_keywords.items():
+        for keyword in keywords:
+            # Look for :param keyword: in docstring
+            if f':param {keyword}' in doc_lower:
+                found_params[param_type] = keyword
+                break
+    
+    # Only return if we found at least a limit parameter
+    return found_params if 'limit' in found_params else None
+
+
+def generate_pagination_hint(action_name: str, estimated_tokens: int, items_count: int, pagination_params: Optional[Dict[str, str]]) -> Optional[str]:
+    """
+    Generate pagination hint if response is large and action supports pagination.
+    
+    Args:
+        action_name: The CKAN action name
+        estimated_tokens: Estimated token count of response
+        items_count: Number of items in response
+        pagination_params: Dict with pagination parameter names (from detect_pagination_params)
+        
+    Returns:
+        Pagination hint string, or None if not needed
+    """
+    # Only suggest pagination if response is large (>2000 tokens)
+    if estimated_tokens < 2000:
+        return None
+    
+    # Only suggest if action supports pagination
+    if not pagination_params:
+        return None
+    
+    limit_param = pagination_params.get('limit', 'limit')
+    offset_param = pagination_params.get('offset', 'offset')
+    
+    # Calculate suggested page size and number of pages
+    suggested_limit = min(50, max(10, items_count // 10))
+    estimated_pages = (items_count + suggested_limit - 1) // suggested_limit if items_count > 0 else 1
+    
+    hint = (
+        f"Response is large ({estimated_tokens} tokens, {items_count} items). "
+        f"Consider pagination:\n"
+        f"- Use '{limit_param}' parameter to set page size (suggested: {suggested_limit})\n"
+        f"- Use '{offset_param}' parameter to iterate through pages\n"
+        f"- Estimated pages needed: {estimated_pages}\n"
+        f"Example: {action_name}({limit_param}={suggested_limit}, {offset_param}=0)"
+    )
+    
+    return hint
+
+
 # --------------------- CKAN Routing and URL Helpers ---------------------
 
 VARIABLE_REGEX = re.compile(r"<(?:(?P<converter>[^:<>]+):)?(?P<variable>[^<>]+)>")

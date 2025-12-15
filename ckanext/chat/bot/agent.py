@@ -31,7 +31,7 @@ from pydantic_ai.models.openai import OpenAIModel, OpenAIModelSettings
 from pydantic_ai.providers.azure import AzureProvider
 from pydantic_ai.usage import UsageLimits
 from pymilvus import MilvusClient
-from ckanext.chat.bot.utils import process_entity, unpack_lazy_json, RouteModel, get_ckan_url_patterns, get_ckan_action, get_ckan_actions, fuzzy_search_early_cancel, FuncSignature
+from ckanext.chat.bot.utils import process_entity, unpack_lazy_json, RouteModel, get_ckan_url_patterns, get_ckan_action, get_ckan_actions, fuzzy_search_early_cancel, FuncSignature, merge_with_smart_defaults, detect_pagination_params, generate_pagination_hint
 
 
 log = logger.bind(module=__name__)
@@ -241,23 +241,55 @@ class AnalyseResult(BaseModel):
     error: Optional[List[str]] = None
 
 class CKANResult(BaseModel):
+    """Result from CKAN agent execution"""
     status: Literal['success', 'fail']
     action_name: str = ""
-    parameters: Optional[Dict[str,Any]] = {} 
-    doc: Optional[FuncSignature]
-    result: str
-    comment: Optional[str]
+    parameters: Optional[Dict[str,Any]] = {}
+    result: str  # The actual result from the CKAN action, or error message
+    comment: Optional[str] = None  # Additional suggestions or explanations
+    parameters_auto_added: Optional[Dict[str,Any]] = None  # Parameters automatically filled by smart defaults
+    metrics: Optional[Dict[str, int]] = None  # Response metrics (size, tokens, item count)
+    action_suggestion: Optional[str] = None  # If wrong command was used, suggest the correct one
 
 # --------------------- Updated RAG Agent Prompt ---------------------
 rag_prompt = (
-    "Role:\n\n"
-    "You perform literature retrieval using a vector store and return scientific citations in markdown format.\n"
-    "- Use rag_search with the original question.\n"
-    "- Aggregate results by `source` into LitResult objects. Use the source field in the vector meta data.\n"
-    "- Fill in start and end of RagHit.entities of the rag_search into the list of string_slices of the matching LitResult objects if possible.\n"
-    "- For each source, return a markdown citation in the format: [1](url)\n"
-    "- Add a summary why the source is relevant.\n"
-    "- Retry search if fewer than N distinct sources are returned.\n"
+    "You perform literature retrieval using vector search and return high-quality scientific citations.\n\n"
+    
+    "PROCESS:\n"
+    "Step 1: Formulate search query\n"
+    "- Rephrase the user's question for better semantic matching\n"
+    "- Extract key concepts and technical terms\n"
+    "- Create 1-2 focused search queries\n\n"
+    
+    "Step 2: Execute rag_search ONCE\n"
+    "- Use limit parameter to control result count (default: 5 sources)\n"
+    "- rag_search returns RagHit objects with distance metrics\n"
+    "- Closer distance = higher similarity (0.0 = perfect match)\n\n"
+    
+    "Step 3: Aggregate and rank results\n"
+    "- Group RagHit objects by 'source' field\n"
+    "- Calculate average similarity per source\n"
+    "- Rank sources by: similarity + diversity\n"
+    "- Create one LitResult per unique source\n"
+    "- Fill string_slices with start/end from RagHit.entity\n\n"
+    
+    "Step 4: Quality check\n"
+    "- Count distinct sources found\n"
+    "- If < N distinct sources AND search was restrictive:\n"
+    "  * Broaden the query (remove filters, add synonyms)\n"
+    "  * Retry search ONCE with modified query\n"
+    "- Maximum 2 search attempts total\n\n"
+    
+    "Step 5: Format citations\n"
+    "- Each source: [Author/Title](source_url)\n"
+    "- Add relevance summary (2-3 sentences)\n"
+    "- Include similarity score if available\n\n"
+    
+    "IMPORTANT:\n"
+    "- NEVER call rag_search more than 2 times\n"
+    "- Quality over quantity - 3-5 highly relevant sources better than 10 mediocre ones\n"
+    "- Always include metrics (similarity scores, source count)\n"
+    "- If second search still yields few results, return what you have with explanation\n"
 )
 
 # --------------------- Updated Document Agent Prompt ---------------------
@@ -376,23 +408,40 @@ research_agent_prompt = (
 # --------------------- System Prompt & Agent ---------------------
 
 ckan_agent_prompt = (
-    "Role:\n\n"
-    "You are an assistant to a CKAN software instance. You execute CKAN actions, evaluate their success, return the results of 'action_run' directly as 'results' "
-    "and suggest improvements or appropriate alternatives when as 'comment'.\n\n"
-    # "Before returning the results, try to augment the entities in your answer with links created by 'build_ckan_url', "
-    # "available routs you can get with 'ckan_url_patterns' tool.\n\n"
-
-    "Behavior:\n"
-    "- Attempt to run the specified CKAN action with the given parameters straight away, do not look up the action.\n"
-    "- If the action fails or is invalid:\n"
-    "  - If the action fails because of missing parameters, run the actions again with the default parameters form the documentation.\n"
-    "  - return the results but mentions the corrections you made and what can be improved on next call."
-    "  - Use `get_ckan_action_details` to explain what the suggested action does.\n"
-    "  - when patching datasets (packages) or resources ALWAYS confirm that the changes where applied by running the corresponding _show action again. If it fails suggest the necessarry call updated coresponding to the metadata schema returned by the _show call.\n"
-    "- If your action returns datasets or other CKAN objects, suggest relevant follow-up actions, e.g., "
-    "- **Do not output internal reasoning. Focus only on clean, result-oriented output.**\n\n"
-    "Data Search:\n"
-    "- When searching for datasets, use `package_search` with `include_private=true` to ensure full visibility.\n\n"
+    "You execute CKAN actions and return structured, transparent results.\n\n"
+    
+    "SYSTEM CAPABILITIES:\n"
+    "The system automatically:\n"
+    "- Fills missing parameters with smart defaults from action documentation\n"
+    "- Measures response size and token usage\n"
+    "- Returns transparency info about what was done\n\n"
+    
+    "YOUR JOB:\n"
+    "1. Handle command selection (use correct action names)\n"
+    "2. Maximum 2 attempts per command\n\n"
+    
+    "PROCESS:\n"
+    "Step 1: Call 'run_action' with provided action name and parameters\n"
+    "Step 2: Check the response:\n"
+    "  - If response.success = True:\n"
+    "    * Set status='success'\n"
+    "    * Put response.data in 'result' field\n"
+    "    * If response.parameters_auto_added exists, mention it in 'comment'\n"
+    "    * Include response.metrics if present\n"
+    "    * Return immediately\n"
+    "  - If response.success = False and error is 'Action not found':\n"
+    "    * Call 'get_ckan_action_names' to find correct action\n"
+    "    * Try ONE more time with correct action name\n"
+    "    * Set action_suggestion to explain the fix\n"
+    "  - If response.success = False with other error:\n"
+    "    * Set status='fail'\n"
+    "    * Put error in 'result' field\n"
+    "    * Return immediately\n\n"
+    
+    "STRICT LIMITS:\n"
+    "- NEVER call 'run_action' more than 2 times\n"
+    "- DO NOT loop or retry indefinitely\n"
+    "- Return after 2 attempts maximum"
 )
 
 agent = Agent(
@@ -415,7 +464,7 @@ ckan_agent = Agent(
     deps_type=Deps,
     output_type=CKANResult,
     system_prompt="".join(ckan_agent_prompt),
-    retries=10,
+    retries=5,
 )
 
 
@@ -464,30 +513,51 @@ async def ckan_run(ctx: RunContext[Deps], command: str, parameters: dict={}) -> 
         parameters (dict): A dictionary of parameters required for the CKAN action.
     Returns:
         str: The result of the CKAN action as a JSON string, or an error message in case of failure.
-    Raises:
-        asyncio.TimeoutError: If the execution of the CKAN action exceeds the specified time (30 seconds).
-        Exception: For any other unexpected errors during the execution of the CKAN action.
     """
+    start_time = datetime.now(timezone.utc)
+    log.info(f"ckan_run starting: action='{command}', params={json.dumps(parameters)[:100]}")
+    
     try:
         r = await asyncio.wait_for(
             ckan_agent.run(
                 f"Run the CKAN action: '{command}' with the parameters: {parameters}. "
-                "If the action fails, suggest the correct action and explain it using 'get_action_details'.",
+                "If the action fails, suggest the correct action and explain it using 'get_ckan_action_details'.",
                 deps=ctx.deps,
-                usage_limits=UsageLimits(request_limit=10,total_tokens_limit=128000),
+                usage_limits=UsageLimits(request_limit=25,total_tokens_limit=128000),
             ),
-            timeout=30
+            timeout=90
         )
+        
+        # Track usage metrics
+        usage = r.usage()
+        duration_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
+        log.info(f"ckan_run completed: action='{command}', "
+                f"tokens=[request:{usage.request_tokens}, response:{usage.response_tokens}, total:{usage.total_tokens}], "
+                f"duration_ms={duration_ms:.0f}")
+        
+        return r.output.model_dump_json()
+        
     except asyncio.TimeoutError:
-        msg="Timeout on ckan_run attempt, retrying..."
-        log.error(msg)
-        return msg
+        duration_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
+        log.error(f"ckan_run timeout: action='{command}', duration_ms={duration_ms:.0f}, limit=90000ms")
+        return json.dumps({"status": "fail", "action_name": command, "result": "Timeout after 90 seconds", "comment": "Operation took too long"})
+        
+    except UsageLimitExceeded as e:
+        log.error(f"ckan_run usage limit exceeded: action='{command}', limit={e}")
+        return json.dumps({"status": "fail", "action_name": command, "result": f"Token limit exceeded: {e}", "comment": "Query too complex"})
+        
+    except ModelHTTPError as e:
+        log.error(f"ckan_run API error: action='{command}', status={e.status_code if hasattr(e, 'status_code') else 'unknown'}")
+        return json.dumps({"status": "fail", "action_name": command, "result": f"API error: {str(e)}", "comment": "Service unavailable"})
+        
+    except UnexpectedModelBehavior as e:
+        log.error(f"ckan_run model behavior error: action='{command}', error={str(e)[:200]}")
+        return json.dumps({"status": "fail", "action_name": command, "result": f"Model output validation failed: {str(e)}", "comment": "Invalid response format"})
+        
     except Exception as e:
-        msg=f"Unexpected error on ckan_run attempt: {str(e)}"
-        log.error(msg)
-        return msg
-    #log.debug(f"ckan_run return: {r.data.json()}")
-    return r.data.json()
+        duration_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
+        log.error(f"ckan_run unexpected error: action='{command}', error_type={type(e).__name__}, error={str(e)[:200]}, duration_ms={duration_ms:.0f}")
+        return json.dumps({"status": "fail", "action_name": command, "result": f"Unexpected error: {type(e).__name__}: {str(e)}", "comment": "Internal error"})
     
 
 #@ckan_agent.tool_plain
@@ -568,16 +638,24 @@ def get_ckan_action_details(action: str) -> FuncSignature:
 @rag_agent.tool
 @ckan_agent.tool
 def run_action(ctx: RunContext[Deps], action_name: str, parameters: Dict) -> Any:
-    """Run CKAN actions basd on the action name and parameters as a dict.
+    """Run CKAN actions with smart parameter filling and metrics.
+    
+    This function automatically merges provided parameters with intelligent defaults
+    extracted from the CKAN action's documentation, executes the action, and returns
+    enriched results with metrics and transparency about what was done.
 
     Args:
-        ctx (RunContext[Deps]): Instance of Agent dependencys at runtime, passed in by agent framework by default
+        ctx (RunContext[Deps]): Instance of Agent dependencys at runtime
         action_name (str): Name of the action to run
         parameters (Dict): Dict of Parameters to be passed to the action
 
     Returns:
-        Any: Output of the action run
+        Dict: Enriched result with data, metrics, and parameters info
     """
+    # Track what parameters were auto-added
+    merged_parameters = merge_with_smart_defaults(action_name, parameters)
+    params_added = {k: v for k, v in merged_parameters.items() if k not in parameters}
+    
     user = CKANmodel.User.get(user_reference=ctx.deps.user_id)
     context = {
         "user": user.name,
@@ -586,14 +664,71 @@ def run_action(ctx: RunContext[Deps], action_name: str, parameters: Dict) -> Any
         "session": CKANmodel.Session,
         "ignore_auth": False,
     }
+    
     try:
-        response = toolkit.get_action(action_name)(context, parameters)
+        # Execute CKAN action
+        response = toolkit.get_action(action_name)(context, merged_parameters)
+        
+        # Measure response before processing
+        json_str = json.dumps(response)
+        response_size_bytes = len(json_str)
+        estimated_tokens = response_size_bytes // 4
+        
+        # Count items in response
+        items_count = 1
+        if isinstance(response, list):
+            items_count = len(response)
+        elif isinstance(response, dict):
+            if 'results' in response and isinstance(response['results'], list):
+                items_count = len(response['results'])
+            elif 'count' in response:
+                items_count = response['count']
+        
+        # Check if pagination hint should be generated
+        action_info = get_ckan_action(action_name)
+        pagination_params = None
+        pagination_hint = None
+        
+        if action_info and action_info.get('doc'):
+            pagination_params = detect_pagination_params(action_info['doc'])
+            if pagination_params:
+                pagination_hint = generate_pagination_hint(
+                    action_name, 
+                    estimated_tokens, 
+                    items_count, 
+                    pagination_params
+                )
+        
+        # Process/clean response
+        clean_response = process_entity(response)
+        
+        # Build enriched result
+        result = {
+            'success': True,
+            'data': clean_response,
+            'parameters_used': merged_parameters,
+            'parameters_auto_added': params_added if params_added else None,
+            'metrics': {
+                'response_size_bytes': response_size_bytes,
+                'estimated_tokens': estimated_tokens,
+                'items_returned': items_count
+            }
+        }
+        
+        # Add pagination hint if applicable
+        if pagination_hint:
+            result['pagination_hint'] = pagination_hint
+        
+        return result
+        
     except Exception as e:
-        return {"error": str(e)}
-    clean_response = process_entity(response)
-    #log.debug(clean_response)
-    #log.debug("{} -> {}".format(len(str(response)), len(str(clean_response))))
-    return clean_response
+        # Return error with details
+        return {
+            'success': False,
+            'error': str(e),
+            'error_type': type(e).__name__,
+            'parameters_attempted': merged_parameters
+        }
 
 def extract_resource_uuid(input_string: str) -> str:
     # Regulärer Ausdruck für UUID zwischen 'resource/' und '/download'
@@ -861,8 +996,12 @@ async def rag_search(
 async def literature_search(
     ctx: RunContext[Deps], search_question: str, num_results: int = 5
 ) -> list[str]:
+    start_time = datetime.now(timezone.utc)
+    log.info(f"literature_search starting: query='{search_question[:100]}...', num_results={num_results}")
+    
     for attempt in range(3):
         try:
+            log.debug(f"literature_search attempt {attempt+1}/3")
             r = await asyncio.wait_for(
                 rag_agent.run(
                     f"Search for documents using this question:{search_question}. You must return {num_results} results",
@@ -870,29 +1009,68 @@ async def literature_search(
                     usage_limits=UsageLimits(request_limit=10,total_tokens_limit=128000),
                 ),
                 timeout=30
-                )
-            break
-        except (asyncio.TimeoutError):
-                log.warning(f"Timeout on literature_search attempt {attempt}, retrying...")
-                attempt+=1
+            )
+            
+            # Track usage metrics
+            usage = r.usage()
+            duration_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
+            log.info(f"literature_search completed: attempt={attempt+1}, "
+                    f"tokens=[request:{usage.request_tokens}, response:{usage.response_tokens}, total:{usage.total_tokens}], "
+                    f"duration_ms={duration_ms:.0f}")
+            
+            return r.output.model_dump_json()
+            
+        except asyncio.TimeoutError:
+            duration_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
+            log.warning(f"literature_search timeout on attempt {attempt+1}/3, duration_ms={duration_ms:.0f}")
+            if attempt == 2:  # Last attempt
+                log.error(f"literature_search all retries timed out after {duration_ms:.0f}ms")
+                raise RuntimeError("All literature_search retries timed out")
+            continue
+            
+        except UsageLimitExceeded as e:
+            log.error(f"literature_search usage limit exceeded on attempt {attempt+1}: {e}")
+            return json.dumps({"answer": "", "error": [f"Token limit exceeded: {str(e)}"]})
+            
+        except ModelHTTPError as e:
+            log.error(f"literature_search API error on attempt {attempt+1}: status={e.status_code if hasattr(e, 'status_code') else 'unknown'}")
+            if attempt == 2:
+                return json.dumps({"answer": "", "error": [f"API error: {str(e)}"]})
+            continue
+            
+        except UnexpectedModelBehavior as e:
+            log.error(f"literature_search model behavior error on attempt {attempt+1}: {str(e)[:200]}")
+            if attempt == 2:
+                return json.dumps({"answer": "", "error": [f"Model output validation failed: {str(e)}"]})
+            continue
+            
         except Exception as e:
-            log.error(f"Unexpected error on literature_search attempt {attempt}: {str(e)}")
-    else:
-        raise RuntimeError("All literature_search retries timed out")
-    #log.debug(r.data)
-    return r.data.json()
+            log.error(f"literature_search unexpected error on attempt {attempt+1}: error_type={type(e).__name__}, error={str(e)[:200]}")
+            if attempt == 2:
+                raise RuntimeError(f"All literature_search retries failed: {type(e).__name__}: {str(e)}")
+            continue
+    
+    # Should not reach here, but just in case
+    raise RuntimeError("All literature_search retries exhausted")
 
 @agent.tool_plain
 @research_agent.tool_plain
 async def literature_analyse(doc: TextResource, question: str, ssl_verify=False) -> list[str]:
+    start_time = datetime.now(timezone.utc)
+    log.info(f"literature_analyse starting: doc_url='{doc.url}', question='{question[:100]}...'")
+    
     try:
         doc=await get_resource_file_contents(resource_url=str(doc.url),ssl_verify=ssl_verify)
+        log.debug(f"literature_analyse loaded document: length={doc.length} chars")
     except Exception as e:
-        return f"Error: {str(e)}"
+        log.error(f"literature_analyse failed to load document: error={str(e)[:200]}")
+        return json.dumps({"answer": "", "source": str(doc.url), "error": [f"Failed to load document: {str(e)}"]})
+    
     prompt = (
         f"Analyze the provided TextResource to determine whether it contains an answer to the question below.\n\n"
         f"**Question:** {question}\n\n"
     )
+    
     try:
         r = await asyncio.wait_for(
             doc_agent.run(
@@ -902,15 +1080,37 @@ async def literature_analyse(doc: TextResource, question: str, ssl_verify=False)
             ),
             timeout=120
         )
+        
+        # Track usage metrics
+        usage = r.usage()
+        duration_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
+        log.info(f"literature_analyse completed: "
+                f"tokens=[request:{usage.request_tokens}, response:{usage.response_tokens}, total:{usage.total_tokens}], "
+                f"duration_ms={duration_ms:.0f}")
+        
+        return r.output.model_dump_json()
+        
     except asyncio.TimeoutError:
-        msg="Timeout on literature_analyse attempt, retrying..."
-        log.error(msg)
-        return msg
+        duration_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
+        log.error(f"literature_analyse timeout after {duration_ms:.0f}ms, limit=120000ms")
+        return json.dumps({"answer": "", "source": str(doc.url), "error": ["Analysis timeout after 120 seconds"]})
+        
+    except UsageLimitExceeded as e:
+        log.error(f"literature_analyse usage limit exceeded: {e}")
+        return json.dumps({"answer": "", "source": str(doc.url), "error": [f"Token limit exceeded: {str(e)}"]})
+        
+    except ModelHTTPError as e:
+        log.error(f"literature_analyse API error: status={e.status_code if hasattr(e, 'status_code') else 'unknown'}")
+        return json.dumps({"answer": "", "source": str(doc.url), "error": [f"API error: {str(e)}"]})
+        
+    except UnexpectedModelBehavior as e:
+        log.error(f"literature_analyse model behavior error: {str(e)[:200]}")
+        return json.dumps({"answer": "", "source": str(doc.url), "error": [f"Model output validation failed: {str(e)}"]})
+        
     except Exception as e:
-        msg=f"Unexpected error on literature_analyse attempt: {str(e)}"
-        log.error(msg)
-        return msg
-    return r.data.json()
+        duration_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
+        log.error(f"literature_analyse unexpected error: error_type={type(e).__name__}, error={str(e)[:200]}, duration_ms={duration_ms:.0f}")
+        return json.dumps({"answer": "", "source": str(doc.url), "error": [f"Unexpected error: {type(e).__name__}: {str(e)}"]})
 
 
 def get_user_token(user_id: str) -> Optional[str]:

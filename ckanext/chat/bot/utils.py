@@ -482,35 +482,58 @@ def truncate_value(value, max_length):
 
 
 def truncate_by_depth(data, max_depth, current_depth=0, placeholder="..."):
+    """
+    Truncate data by depth, removing empty/None values completely.
+    This keeps the response minimal and meaningful.
+    """
     if current_depth >= max_depth:
         return placeholder
+    
     if isinstance(data, dict):
-        return {
-            key: truncate_by_depth(
+        result = {}
+        for key, value in data.items():
+            # Skip None, empty strings, empty lists, empty dicts
+            if value in (None, "", [], {}):
+                continue
+            
+            truncated = truncate_by_depth(
                 truncate_value(value, max_length=200),
                 max_depth,
                 current_depth + 1,
                 placeholder,
             )
-            for key, value in data.items()
-        }
+            
+            # Only include if the truncated value is meaningful
+            if truncated not in (None, "", [], {}, placeholder):
+                result[key] = truncated
+        
+        return result
+    
     if isinstance(data, list):
-        data = truncate_value(data, max_length=200)
-        return [
-            truncate_by_depth(item, max_depth, current_depth + 1, placeholder)
-            for item in data
-        ]
+        # Filter out None/empty items first
+        filtered = [item for item in data if item not in (None, "", [], {})]
+        data = truncate_value(filtered, max_length=200)
+        
+        result = []
+        for item in data:
+            truncated = truncate_by_depth(item, max_depth, current_depth + 1, placeholder)
+            # Only include meaningful items
+            if truncated not in (None, "", [], {}, placeholder):
+                result.append(truncated)
+        
+        return result
+    
     return data
 
 
-def smart_truncate_response(response: Any, max_tokens: int = 8000) -> Dict[str, Any]:
+def smart_truncate_response(response: Any, max_tokens: int = 1500) -> Dict[str, Any]:
     """
     Intelligently truncate CKAN response based on structure and size.
     
     Strategy:
-    - Small responses (<2K tokens): No truncation
-    - Medium responses (2K-8K tokens): Depth truncation (keeps all items, limits detail)
-    - Large responses (>8K tokens): Combined depth + item limit
+    - Small responses (<500 tokens): No truncation
+    - Medium responses (500-1.5K tokens): Depth truncation (keeps all items, limits detail)
+    - Large responses (>1.5K tokens): Combined depth + item limit
     
     Args:
         response: Raw CKAN API response
@@ -539,7 +562,7 @@ def smart_truncate_response(response: Any, max_tokens: int = 8000) -> Dict[str, 
         total_count = 1
     
     # Decision tree
-    if estimated_tokens < 2000:
+    if estimated_tokens < 500:
         # Small response - no truncation needed
         return {
             'data': process_entity(response),
@@ -550,11 +573,11 @@ def smart_truncate_response(response: Any, max_tokens: int = 8000) -> Dict[str, 
             'estimated_tokens': estimated_tokens
         }
     
-    elif estimated_tokens < 8000:
+    elif estimated_tokens < 1500:
         # Medium response - use depth truncation (keeps all items, less detail)
         # Process entities FIRST (before truncation to avoid DynamicResource errors)
         processed_response = process_entity(response)
-        truncated_data = truncate_by_depth(processed_response, max_depth=2)
+        truncated_data = truncate_by_depth(processed_response, max_depth=3)
         
         # Re-estimate after truncation
         new_json_str = json.dumps(truncated_data)
@@ -575,23 +598,23 @@ def smart_truncate_response(response: Any, max_tokens: int = 8000) -> Dict[str, 
         # Process entities FIRST (before truncation to avoid DynamicResource errors)
         processed_response = process_entity(response)
         
-        # Then limit items and truncate
+        # Then limit items and truncate (reduced to 5 items for speed)
         if isinstance(processed_response, dict) and 'results' in processed_response:
             # Keep top-level structure, truncate individual results
             limited_response = {**processed_response}
             limited_response['results'] = [
-                truncate_by_depth(item, max_depth=3) for item in processed_response['results'][:10]
+                truncate_by_depth(item, max_depth=2) for item in processed_response['results'][:5]
             ]
         elif isinstance(processed_response, list):
-            limited_response = [truncate_by_depth(item, max_depth=3) for item in processed_response[:10]]
+            limited_response = [truncate_by_depth(item, max_depth=2) for item in processed_response[:5]]
         else:
-            limited_response = truncate_by_depth(processed_response, max_depth=3)
+            limited_response = truncate_by_depth(processed_response, max_depth=2)
         
         # Calculate actual showing count
         if isinstance(response, dict) and 'results' in response:
-            showing_count = min(10, len(response['results']))
+            showing_count = min(5, len(response['results']))
         elif isinstance(response, list):
-            showing_count = min(10, len(response))
+            showing_count = min(5, len(response))
         else:
             showing_count = 1
         

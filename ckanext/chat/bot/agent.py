@@ -368,8 +368,13 @@ front_agent_prompt = (
     
     "**ckan_run:**\n"
     "- Check available actions: get_ckan_action_names()\n"
-    "- For dataset search: ckan_run('package_search', {q: 'query', include_private: true})\n"
-    "- Sub-agents handle parameter filling automatically\n"
+    "- For dataset search:\n"
+    "  * DEFAULT: ckan_run('package_search', {'q': '*:*', 'include_private': True}) - ALWAYS include this\n"
+    "  * Search by tag: ckan_run('package_search', {'q': 'tags:climate', 'include_private': True})\n"
+    "  * Free text: ckan_run('package_search', {'q': 'keyword', 'include_private': True})\n"
+    "  * CRITICAL: ALWAYS add 'include_private': True to show both public AND private datasets\n"
+    "  * CRITICAL: Use boolean True, NOT string 'true'\n"
+    "- For simple listing: ckan_run('current_package_list_with_resources', {}) - no parameters\n"
     "- Warn before write/delete operations\n\n"
     
     "**literature_search:**\n"
@@ -491,48 +496,36 @@ research_agent_prompt = (
 # --------------------- System Prompt & Agent ---------------------
 
 ckan_agent_prompt = (
-    "You execute CKAN actions and return structured, transparent results.\n\n"
-    
-    "SYSTEM CAPABILITIES:\n"
-    "The system automatically:\n"
-    "- Fills missing parameters with smart defaults from action documentation\n"
-    "- Filters out empty strings (treats '' as not provided)\n"
-    "- Measures response size and token usage\n"
-    "- Returns transparency info about what was done\n\n"
-    
-    "YOUR JOB:\n"
-    "1. Execute the action with provided parameters ONCE\n"
-    "2. Maximum 1 attempt per command (only retry if action name wrong)\n"
-    "3. ALWAYS preserve user parameters on retry\n\n"
+    "You execute CKAN actions. Your ONLY job is to call run_action and return the result.\n\n"
     
     "PROCESS:\n"
-    "Step 1: Call 'run_action' with provided action name and parameters\n"
-    "Step 2: Check the response:\n"
-    "  - If response.success = True:\n"
-    "    * Set status='success'\n"
-    "    * Put 'Action executed successfully' in 'result' field\n"
-    "    * If response.parameters_auto_added exists, mention it in 'comment'\n"
-    "    * Include response.metrics if present\n"
-    "    * STOP and return immediately (data will be fetched separately)\n"
-    "  - If response.success = False and error is 'Action not found':\n"
-    "    * Call 'get_ckan_action_names' to find correct action\n"
-    "    * Retry ONCE with correct action name BUT KEEP ORIGINAL PARAMETERS\n"
-    "    * Set action_suggestion to explain the fix\n"
-    "    * STOP after this retry\n"
-    "  - If response.success = False with parameter validation error:\n"
-    "    * DO NOT retry - user parameters are what they specified\n"
-    "    * Set status='fail'\n"
-    "    * Put error in 'result' field with helpful explanation\n"
-    "    * STOP and return immediately\n\n"
+    "1. Call run_action with the provided action name and parameters\n"
+    "2. If response.success = True:\n"
+    "   - Set status='success'\n"
+    "   - Set result='Action executed successfully'\n"
+    "   - RETURN immediately\n"
+    "3. If response.success = False:\n"
+    "   - Set status='fail'\n"
+    "   - Copy the error message to result field\n"
+    "   - RETURN immediately\n\n"
     
     "CRITICAL RULES:\n"
-    "- If first run_action succeeds: STOP IMMEDIATELY, do not call again\n"
-    "- NEVER call 'run_action' more than 2 times total\n"
-    "- Only retry if action name was wrong, not for parameter issues\n"
-    "- ALWAYS preserve original user parameters on retry\n"
-    "- DO NOT remove or modify user-provided parameters\n"
-    "- Empty strings '' are filtered by system, you don't need to handle them\n"
-    "- Once you have a success or fail result: RETURN IT, do not continue"
+    "- Call run_action EXACTLY ONCE\n"
+    "- DO NOT analyze whether parameters are required\n"
+    "- DO NOT check documentation\n"
+    "- DO NOT suggest alternatives\n"
+    "- JUST call run_action and return the result\n"
+    "- Trust that run_action will handle everything\n\n"
+    
+    "WRONG (DO NOT DO THIS):\n"
+    "❌ 'The action requires parameters'\n"
+    "❌ 'Parameters are missing'\n"
+    "❌ Looking at documentation before calling\n\n"
+    
+    "CORRECT (DO THIS):\n"
+    "✅ Immediately call run_action\n"
+    "✅ Return whatever run_action returns\n"
+    "✅ Don't add your own opinions about parameters"
 )
 
 agent = Agent(
@@ -589,6 +582,32 @@ def convert_to_model_messages(history: str) -> List:
 
 # --------------------- Front Agent Delegation Tools ---------------------
 
+def normalize_parameters(params: dict) -> dict:
+    """
+    Normalize parameters from JSON/LLM format to Python format.
+    Converts: true→True, false→False, null→None
+    """
+    if not isinstance(params, dict):
+        return params
+    
+    normalized = {}
+    for key, value in params.items():
+        if value is True or value == "true" or value == "True":
+            normalized[key] = True
+        elif value is False or value == "false" or value == "False":
+            normalized[key] = False
+        elif value is None or value == "null" or value == "None":
+            normalized[key] = None
+        elif isinstance(value, dict):
+            normalized[key] = normalize_parameters(value)
+        elif isinstance(value, list):
+            normalized[key] = [normalize_parameters(item) if isinstance(item, dict) else item for item in value]
+        else:
+            normalized[key] = value
+    
+    return normalized
+
+
 @agent.tool
 @research_agent.tool
 async def ckan_run(ctx: RunContext[Deps], command: str, parameters: dict={}) -> str:
@@ -605,6 +624,9 @@ async def ckan_run(ctx: RunContext[Deps], command: str, parameters: dict={}) -> 
     Returns:
         str: The result of the CKAN action as a JSON string, or an error message in case of failure.
     """
+    # Normalize parameters to handle JSON boolean/null conversions
+    parameters = normalize_parameters(parameters)
+    
     start_time = datetime.now(timezone.utc)
     log.info(f"ckan_run starting: action='{command}', params={json.dumps(parameters)[:100]}")
     

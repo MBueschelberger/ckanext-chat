@@ -149,7 +149,7 @@ async def _agent_worker(prompt: str, history: str, user_id: str, research: bool 
             user_prompt=prompt,
             message_history=msg_history,
             deps=deps,
-            usage_limits=UsageLimits(request_limit=3,total_tokens_limit=200000),
+            usage_limits=UsageLimits(request_limit=6,total_tokens_limit=200000),
         )
 
     logger.debug(f"Worker done, result: {r}")

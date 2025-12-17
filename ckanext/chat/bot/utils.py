@@ -2,6 +2,7 @@ import asyncio
 import json
 import re
 import time
+from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
 import ckan.plugins.toolkit as toolkit
@@ -102,7 +103,12 @@ class FuncSignature(BaseModel):
 CKAN_ACTIONS: Dict[str, FuncSignature] = {}
 
 
+@lru_cache(maxsize=1)
 def get_ckan_actions() -> Dict[str,str]:
+    """
+    Get all CKAN actions with LRU caching.
+    Cache is cleared when CKAN is restarted.
+    """
     global CKAN_ACTIONS
     if not CKAN_ACTIONS:
         from ckan.logic import _actions

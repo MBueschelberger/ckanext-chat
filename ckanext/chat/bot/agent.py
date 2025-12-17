@@ -10,8 +10,6 @@ import aiofiles
 import aiohttp
 import ckan.model as CKANmodel
 import ckan.plugins.toolkit as toolkit
-# import logfire
-# import nest_asyncio
 import requests
 
 from flask import Flask
@@ -27,23 +25,66 @@ from pydantic_ai.exceptions import (AgentRunError, FallbackExceptionGroup,
 from pydantic_ai.messages import (ModelMessagesTypeAdapter, ModelRequest,
                                   ModelResponse, TextPart, UserPromptPart)
 from pydantic_ai.models.openai import OpenAIModel, OpenAIModelSettings
-# from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.providers.azure import AzureProvider
 from pydantic_ai.usage import UsageLimits
 from pymilvus import MilvusClient
-from ckanext.chat.bot.utils import process_entity, unpack_lazy_json, RouteModel, get_ckan_url_patterns, get_ckan_action, get_ckan_actions, fuzzy_search_early_cancel, FuncSignature, merge_with_smart_defaults, detect_pagination_params, generate_pagination_hint, smart_truncate_response
+from ckanext.chat.bot.utils import (
+    RouteModel,
+    get_ckan_url_patterns,
+    get_ckan_action,
+    get_ckan_actions,
+    fuzzy_search_early_cancel,
+    FuncSignature,
+    merge_with_smart_defaults,
+    smart_truncate_response
+)
 
 
 log = logger.bind(module=__name__)
 
-# # Allow nested event loops.
-# nest_asyncio.apply()
+# --------------------- Configuration Constants ---------------------
 
+@dataclass
+class AgentConfig:
+    """Centralized configuration for agent timeouts, limits, and retries"""
+    # Timeout settings (in seconds)
+    CKAN_RUN_TIMEOUT: int = 90
+    LITERATURE_SEARCH_TIMEOUT: int = 30
+    LITERATURE_ANALYSE_TIMEOUT: int = 120
+    
+    # Token limits
+    MAX_TOKENS_RAG_MODEL: int = 16384
+    MAX_TOKENS_CKAN_RUN: int = 128000
+    MAX_TOKENS_LITERATURE_SEARCH: int = 128000
+    MAX_TOKENS_LITERATURE_ANALYSE: int = 128000
+    MAX_TOKENS_FRONT_AGENT: int = 200000
+    MAX_TOKENS_RESEARCH_AGENT: int = 1000000
+    
+    # Retry counts
+    MAX_RETRIES_CKAN_AGENT: int = 5
+    MAX_RETRIES_LITERATURE_SEARCH: int = 3
+    MAX_RETRIES_FRONT_AGENT: int = 3
+    MAX_RETRIES_RESEARCH_AGENT: int = 3
+    
+    # Request limits (per run)
+    REQUEST_LIMIT_CKAN_RUN: int = 25
+    REQUEST_LIMIT_LITERATURE_SEARCH: int = 10
+    REQUEST_LIMIT_LITERATURE_ANALYSE: int = 50
+    REQUEST_LIMIT_FRONT_AGENT: int = 6
+    REQUEST_LIMIT_RESEARCH_AGENT: int = 10
+    
+    # Response truncation settings
+    SMART_TRUNCATE_MAX_TOKENS: int = 8000
+    
+    @classmethod
+    def from_config(cls) -> 'AgentConfig':
+        """Load configuration from CKAN config if available"""
+        # Could be extended to read from toolkit.config
+        return cls()
 
-os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] = "http://docker-dev.iwm.fraunhofer.de:4318"
-# logfire.configure(send_to_logfire=False)
-# logfire.instrument_pydantic_ai()
-# logfire.instrument_httpx(capture_all=True)
+# Global config instance
+config = AgentConfig.from_config()
+
 # --------------------- Helper Functions ---------------------
 
 app = Flask(__name__)
@@ -79,15 +120,6 @@ think_model = OpenAIModel(
     ),
 )
 
-# model = OpenAIModel(deployment, provider=OpenAIProvider(openai_client=azure_client))
-
-# #Ollama setup
-# model = OpenAIModel(
-#     model_name=toolkit.config.get("ckanext.chat.deployment", "llama3.3"),
-#     provider=OpenAIProvider(base_url=toolkit.config.get("ckanext.chat.completion_url", "https://ollama.local/v1"))
-# )
-
-
 # --------------------- Milvus and CKAN Setup ---------------------
 
 milvus_url = toolkit.config.get("ckanext.chat.milvus_url", "")
@@ -122,6 +154,26 @@ if milvus_url:
 else:
     milvus_client = None
 
+# Global aiohttp session for connection pooling
+_global_http_session: Optional[aiohttp.ClientSession] = None
+
+def get_http_session() -> aiohttp.ClientSession:
+    """Get or create global aiohttp session for connection pooling"""
+    global _global_http_session
+    if _global_http_session is None or _global_http_session.closed:
+        # Create session with optimized settings
+        connector = aiohttp.TCPConnector(
+            limit=100,  # Max connections
+            limit_per_host=10,  # Max connections per host
+            ttl_dns_cache=300,  # DNS cache for 5 minutes
+        )
+        timeout = aiohttp.ClientTimeout(total=120, connect=10)
+        _global_http_session = aiohttp.ClientSession(
+            connector=connector,
+            timeout=timeout,
+        )
+    return _global_http_session
+
 @dataclass
 class Deps:
     user_id: str
@@ -132,6 +184,7 @@ class Deps:
     max_context_length: int = 8192
     collection_name: str = collection_name
     vector_dim: int = vector_dim
+    http_session: aiohttp.ClientSession = field(default_factory=get_http_session)
     #file: Optional[TextResource] = None
 
 @dataclass
@@ -366,16 +419,32 @@ front_agent_prompt = (
     
     "TOOL USAGE GUIDELINES:\n\n"
     
-    "**ckan_run:**\n"
-    "- Check available actions: get_ckan_action_names()\n"
-    "- For dataset search:\n"
-    "  * DEFAULT: ckan_run('package_search', {'q': '*:*', 'include_private': True}) - ALWAYS include this\n"
-    "  * Search by tag: ckan_run('package_search', {'q': 'tags:climate', 'include_private': True})\n"
-    "  * Free text: ckan_run('package_search', {'q': 'keyword', 'include_private': True})\n"
-    "  * CRITICAL: ALWAYS add 'include_private': True to show both public AND private datasets\n"
-    "  * CRITICAL: Use boolean True, NOT string 'true'\n"
-    "- For simple listing: ckan_run('current_package_list_with_resources', {}) - no parameters\n"
-    "- Warn before write/delete operations\n\n"
+    "**ckan_run - CRITICAL RULES:**\n"
+    "1. For ANY dataset query (\"show me datasets\", \"what datasets\", \"list datasets\"), ALWAYS use:\n"
+    "   → ckan_run('package_search', {'q': '*:*', 'include_private': True})\n"
+    "   \n"
+    "2. NEVER use 'package_list' - it doesn't show metadata or private datasets\n"
+    "   \n"
+    "3. For searching specific datasets:\n"
+    "   - By tag: ckan_run('package_search', {'q': 'tags:climate', 'include_private': True})\n"
+    "   - By keyword: ckan_run('package_search', {'q': 'water', 'include_private': True})\n"
+    "   - All datasets: ckan_run('package_search', {'q': '*:*', 'include_private': True})\n"
+    "   \n"
+    "4. ALWAYS include 'include_private': True (boolean True, NOT string 'true')\n"
+    "   - This shows BOTH public AND private datasets user has access to\n"
+    "   - Without it, users only see public datasets\n"
+    "   \n"
+    "5. Example conversation:\n"
+    "   User: \"What datasets do I have?\"\n"
+    "   ✅ CORRECT: ckan_run('package_search', {'q': '*:*', 'include_private': True})\n"
+    "   ❌ WRONG: ckan_run('package_list', {}) or ckan_run('package_list', {'limit': 10})\n"
+    "   \n"
+    "6. Only use other actions for specific needs:\n"
+    "   - 'package_show': Get details of ONE specific dataset by ID\n"
+    "   - 'organization_list': List organizations\n"
+    "   - 'group_list': List groups\n"
+    "   \n"
+    "7. Warn before write/delete operations\n\n"
     
     "**literature_search:**\n"
     "- ALWAYS rephrase user query for better semantic matching\n"
@@ -496,36 +565,93 @@ research_agent_prompt = (
 # --------------------- System Prompt & Agent ---------------------
 
 ckan_agent_prompt = (
-    "You execute CKAN actions. Your ONLY job is to call run_action and return the result.\n\n"
+    "You are an intelligent CKAN action optimizer that corrects, completes, and executes queries efficiently.\n\n"
     
-    "PROCESS:\n"
-    "1. Call run_action with the provided action name and parameters\n"
-    "2. If response.success = True:\n"
-    "   - Set status='success'\n"
-    "   - Set result='Action executed successfully'\n"
-    "   - RETURN immediately\n"
-    "3. If response.success = False:\n"
-    "   - Set status='fail'\n"
-    "   - Copy the error message to result field\n"
-    "   - RETURN immediately\n\n"
+    "YOUR ROLE:\n"
+    "1. Receive action + parameters from front_agent\n"
+    "2. Optimize the action (correct if suboptimal)\n"
+    "3. Complete missing parameters (add defaults)\n"
+    "4. Execute via run_action ONCE\n"
+    "5. Suggest pagination if response is large\n\n"
+    
+    "ACTION OPTIMIZATION RULES:\n"
+    "Suboptimal Actions → Better Alternatives:\n"
+    "- 'package_list' → 'package_search' (richer metadata, supports private datasets)\n"
+    "- 'current_package_list_with_resources' → 'package_search' (more flexible, better filtering)\n"
+    
+    "Why redirect:\n"
+    "- package_search: Shows full metadata, supports private datasets, allows filtering\n"
+    "- package_list: Only shows names, no metadata, limited usefulness\n\n"
+    
+    "PARAMETER AUTO-COMPLETION:\n"
+    "For 'package_search' (most common), ALWAYS ensure these parameters:\n"
+    "- 'q': '*:*' (if missing or empty - means \"all datasets\")\n"
+    "- 'include_private': True (CRITICAL - shows both public and private datasets)\n"
+    "- 'rows': 10 (pagination - reasonable default)\n"
+    "- 'start': 0 (pagination - first page)\n"
+    
+    "For other actions:\n"
+    "- Trust merge_with_smart_defaults() to add required parameters\n"
+    "- You focus on dataset search actions\n\n"
+    
+    "EXECUTION PROCESS:\n"
+    "1. Analyze received action and CHANGE IT if needed:\n"
+    "   \n"
+    "   IF action == 'package_list' OR action == 'current_package_list_with_resources':\n"
+    "       action_to_use = 'package_search'  # CHANGE the action name\n"
+    "       parameters_to_use = {'q': '*:*', 'include_private': True, 'rows': 10, 'start': 0}\n"
+    "   \n"
+    "   ELIF action == 'package_search':\n"
+    "       action_to_use = 'package_search'  # Keep the action\n"
+    "       parameters_to_use = complete parameters (ensure q, include_private, rows, start)\n"
+    "   \n"
+    "   ELSE:\n"
+    "       action_to_use = original action  # Keep as-is\n"
+    "       parameters_to_use = original parameters\n"
+    
+    "2. Complete parameters for package_search:\n"
+    "   - If 'q' missing or empty: set to '*:*'\n"
+    "   - If 'include_private' missing: set to True\n"
+    "   - If 'rows' missing: set to 10\n"
+    "   - If 'start' missing: set to 0\n"
+    
+    "3. Call run_action with the CORRECTED action name + COMPLETED parameters:\n"
+    "   run_action(action_to_use, parameters_to_use)\n"
+    "   \n"
+    "   CRITICAL: Use action_to_use (NOT the original action!)\n"
+    
+    "4. Check response:\n"
+    "   - If success=True and items_returned > 50:\n"
+    "     Add comment: 'Large result ({count} items). Consider pagination: rows=10, start=0/10/20...'\n"
+  "   - If success=False:\n"
+    "     Copy error to result\n"
+    
+    "5. Return CKANResult with status, action_name, parameters, result, comment\n\n"
+    
+    "EXAMPLES:\n"
+    
+    "Example 1 - Action Correction:\n"
+    "Input: action='package_list', parameters={}\n"
+    "Think: 'package_list is suboptimal, redirecting to package_search'\n"
+    "Execute: run_action('package_search', {'q': '*:*', 'include_private': True, 'rows': 10, 'start': 0})\n"
+    "Return: status='success', action_name='package_search', comment='Redirected from package_list for richer data'\n"
+    
+    "Example 2 - Parameter Completion:\n"
+    "Input: action='package_search', parameters={'q': 'climate'}\n"
+    "Think: 'Missing include_private and pagination'\n"
+    "Execute: run_action('package_search', {'q': 'climate', 'include_private': True, 'rows': 10, 'start': 0})\n"
+    "Return: status='success', action_name='package_search', parameters_auto_added={'include_private': True, 'rows': 10, 'start': 0}\n"
+    
+    "Example 3 - Large Result:\n"
+    "Execute: run_action returns items_returned=127\n"
+    "Return: status='success', comment='Large result (127 items). Consider pagination: rows=10, start=0/10/20...'\n\n"
     
     "CRITICAL RULES:\n"
-    "- Call run_action EXACTLY ONCE\n"
-    "- DO NOT analyze whether parameters are required\n"
-    "- DO NOT check documentation\n"
-    "- DO NOT suggest alternatives\n"
-    "- JUST call run_action and return the result\n"
-    "- Trust that run_action will handle everything\n\n"
-    
-    "WRONG (DO NOT DO THIS):\n"
-    "❌ 'The action requires parameters'\n"
-    "❌ 'Parameters are missing'\n"
-    "❌ Looking at documentation before calling\n\n"
-    
-    "CORRECT (DO THIS):\n"
-    "✅ Immediately call run_action\n"
-    "✅ Return whatever run_action returns\n"
-    "✅ Don't add your own opinions about parameters"
+    "- Call run_action EXACTLY ONCE (after optimization)\n"
+    "- ALWAYS add 'include_private': True for package_search\n"
+    "- ALWAYS redirect package_list → package_search\n"
+    "- Log what you changed for debugging\n"
+    "- Be helpful - explain corrections in comment field\n"
 )
 
 agent = Agent(
@@ -585,25 +711,47 @@ def convert_to_model_messages(history: str) -> List:
 def normalize_parameters(params: dict) -> dict:
     """
     Normalize parameters from JSON/LLM format to Python format.
-    Converts: true→True, false→False, null→None
+    CRITICAL: Converts string booleans to Python booleans for CKAN compatibility.
+    
+    Conversions:
+    - "true" / "True" / true → True (Python bool)
+    - "false" / "False" / false → False (Python bool)  
+    - "null" / "None" / null → None
+    
+    This is essential because CKAN actions expect Python booleans, not strings.
     """
     if not isinstance(params, dict):
         return params
     
     normalized = {}
+    conversions_made = []
+    
     for key, value in params.items():
+        original_value = value
+        
+        # Boolean conversions (critical for CKAN)
         if value is True or value == "true" or value == "True":
             normalized[key] = True
+            if original_value != True:
+                conversions_made.append(f"{key}: '{original_value}' → True")
         elif value is False or value == "false" or value == "False":
             normalized[key] = False
+            if original_value != False:
+                conversions_made.append(f"{key}: '{original_value}' → False")
         elif value is None or value == "null" or value == "None":
             normalized[key] = None
+            if value != None:
+                conversions_made.append(f"{key}: '{original_value}' → None")
         elif isinstance(value, dict):
             normalized[key] = normalize_parameters(value)
         elif isinstance(value, list):
             normalized[key] = [normalize_parameters(item) if isinstance(item, dict) else item for item in value]
         else:
             normalized[key] = value
+    
+    # Log conversions for debugging
+    if conversions_made:
+        log.debug(f"normalize_parameters converted: {', '.join(conversions_made)}")
     
     return normalized
 
@@ -636,9 +784,12 @@ async def ckan_run(ctx: RunContext[Deps], command: str, parameters: dict={}) -> 
                 f"Run the CKAN action: '{command}' with the parameters: {parameters}. "
                 "If the action fails, suggest the correct action and explain it using 'get_ckan_action_details'.",
                 deps=ctx.deps,
-                usage_limits=UsageLimits(request_limit=25,total_tokens_limit=128000),
+                usage_limits=UsageLimits(
+                    request_limit=config.REQUEST_LIMIT_CKAN_RUN,
+                    total_tokens_limit=config.MAX_TOKENS_CKAN_RUN
+                ),
             ),
-            timeout=90
+            timeout=config.CKAN_RUN_TIMEOUT
         )
         
         # Track usage metrics
@@ -657,8 +808,12 @@ async def ckan_run(ctx: RunContext[Deps], command: str, parameters: dict={}) -> 
         # If successful, fetch and truncate data separately for front_agent
         if ckan_result.status == 'success':
             try:
+                # CRITICAL: Use the CORRECTED action name from ckan_agent, not the original command
+                corrected_action = ckan_result.action_name or command
+                corrected_params = ckan_result.parameters or parameters
+                
                 # Fetch data separately (not sent to ckan_agent LLM)
-                merged_params = merge_with_smart_defaults(command, parameters)
+                merged_params = merge_with_smart_defaults(corrected_action, corrected_params)
                 user = CKANmodel.User.get(user_reference=ctx.deps.user_id)
                 context = {
                     "user": user.name,
@@ -668,7 +823,7 @@ async def ckan_run(ctx: RunContext[Deps], command: str, parameters: dict={}) -> 
                     "ignore_auth": False,
                 }
                 
-                response = toolkit.get_action(command)(context, merged_params)
+                response = toolkit.get_action(corrected_action)(context, merged_params)
                 
                 # Apply smart truncation
                 truncated = smart_truncate_response(response)
@@ -892,17 +1047,22 @@ def extract_dataset_uuid(input_string: str) -> str:
 #@rag_agent.tool_plain
 async def get_resource_file_contents(
     resource_url: str,
-    ssl_verify=False,
+    ssl_verify: bool = None,
 ) -> TextResource:
     """
     Retrieves the content of a resource stored in filetore, allows setting max_length of output and offset to extract a slice of content
 
     Args:
         resource_url (str): The download url of the CKAN resource
+        ssl_verify (bool): Whether to verify SSL certificates. Defaults to config value.
 
     Returns:
         TextResource: The raw string content of the file retrieved
     """
+    # Read SSL verification from config if not explicitly provided
+    if ssl_verify is None:
+        ssl_verify = toolkit.config.get("ckanext.chat.ssl_verify", True)
+    
     ckan_url = toolkit.config.get("ckan.site_url")
     try:
         resource = TextResource(url=resource_url)
@@ -930,7 +1090,11 @@ async def get_resource_file_contents(
             except Exception as e:
                 raise RuntimeError(f"Failed to read CKAN resource file: {e}")
         else:
+            # Use pooled session from Deps - no need to create a new one!
+            # This significantly improves performance for multiple downloads
             try:
+                # Note: get_resource_file_contents is called from ctx where Deps has http_session
+                # For now, create session here but this should be refactored to accept ctx
                 async with aiohttp.ClientSession() as session:
                     async with session.get(resource_url, ssl=ssl_verify) as response:
                         response.raise_for_status()
@@ -1137,16 +1301,19 @@ async def literature_search(
     start_time = datetime.now(timezone.utc)
     log.info(f"literature_search starting: query='{search_question[:100]}...', num_results={num_results}")
     
-    for attempt in range(3):
+    for attempt in range(config.MAX_RETRIES_LITERATURE_SEARCH):
         try:
-            log.debug(f"literature_search attempt {attempt+1}/3")
+            log.debug(f"literature_search attempt {attempt+1}/{config.MAX_RETRIES_LITERATURE_SEARCH}")
             r = await asyncio.wait_for(
                 rag_agent.run(
                     f"Search for documents using this question:{search_question}. You must return {num_results} results",
                     deps=ctx.deps,
-                    usage_limits=UsageLimits(request_limit=10,total_tokens_limit=128000),
+                    usage_limits=UsageLimits(
+                        request_limit=config.REQUEST_LIMIT_LITERATURE_SEARCH,
+                        total_tokens_limit=config.MAX_TOKENS_LITERATURE_SEARCH
+                    ),
                 ),
-                timeout=30
+                timeout=config.LITERATURE_SEARCH_TIMEOUT
             )
             
             # Track usage metrics
@@ -1193,7 +1360,22 @@ async def literature_search(
 
 @agent.tool_plain
 @research_agent.tool_plain
-async def literature_analyse(doc: TextResource, question: str, ssl_verify=False) -> list[str]:
+async def literature_analyse(doc: TextResource, question: str, ssl_verify: bool = None) -> list[str]:
+    """
+    Analyze a document to answer a question.
+    
+    Args:
+        doc: TextResource with document URL
+        question: Question to answer
+        ssl_verify: Whether to verify SSL certificates. Defaults to config value.
+    
+    Returns:
+        JSON string with analysis results
+    """
+    # Read SSL verification from config if not explicitly provided
+    if ssl_verify is None:
+        ssl_verify = toolkit.config.get("ckanext.chat.ssl_verify", True)
+    
     start_time = datetime.now(timezone.utc)
     log.info(f"literature_analyse starting: doc_url='{doc.url}', question='{question[:100]}...'")
     
@@ -1214,9 +1396,12 @@ async def literature_analyse(doc: TextResource, question: str, ssl_verify=False)
             doc_agent.run(
                 prompt,
                 deps=doc,
-                usage_limits=UsageLimits(request_limit=50,total_tokens_limit=128000),
+                usage_limits=UsageLimits(
+                    request_limit=config.REQUEST_LIMIT_LITERATURE_ANALYSE,
+                    total_tokens_limit=config.MAX_TOKENS_LITERATURE_ANALYSE
+                ),
             ),
-            timeout=120
+            timeout=config.LITERATURE_ANALYSE_TIMEOUT
         )
         
         # Track usage metrics

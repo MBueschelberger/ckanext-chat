@@ -77,7 +77,7 @@ def ask():
     #logger.debug(request.form)
     user_input = request.form.get("text")
     history = request.form.get("history", "")
-    research= request.form.get("reserach", False)
+    research = request.form.get("research", False)
     max_retries = 3
     attempt = 0
     tkuser = toolkit.current_user

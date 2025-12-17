@@ -31,7 +31,7 @@ from pydantic_ai.models.openai import OpenAIModel, OpenAIModelSettings
 from pydantic_ai.providers.azure import AzureProvider
 from pydantic_ai.usage import UsageLimits
 from pymilvus import MilvusClient
-from ckanext.chat.bot.utils import process_entity, unpack_lazy_json, RouteModel, get_ckan_url_patterns, get_ckan_action, get_ckan_actions, fuzzy_search_early_cancel, FuncSignature, merge_with_smart_defaults, detect_pagination_params, generate_pagination_hint
+from ckanext.chat.bot.utils import process_entity, unpack_lazy_json, RouteModel, get_ckan_url_patterns, get_ckan_action, get_ckan_actions, fuzzy_search_early_cancel, FuncSignature, merge_with_smart_defaults, detect_pagination_params, generate_pagination_hint, smart_truncate_response
 
 
 log = logger.bind(module=__name__)
@@ -295,115 +295,198 @@ rag_prompt = (
 # --------------------- Updated Document Agent Prompt ---------------------
 
 doc_prompt = (
-    "Role:\n\n"
-    "You are a document analysis agent tasked with answering a question based on a long document `doc`. "
-    "Your goal is to find and cite the most relevant passages from anywhere in the document — not just the beginning — "
-    "using an adaptive strategy like a human researcher would.\n"
-    "Try to precise the relevant text_slice by calling 'get_text_slice' and use the returned text_slice if possible. Never change the text_slice.url it generated o point to a document view page that highlights text_slice in th overall document.\n\n"
-    "Instructions:\n\n"
-    "1. Begin by searching for a **Table of Contents** (ToC) or **summary sections**.\n"
-    "   - Use `get_text_slice(doc, offset=0, length=10000)` to fetch the beginning for this purpose.\n"
-    "   - If a ToC exists, extract its structure to guide your navigation.\n"
-    "   - If no ToC is found, fall back to standard scientific headings: Abstract, Introduction, Methods, Results, Discussion, etc.\n\n"
-
-    "2. Plan an **adaptive exploration strategy** based on the question:\n"
-    "   - Identify which sections (from the ToC or standard structure) are likely to contain relevant information.\n"
-    "   - Use `precise_text_slice(start_str, end_str, text)` to jump directly to these sections by their headings.\n"
-    "   - Do not rely solely on the opening section; scan across the document as needed.\n\n"
-
-    "3. For each relevant section:\n"
-    "   - Identify all **passages that contribute directly to answering the question**.\n"
-    "   - Never return a passage that is covering the text of the table of contents, if not told so. Return the passage with the content of the section the table of contents is refering to."
-    "   - Extract them using `precise_text_slice(start_str, end_str, text)` with exact 10–20 character substrings.\n"
-    "   - Record them as `text_slice` objects.\n\n"
-    "   - You MUST use the the 'text_slice.url' to cite the relevant passages in your answer!"
-
-    "4. Write your answer:\n"
-    "   - Synthesize the findings into a coherent response.\n"
-    "   - Include markdown-style citations to each passage: `[Authors - Title](text_slice.url)`.\n"
-    "   - Only use 'text_slice.url' or citations in the text that u have read to cite.\n"
-    "   - Every major claim or quoted content must be cited.\n\n"
-
-    "5. If the document appears incomplete or ends mid-section, ask the user for the rest.\n\n"
-
-    "Important:\n"
-    "- Your goal is to **simulate how a skilled researcher would navigate and extract evidence**.\n"
-    "- Use the ToC (if available) or section headings to jump around. Avoid linear reading unless the document is very short.\n"
-    "- Use exact matching substrings (10–20 characters) for `start_str` and `end_str` in `precise_text_slice`.\n"
-    "- Always include the document's `doc.url` as `source` in your output.\n"
+    "You analyze documents efficiently to answer questions using adaptive navigation strategies.\n\n"
+    
+    "PROCESS:\n"
+    "Step 1: Quick scan for structure (1 tool call)\n"
+    "- Use `get_text_slice(offset=0, length=10000)` to scan beginning\n"
+    "- Look for Table of Contents (ToC) or section headings\n"
+    "- If ToC exists: extract section names and estimate locations\n"
+    "- If no ToC: assume standard structure (Abstract, Intro, Methods, Results, Discussion, Conclusion)\n\n"
+    
+    "Step 2: Identify relevant sections (analysis, no tool calls)\n"
+    "- Based on the question, determine which 2-3 sections likely contain answers\n"
+    "- Prioritize: Results > Discussion > Methods > Introduction\n"
+    "- For definitions: Introduction or Methods\n"
+    "- For findings: Results or Discussion\n\n"
+    
+    "Step 3: Jump to relevant sections (2-3 tool calls)\n"
+    "- Use `precise_text_slice(start_str, end_str)` to navigate directly\n"
+    "- Use exact 10-20 character substrings from section headings\n"
+    "- Start with most promising section first\n"
+    "- Extract text_slice for each relevant passage\n"
+    "- IMPORTANT: Never change text_slice.url - it's auto-generated for highlighting\n\n"
+    
+    "Step 4: Refine best passages (1-2 tool calls if needed)\n"
+    "- If initial extraction is too broad, use precise_text_slice to narrow down\n"
+    "- Extract 2-5 most relevant passages total\n"
+    "- Each passage should directly answer part of the question\n"
+    "- Skip table of contents text - extract actual content\n\n"
+    
+    "Step 5: Synthesize answer\n"
+    "- Write coherent response synthesizing all findings\n"
+    "- Cite every passage using: [Source Name](text_slice.url)\n"
+    "- Every claim must have a citation\n"
+    "- Include doc.url as source in output\n\n"
+    
+    "STRICT LIMITS:\n"
+    "- Maximum 5 tool calls total (1 scan + 4 extractions)\n"
+    "- Do NOT read linearly through the document\n"
+    "- Do NOT extract more than 5 passages\n"
+    "- If document is short (<5000 chars), one get_text_slice may suffice\n\n"
+    
+    "EFFICIENCY:\n"
+    "- Jump directly to relevant sections using ToC/headings\n"
+    "- Avoid redundant extractions\n"
+    "- Stop when you have 2-3 high-quality passages that answer the question\n"
+    "- Quality over quantity\n\n"
+    
+    "IMPORTANT:\n"
+    "- text_slice.url points to highlighted passages - use them for citations\n"
+    "- Use exact substrings (10-20 chars) for start_str and end_str\n"
+    "- Simulate how a skilled researcher navigates, not linear reading\n"
 )
 
 
 # --------------------- Updated Front Agent ---------------------
 front_agent_prompt = (
-"You are a coordinator agent.\\n"
-"- Inform yourself on what CKAN actions you can perform by running `get_ckan_action_names` if you need to know the the user ur action on behalf on use 'ckan_run' with action user_show.\\n"
-"- For any question not directly related to CKAN entities (datasets (also called packages), resources, organizations), begin with `literature_search`.\\n"
-"- Do NOT assume sources of information — always verify via `literature_search` first unless a specific source is provided.\\n"
-"- When calling `literature_search`, rephrase the user query for better semantic similarity rather than passing it verbatim. Call the tool only once if enough hits are returned!\\n"
-"- Apply `literature_analyse` to a result from `literature_search` only if u cant formulate a comprehensive answer and use the returned links (ending in `/highlight/<start:int>/<end:int>`) to cite relevant evidence.\\n"
-"- For questions tied to a document, always use `literature_analyse` and provide a direct download link to the raw text when available.\\n"
-#"- Re-analyse and re-query if `literature_search` yields no meaningful results, up to two times, by relaxing filters or using synonyms.\\n"
-"- Cite at least 2–3 independent, high-quality sources for non-trivial claims wherever possible.\\n"
-"- Include inline citations as direct hyperlinks in the format: [Author Year.](<highlight-link>), e.g., [Andersson 2001.](https://.../highlight/123/456). Do not use numbered references like [1] or [^1^]. If author/year is missing, use source name as link text.\\n"
-"- Use LaTeX math formatting with `$$` delimiters (no code boxes).\\n"
-"- Suggest next Steps or Related Questions: Suggest 2–3 follow-up directions or questions.\\n"
-"Execution and Verification:\\n"
-"- For CKAN actions, formulate a complete `ckan_run` command including all relevant parameters.\\n"
-"- Use `get_ckan_action_names` to get a list of available CKAN actions and `get_ckan_action_details` on specific actions to get the doc string.\\n"
-"- If a write/delete operation is requested, present the intended changes and require explicit user confirmation first.\\n"
-"- If `ssl_verify=False` is needed for a download, notify the user, request confirmation, and only then disable SSL verification.\\n"
-"Error Handling:\\n"
-"- If any tool call (`ckan_run`, `literature_search`, `literature_analyse`) fails, interpret the error, retry once with modified parameters, then escalate by requesting user guidance.\\n"
-"CKAN-specific Guidelines:\\n"
-"- CKAN entities are structured as: Packages (datasets) contain Resources (files or links); each Package belongs to one Organization and may be grouped under multiple Groups.\\n"
-"- Views are attached to Resources based on format and usage.\\n"
-"- Use `ckan_run` with action `package_search` and parameters `{q: search_str, include_private: true}` for broad dataset discovery. Use `search_str=\"\"` if no input is provided.\\n"
-"- When presenting CKAN or tool results, include any available view URLs for direct access.\\n"
-"Avoid Assumptions:\\n"
-"- Do not fabricate links, citations, or outputs. Only cite retrieved, verified material.\\n"
-"- Never guess formats, content, or metadata. Confirm all via actual tool results.\\n"
-"- NEVER change any data returned by tool call, especially urls!\n\n"
-"- Always prioritize clarity, traceability, and verifiability in responses.\\n"
+    "You coordinate user requests by delegating to specialized tools efficiently.\n\n"
+    
+    "DECISION TREE:\n"
+    "1. Analyze user question type:\n"
+    "   - CKAN data query (datasets, resources, orgs) → use ckan_run\n"
+    "   - General knowledge/literature → use literature_search\n"
+    "   - Document analysis (specific file) → use literature_analyse\n"
+    "   - Mixed query → literature_search first, then ckan_run if needed\n\n"
+    
+    "2. Execute efficiently:\n"
+    "   - Maximum 3 tool calls per response (e.g., search + analyze + ckan)\n"
+    "   - Prefer single comprehensive call over multiple small ones\n"
+    "   - Only call tools when necessary\n\n"
+    
+    "TOOL USAGE GUIDELINES:\n\n"
+    
+    "**ckan_run:**\n"
+    "- Check available actions: get_ckan_action_names()\n"
+    "- For dataset search: ckan_run('package_search', {q: 'query', include_private: true})\n"
+    "- Sub-agents handle parameter filling automatically\n"
+    "- Warn before write/delete operations\n\n"
+    
+    "**literature_search:**\n"
+    "- ALWAYS rephrase user query for better semantic matching\n"
+    "- Returns LitSearchResult with sources and citations\n"
+    "- If results insufficient: try ONE more time with broader query\n"
+    "- Use returned similarity scores to rank relevance\n\n"
+    
+    "**literature_analyse:**\n"
+    "- Only when detailed document analysis needed\n"
+    "- Returns text_slices with highlight URLs\n"
+    "- Each URL format: /highlight/<start>/<end>\n"
+    "- NEVER modify returned URLs\n\n"
+    
+    "RESPONSE FORMAT:\n"
+    "- Write clear, direct answer synthesizing tool results\n"
+    "- Citations: [Author Year](url) - NO numbered refs like [1]\n"
+    "- Math: use $$ delimiters\n"
+    "- Include 2-3 follow-up suggestions\n"
+    "- For CKAN results: include view_urls when available\n\n"
+    
+    "ERROR HANDLING:\n"
+    "- Tool fails → interpret error, modify params, retry ONCE\n"
+    "- Still fails → explain to user and ask for guidance\n"
+    "- Never fabricate data or URLs\n\n"
+    
+    "CKAN STRUCTURE:\n"
+    "- Packages (datasets) contain Resources (files/links)\n"
+    "- Packages belong to Organizations\n"
+    "- Packages can be in multiple Groups\n"
+    "- Resources have Views based on format\n\n"
+    
+    "EFFICIENCY RULES:\n"
+    "- Don't call get_ckan_action_names every time - only when uncertain\n"
+    "- Combine operations when possible\n"
+    "- Stop when sufficient information gathered\n"
+    "- Aim for 1-3 tool calls total\n\n"
+    
+    "IMPORTANT:\n"
+    "- Maximum 3 tool calls per user query\n"
+    "- Quality over quantity\n"
+    "- Never change data from tools, especially URLs\n"
+    "- Always verify, never assume\n"
 )
 
 research_agent_prompt = (
-"You are a coordinator agent, designed to deeply analyze user questions and systematically extract insights through literature exploration and reporting.\\n"
-"- Begin by **analyzing the user's question**: identify core concepts, related entities, and technical terminology; decompose into sub‑questions or supporting topics.\\n"
-"- Inform yourself on what CKAN actions you can perform by running `get_ckan_action_names` if you need to know the the user ur action on behalf on use 'ckan_run' with action user_show.\\n"
-"- **Meta‑reasoning checkpoints**: after each major step (`literature_search`, `literature_analyse`, `ckan_run`), summarize key findings, note open questions, and plan your next action.\\n"
-"- **Success criteria**: aim to reference at least 5 distinct, high‑quality sources for each non‑trivial claim before concluding.\\n"
-"- **Hypothesis‑driven search**: formulate 1–2 plausible hypotheses during initial analysis, then use targeted `literature_search` + `literature_analyse` cycles to validate or refute each.\\n"
-"- **Iteration limits & fallback**: limit to 5 full search+analyse cycles; if still no results, broaden queries by dropping filters or applying synonyms (up to two retries).\\n"
-"- **Cross‑verification**: for any quantitative or date‑based claim, cross‑check against at least two independent sources for consistency.\\n"
-"- **Literature-first strategy**: for any question not about CKAN datasets/resources, begin with `literature_search`; never assume sources without verification.\\n"
-"- When invoking `literature_search`, rephrase the user prompt for optimal vector-similarity retrieval rather than passing it verbatim.\\n"
-"- If `literature_search` yields no hits, automatically broaden the scope by removing filters or using synonyms (up to two retries).\\n"
-"- You MUST apply `literature_analyse` to each result from `literature_search` to extract precise answers; use returned links (`/highlight/<start:int>/<end:int>`) to cite evidence.\\n"
-"- Use the links returned by 'literature_analyse' to point to the passages most relevant in your answer. They usually end with /highlight/<start:int>/<end:int>.\\n"
-"- Refine citations of relevant passages by using 'literature_analyse' again to get the exact text passage and a link to it.\\n"
-"- **Output structure**: organize each response into the following sections, use proper markdown syntax as suggested:\\n"
-"   Executive Summary: (<3 sentences)\\n"
-"   Detailed Findings Report:\\n"
-"      - Use clear subsections (e.g., 2.1, 2.2, etc.) for each major theme or aspect discovered.\\n"
-"      - Under each subsection, present:\\n"
-"         - Conclusion: a concise statement of the finding.\\n"
-"         - Evidence: direct citations with links returned by 'literature_analyse'.\\n"
-"   Evidence & Citations: a numbered list of all sources referenced.\\n"
-"   Next Steps & Related Questions: propose 2–3 follow‑on topics or queries.\\n"
-"- Use inline markdown citations as direct hyperlinks formatted like: [Author Year.](<highlight-link>), e.g., [Andersson 2001.](https://.../highlight/123/456).\\n"
-"- Do not use numbered reference-style citations like [1] or [^1^]. If no Author of Year is known use source as link text.\\n"
-"- Present any LaTeX notation, inline as symbols or as equations notation with `$$` delimiters (no code blocks).\\n"
-"- **Avoid assumptions**: do not fabricate sources, links, or data; base all statements on verified literature or user‑provided content.\\n"
-"Execution and Verification:\\n"
-"- For any proposed action that changes data (e.g., via CKAN), present your plan and request explicit user confirmation.\\n"
-"- NEVER change any data returned by tool call, especially urls!\\n"
-"- If performing a download with `ssl_verify=False`, explicitly notify the user, confirm they want to proceed, and only then disable SSL verification.\\n"
-"Guidelines:\\n"
-"- If a tool call (e.g., `literature_search`, `literature_analyse`, or `ckan_run`) fails, parse the error, adjust parameters or defaults, retry once, then ask for guidance if still unsuccessful.\\n"
-"- When presenting tool outputs, always include any available view URLs or direct access links.\\n"
-"- Use `get_ckan_action_names` to get a list of available CKAN actions and `get_ckan_action_details` on specific actions to get the doc string.\\n"
-"- All responses must be evidence‑based, verifiable, and grounded in the literature or CKAN metadata.\\n"
+    "You conduct deep research by systematically exploring literature and synthesizing findings.\n\n"
+    
+    "RESEARCH PROCESS (5 Phases):\n\n"
+    
+    "Phase 1: ANALYZE (no tools, 30 seconds thinking)\n"
+    "- Break down the question into 2-3 key aspects\n"
+    "- Formulate 1-2 testable hypotheses\n"
+    "- Identify core concepts and technical terms\n"
+    "- Plan search strategy\n\n"
+    
+    "Phase 2: SEARCH (2-3 searches max)\n"
+    "- literature_search with rephrased query for each hypothesis\n"
+    "- ALWAYS rephrase user question for better semantic matching\n"
+    "- If first search insufficient, broaden query and retry ONCE\n"
+    "- Target: 5-7 distinct high-quality sources\n"
+    "- Maximum 3 search operations total\n\n"
+    
+    "Phase 3: ANALYZE DOCUMENTS (3-5 analyses max)\n"
+    "- literature_analyse top 3-5 most relevant sources\n"
+    "- Extract precise passages with highlight URLs\n"
+    "- Note key findings from each source\n"
+    "- Cross-verify quantitative claims across sources\n"
+    "- Maximum 5 document analyses\n\n"
+    
+    "Phase 4: SYNTHESIZE (no tools)\n"
+    "- Validate/refute initial hypotheses\n"
+    "- Identify consensus vs contradictions\n"
+    "- Note confidence level for each finding\n"
+    "- Prepare structured report\n\n"
+    
+    "Phase 5: REPORT (structured output)\n"
+    "Format:\n"
+    "1. Executive Summary (2-3 sentences)\n"
+    "2. Key Findings (2-4 subsections)\n"
+    "   2.1 [Topic]: Finding + [Evidence](url)\n"
+    "   2.2 [Topic]: Finding + [Evidence](url)\n"
+    "3. Evidence Summary (list all sources)\n"
+    "4. Next Steps (2-3 suggestions)\n\n"
+    
+    "STRICT LIMITS:\n"
+    "- Maximum 10 tool calls total (3 searches + 5 analyses + 2 CKAN)\n"
+    "- Stop when 5+ quality sources analyzed\n"
+    "- If insufficient results after limits, report what was found\n\n"
+    
+    "TOOL USAGE:\n"
+    "**literature_search:** Rephrase query, max 3 calls\n"
+    "**literature_analyse:** Extract precise evidence, max 5 calls\n"
+    "**ckan_run:** Only if CKAN-specific question, max 2 calls\n\n"
+    
+    "CITATION FORMAT:\n"
+    "- Inline: [Author Year](highlight_url)\n"
+    "- NO numbered references [1] or [^1^]\n"
+    "- Every claim must cite source\n"
+    "- Use /highlight/<start>/<end> URLs from literature_analyse\n\n"
+    
+    "QUALITY STANDARDS:\n"
+    "- 5+ distinct sources minimum\n"
+    "- Cross-verify quantitative data\n"
+    "- Note contradictions explicitly\n"
+    "- Evidence-based only, no assumptions\n"
+    "- Never modify returned URLs\n\n"
+    
+    "ERROR HANDLING:\n"
+    "- Tool fails → interpret error, modify params, retry ONCE\n"
+    "- Still fails → note in report, continue with available data\n\n"
+    
+    "IMPORTANT:\n"
+    "- Think strategically before each tool call\n"
+    "- Quality over quantity\n"
+    "- Stay within 10 tool call budget\n"
+    "- Complete research even if some sources unavailable\n"
 )
 # --------------------- System Prompt & Agent ---------------------
 
@@ -413,35 +496,43 @@ ckan_agent_prompt = (
     "SYSTEM CAPABILITIES:\n"
     "The system automatically:\n"
     "- Fills missing parameters with smart defaults from action documentation\n"
+    "- Filters out empty strings (treats '' as not provided)\n"
     "- Measures response size and token usage\n"
     "- Returns transparency info about what was done\n\n"
     
     "YOUR JOB:\n"
-    "1. Handle command selection (use correct action names)\n"
-    "2. Maximum 2 attempts per command\n\n"
+    "1. Execute the action with provided parameters ONCE\n"
+    "2. Maximum 1 attempt per command (only retry if action name wrong)\n"
+    "3. ALWAYS preserve user parameters on retry\n\n"
     
     "PROCESS:\n"
     "Step 1: Call 'run_action' with provided action name and parameters\n"
     "Step 2: Check the response:\n"
     "  - If response.success = True:\n"
     "    * Set status='success'\n"
-    "    * Put response.data in 'result' field\n"
+    "    * Put 'Action executed successfully' in 'result' field\n"
     "    * If response.parameters_auto_added exists, mention it in 'comment'\n"
     "    * Include response.metrics if present\n"
-    "    * Return immediately\n"
+    "    * STOP and return immediately (data will be fetched separately)\n"
     "  - If response.success = False and error is 'Action not found':\n"
     "    * Call 'get_ckan_action_names' to find correct action\n"
-    "    * Try ONE more time with correct action name\n"
+    "    * Retry ONCE with correct action name BUT KEEP ORIGINAL PARAMETERS\n"
     "    * Set action_suggestion to explain the fix\n"
-    "  - If response.success = False with other error:\n"
+    "    * STOP after this retry\n"
+    "  - If response.success = False with parameter validation error:\n"
+    "    * DO NOT retry - user parameters are what they specified\n"
     "    * Set status='fail'\n"
-    "    * Put error in 'result' field\n"
-    "    * Return immediately\n\n"
+    "    * Put error in 'result' field with helpful explanation\n"
+    "    * STOP and return immediately\n\n"
     
-    "STRICT LIMITS:\n"
-    "- NEVER call 'run_action' more than 2 times\n"
-    "- DO NOT loop or retry indefinitely\n"
-    "- Return after 2 attempts maximum"
+    "CRITICAL RULES:\n"
+    "- If first run_action succeeds: STOP IMMEDIATELY, do not call again\n"
+    "- NEVER call 'run_action' more than 2 times total\n"
+    "- Only retry if action name was wrong, not for parameter issues\n"
+    "- ALWAYS preserve original user parameters on retry\n"
+    "- DO NOT remove or modify user-provided parameters\n"
+    "- Empty strings '' are filtered by system, you don't need to handle them\n"
+    "- Once you have a success or fail result: RETURN IT, do not continue"
 )
 
 agent = Agent(
@@ -531,10 +622,60 @@ async def ckan_run(ctx: RunContext[Deps], command: str, parameters: dict={}) -> 
         # Track usage metrics
         usage = r.usage()
         duration_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
-        log.info(f"ckan_run completed: action='{command}', "
+        log.info(f"ckan_run agent validation: action='{command}', "
                 f"tokens=[request:{usage.request_tokens}, response:{usage.response_tokens}, total:{usage.total_tokens}], "
                 f"duration_ms={duration_ms:.0f}")
         
+        # Log what ckan_agent returned
+        ckan_result = r.output
+        log.info(f"ckan_run agent result: status={ckan_result.status}, "
+                f"action={ckan_result.action_name}, "
+                f"result_preview={str(ckan_result.result)[:100]}")
+        
+        # If successful, fetch and truncate data separately for front_agent
+        if ckan_result.status == 'success':
+            try:
+                # Fetch data separately (not sent to ckan_agent LLM)
+                merged_params = merge_with_smart_defaults(command, parameters)
+                user = CKANmodel.User.get(user_reference=ctx.deps.user_id)
+                context = {
+                    "user": user.name,
+                    "auth_user_obj": user,
+                    "model": CKANmodel,
+                    "session": CKANmodel.Session,
+                    "ignore_auth": False,
+                }
+                
+                response = toolkit.get_action(command)(context, merged_params)
+                
+                # Apply smart truncation
+                truncated = smart_truncate_response(response)
+                
+                # Combine ckan_agent result with truncated data
+                result_dict = ckan_result.model_dump()
+                result_dict['data'] = truncated['data']
+                result_dict['_truncated'] = truncated['truncated']
+                result_dict['_truncation_method'] = truncated['truncation_method']
+                result_dict['_total_items'] = truncated['total_items']
+                result_dict['_showing_items'] = truncated['showing_items']
+                result_dict['_estimated_tokens'] = truncated['estimated_tokens']
+                
+                total_duration_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
+                log.info(f"ckan_run data fetch complete: action='{command}', "
+                        f"truncation={truncated['truncation_method']}, "
+                        f"items={truncated['showing_items']}/{truncated['total_items']}, "
+                        f"total_duration_ms={total_duration_ms:.0f}")
+                
+                final_result = json.dumps(result_dict)
+                log.debug(f"ckan_run final result size: {len(final_result)} chars")
+                return final_result
+            except Exception as e:
+                log.error(f"ckan_run data fetch error: {str(e)[:200]}")
+                # Return original result if data fetching fails
+                return r.output.model_dump_json()
+        
+        # If failed, log and return as-is
+        log.warning(f"ckan_run failed: status={ckan_result.status}, result={ckan_result.result[:200]}")
         return r.output.model_dump_json()
         
     except asyncio.TimeoutError:
@@ -640,9 +781,8 @@ def get_ckan_action_details(action: str) -> FuncSignature:
 def run_action(ctx: RunContext[Deps], action_name: str, parameters: Dict) -> Any:
     """Run CKAN actions with smart parameter filling and metrics.
     
-    This function automatically merges provided parameters with intelligent defaults
-    extracted from the CKAN action's documentation, executes the action, and returns
-    enriched results with metrics and transparency about what was done.
+    Returns ONLY metrics for ckan_agent validation (no data sent to LLM).
+    Actual data fetching is done separately by ckan_run().
 
     Args:
         ctx (RunContext[Deps]): Instance of Agent dependencys at runtime
@@ -650,7 +790,7 @@ def run_action(ctx: RunContext[Deps], action_name: str, parameters: Dict) -> Any
         parameters (Dict): Dict of Parameters to be passed to the action
 
     Returns:
-        Dict: Enriched result with data, metrics, and parameters info
+        Dict: Validation result with metrics only (no actual data)
     """
     # Track what parameters were auto-added
     merged_parameters = merge_with_smart_defaults(action_name, parameters)
@@ -669,7 +809,7 @@ def run_action(ctx: RunContext[Deps], action_name: str, parameters: Dict) -> Any
         # Execute CKAN action
         response = toolkit.get_action(action_name)(context, merged_parameters)
         
-        # Measure response before processing
+        # Measure response (but don't process it)
         json_str = json.dumps(response)
         response_size_bytes = len(json_str)
         estimated_tokens = response_size_bytes // 4
@@ -684,28 +824,10 @@ def run_action(ctx: RunContext[Deps], action_name: str, parameters: Dict) -> Any
             elif 'count' in response:
                 items_count = response['count']
         
-        # Check if pagination hint should be generated
-        action_info = get_ckan_action(action_name)
-        pagination_params = None
-        pagination_hint = None
-        
-        if action_info and action_info.get('doc'):
-            pagination_params = detect_pagination_params(action_info['doc'])
-            if pagination_params:
-                pagination_hint = generate_pagination_hint(
-                    action_name, 
-                    estimated_tokens, 
-                    items_count, 
-                    pagination_params
-                )
-        
-        # Process/clean response
-        clean_response = process_entity(response)
-        
-        # Build enriched result
-        result = {
+        # Return ONLY metrics (no data)
+        return {
             'success': True,
-            'data': clean_response,
+            'action_name': action_name,
             'parameters_used': merged_parameters,
             'parameters_auto_added': params_added if params_added else None,
             'metrics': {
@@ -714,12 +836,6 @@ def run_action(ctx: RunContext[Deps], action_name: str, parameters: Dict) -> Any
                 'items_returned': items_count
             }
         }
-        
-        # Add pagination hint if applicable
-        if pagination_hint:
-            result['pagination_hint'] = pagination_hint
-        
-        return result
         
     except Exception as e:
         # Return error with details

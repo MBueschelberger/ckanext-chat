@@ -1,4 +1,5 @@
 import asyncio
+import json
 import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -95,6 +96,7 @@ class DynamicResource(BaseModel):
 
 class FuncSignature(BaseModel):
     doc: Any
+    defaults: Optional[Dict[str, Any]] = {}
 
 
 CKAN_ACTIONS: Dict[str, FuncSignature] = {}
@@ -112,6 +114,45 @@ def get_ckan_actions() -> Dict[str,str]:
             CKAN_ACTIONS[item] = FuncSignature(doc=doc).model_dump()
     return {k: v["doc"].strip().splitlines()[0] if v.get("doc") else "" for k, v in CKAN_ACTIONS.items()}
 
+def extract_defaults_from_signature(action_name: str) -> Dict[str, Any]:
+    """
+    Extract default parameter values directly from Python function signature.
+    This is completely dynamic and adapts to API changes automatically.
+    
+    Args:
+        action_name: The CKAN action name
+        
+    Returns:
+        Dictionary mapping parameter names to their default values
+    """
+    try:
+        import inspect
+        from ckan.logic import get_action
+        
+        # Get the actual action function
+        action_func = get_action(action_name)
+        
+        # Get its signature
+        sig = inspect.signature(action_func)
+        
+        # Extract parameters with defaults
+        defaults = {}
+        for param_name, param in sig.parameters.items():
+            # Skip framework parameters
+            if param_name in ('context', 'data_dict'):
+                continue
+                
+            # Check if parameter has a default value
+            if param.default != inspect.Parameter.empty:
+                defaults[param_name] = param.default
+        
+        return defaults
+        
+    except Exception as e:
+        log.debug(f"Could not inspect signature for {action_name}: {e}")
+        return {}
+
+
 def get_ckan_action(action: str) -> FuncSignature:
     global CKAN_ACTIONS
     if not CKAN_ACTIONS:
@@ -121,7 +162,9 @@ def get_ckan_action(action: str) -> FuncSignature:
         actions = [key for key in _actions.keys() if "_update" not in key]
         for item in actions:
             doc = help_show({}, {"name": item})
-            CKAN_ACTIONS[item] = FuncSignature(doc=doc).model_dump()
+            # Extract defaults from signature
+            defaults = extract_defaults_from_signature(item)
+            CKAN_ACTIONS[item] = FuncSignature(doc=doc, defaults=defaults).model_dump()
     if action in CKAN_ACTIONS.keys():
         return CKAN_ACTIONS[action]
     else:
@@ -135,9 +178,21 @@ def parse_default_value(value_str: str) -> Any:
     # Remove markdown/rst backticks that CKAN uses in docstrings
     value_str = value_str.replace('``', '').strip()
     
-    # Remove surrounding quotes
-    if value_str.startswith(("'", '"')) and value_str.endswith(("'", '"')):
+    # Remove trailing punctuation from docstring capture (., ,, ;)
+    value_str = value_str.rstrip('.,;')
+    
+    # Remove surrounding quotes (matched pairs)
+    if value_str.startswith(("'", '"')) and value_str.endswith(("'", '"')) and len(value_str) >= 2:
         value_str = value_str[1:-1].strip()
+    
+    # Remove unmatched quotes (parsing artifacts)
+    if value_str.count("'") == 1:
+        value_str = value_str.replace("'", "")
+    if value_str.count('"') == 1:
+        value_str = value_str.replace('"', "")
+    
+    # Clean again after quote removal
+    value_str = value_str.strip().rstrip('.,;')
     
     # Boolean values
     if value_str.lower() in ('true', 'false'):
@@ -159,22 +214,18 @@ def parse_default_value(value_str: str) -> Any:
     except ValueError:
         pass
     
-    # If it still looks like a quoted string, unwrap again
-    if value_str.startswith(("'", '"')) and value_str.endswith(("'", '"')):
-        value_str = value_str[1:-1]
-    
     # Return as-is if we can't parse it
     return value_str
 
 
 def extract_param_defaults(action_doc: str) -> Dict[str, Any]:
     """
-    Parse CKAN action docstring to extract parameter defaults.
+    Parse CKAN action docstring to extract parameter defaults dynamically.
     
     Looks for patterns like:
     - :param name: (optional, default: value)
     - :param name: description (default: value)
-    - (default: value)
+    - :param name: ... Default: value
     
     Args:
         action_doc: The docstring from help_show()
@@ -193,7 +244,9 @@ def extract_param_defaults(action_doc: str) -> Dict[str, Any]:
         r':param\s+(\w+):\s*[^:]*?\(default:\s*([^)]+)\)',
         # Pattern 2: :param name: ... default: value
         r':param\s+(\w+):\s*[^:]*?default:\s*([^),\n]+)',
-        # Pattern 3: (optional, default: value) anywhere after param
+        # Pattern 3: :param name: ... Default: value (capital D)
+        r':param\s+(\w+):\s*[^:]*?Default:\s*([^),\n]+)',
+        # Pattern 4: (optional, default: value) anywhere after param
         r':param\s+(\w+):[^:]*?\(optional[^)]*default:\s*([^)]+)\)',
     ]
     
@@ -204,51 +257,52 @@ def extract_param_defaults(action_doc: str) -> Dict[str, Any]:
                 default_value_str = match.group(2).strip().rstrip(')')
                 defaults[param_name] = parse_default_value(default_value_str)
     
-    # Add common CKAN defaults that are typically used
-    common_defaults = {
-        'include_private': True,  # For search operations
-        'limit': 1000,  # For list operations
-        'offset': 0,  # For pagination
-    }
-    
-    # Only add common defaults if they match the action pattern
-    action_lower = action_doc.lower() if action_doc else ""
-    if 'search' in action_lower and 'include_private' not in defaults:
-        defaults['include_private'] = True
-    if 'list' in action_lower and 'limit' not in defaults:
-        defaults['limit'] = 1000
-    
     return defaults
 
 
 def merge_with_smart_defaults(action: str, provided_params: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Merge provided parameters with defaults extracted from action signature.
+    Merge provided parameters with defaults extracted dynamically from action metadata.
     
-    This function:
-    1. Gets the cached action documentation
-    2. Extracts default values from the docstring
-    3. Merges with provided params (provided params take precedence)
+    Pure dynamic approach using three tiers:
+    1. Signature inspection (Python code defaults - most accurate)
+    2. Docstring parsing (documented defaults from help_show)
+    3. User parameters (always take precedence, except empty strings)
+    
+    Zero hardcoding - everything extracted dynamically from CKAN.
     
     Args:
         action: The CKAN action name
         provided_params: Parameters provided by the user/agent
         
     Returns:
-        Merged dictionary with defaults filled in
+        Merged dictionary with defaults filled in (provided params take precedence)
     """
     action_info = get_ckan_action(action)
     
-    if not action_info or not action_info.get('doc'):
+    if not action_info:
         return provided_params
     
-    # Extract defaults from docstring
-    defaults = extract_param_defaults(action_info['doc'])
+    # Filter out empty strings and None - treat as not provided
+    # Empty string "" should use defaults, not override them
+    filtered_params = {
+        k: v for k, v in provided_params.items() 
+        if v != "" and v is not None
+    }
     
-    # Merge: provided params override defaults
-    merged = {**defaults, **provided_params}
+    # Tier 1: Signature defaults (from Python function signature)
+    sig_defaults = action_info.get('defaults', {})
     
-    log.debug(f"merge_with_smart_defaults: action={action}, defaults={defaults}, merged={merged}")
+    # Tier 2: Docstring defaults (from help_show documentation)
+    doc_defaults = extract_param_defaults(action_info.get('doc', ''))
+    
+    # Merge: signature defaults override docstring (more authoritative)
+    defaults = {**doc_defaults, **sig_defaults}
+    
+    # Tier 3: User params always override everything (but not empty strings)
+    merged = {**defaults, **filtered_params}
+    
+    log.debug(f"merge_with_smart_defaults: action={action}, sig_defaults={sig_defaults}, doc_defaults={doc_defaults}, filtered_params={filtered_params}, merged={merged}")
     
     return merged
 
@@ -447,6 +501,113 @@ def truncate_by_depth(data, max_depth, current_depth=0, placeholder="..."):
             for item in data
         ]
     return data
+
+
+def smart_truncate_response(response: Any, max_tokens: int = 8000) -> Dict[str, Any]:
+    """
+    Intelligently truncate CKAN response based on structure and size.
+    
+    Strategy:
+    - Small responses (<2K tokens): No truncation
+    - Medium responses (2K-8K tokens): Depth truncation (keeps all items, limits detail)
+    - Large responses (>8K tokens): Combined depth + item limit
+    
+    Args:
+        response: Raw CKAN API response
+        max_tokens: Maximum token budget (default: 8000)
+        
+    Returns:
+        Dict with truncated data and metadata about truncation
+    """
+    # Estimate size
+    json_str = json.dumps(response)
+    estimated_tokens = len(json_str) // 4
+    total_count = 1
+    
+    # Count items
+    if isinstance(response, list):
+        total_count = len(response)
+        items = response
+    elif isinstance(response, dict) and 'results' in response:
+        total_count = response.get('count', len(response['results']))
+        items = response['results']
+    elif isinstance(response, dict):
+        items = response
+        total_count = 1
+    else:
+        items = response
+        total_count = 1
+    
+    # Decision tree
+    if estimated_tokens < 2000:
+        # Small response - no truncation needed
+        return {
+            'data': process_entity(response),
+            'truncated': False,
+            'truncation_method': 'none',
+            'total_items': total_count,
+            'showing_items': total_count if isinstance(items, list) else 1,
+            'estimated_tokens': estimated_tokens
+        }
+    
+    elif estimated_tokens < 8000:
+        # Medium response - use depth truncation (keeps all items, less detail)
+        # Process entities FIRST (before truncation to avoid DynamicResource errors)
+        processed_response = process_entity(response)
+        truncated_data = truncate_by_depth(processed_response, max_depth=2)
+        
+        # Re-estimate after truncation
+        new_json_str = json.dumps(truncated_data)
+        new_tokens = len(new_json_str) // 4
+        
+        return {
+            'data': truncated_data,
+            'truncated': True,
+            'truncation_method': 'depth',
+            'total_items': total_count,
+            'showing_items': total_count if isinstance(items, list) else 1,
+            'estimated_tokens': new_tokens,
+            'original_tokens': estimated_tokens
+        }
+    
+    else:
+        # Large response - combine depth truncation + item limit
+        # Process entities FIRST (before truncation to avoid DynamicResource errors)
+        processed_response = process_entity(response)
+        
+        # Then limit items and truncate
+        if isinstance(processed_response, dict) and 'results' in processed_response:
+            # Keep top-level structure, truncate individual results
+            limited_response = {**processed_response}
+            limited_response['results'] = [
+                truncate_by_depth(item, max_depth=3) for item in processed_response['results'][:10]
+            ]
+        elif isinstance(processed_response, list):
+            limited_response = [truncate_by_depth(item, max_depth=3) for item in processed_response[:10]]
+        else:
+            limited_response = truncate_by_depth(processed_response, max_depth=3)
+        
+        # Calculate actual showing count
+        if isinstance(response, dict) and 'results' in response:
+            showing_count = min(10, len(response['results']))
+        elif isinstance(response, list):
+            showing_count = min(10, len(response))
+        else:
+            showing_count = 1
+        
+        # Re-estimate after truncation
+        new_json_str = json.dumps(limited_response)
+        new_tokens = len(new_json_str) // 4
+        
+        return {
+            'data': limited_response,
+            'truncated': True,
+            'truncation_method': 'depth+limit',
+            'total_items': total_count,
+            'showing_items': showing_count,
+            'estimated_tokens': new_tokens,
+            'original_tokens': estimated_tokens
+        }
 
 
 def unpack_lazy_json(obj):

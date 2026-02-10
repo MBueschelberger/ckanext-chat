@@ -1,0 +1,105 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel", "setuptools-scm>=8.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ckanext-chat"
+dynamic = ["version"]
+description = "Extension adds a pydantic ai chat interface to CKAN, that can run actions with user aware context."
+readme = "README.md"
+authors = [
+    {name = "Thomas Hanke", email = "thomas.hanke@iwm.fraunhofer.de"}
+]
+license = {text = "AGPL"}
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+]
+keywords = ["CKAN", "AI", "CHAT", "ASSISTANT"]
+requires-python = ">=3.8"
+dependencies = [
+    "pydantic-ai-slim[openai,logfire]==1.32.0",
+    "openai",
+    "logfire[httpx]",
+    "nest_asyncio",
+    "pymilvus==2.5.5",
+    "tiktoken",
+    "regex",
+    "aiofiles",
+    "aiohttp[speedups]",
+    "loguru",
+]
+
+[project.urls]
+Homepage = "https://github.com/Mat-O-Lab/ckanext-chat"
+
+[project.entry-points."ckan.plugins"]
+chat = "ckanext.chat.plugin:ChatPlugin"
+
+[project.entry-points."babel.extractors"]
+ckan = "ckan.lib.extract:extract_ckan"
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-ckan",
+    "pytest-cov",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-data]
+"ckanext.chat" = [
+    "templates/**/*.html",
+    "assets/**/*",
+    "public/**/*",
+    "migration/**/*.py",
+    "migration/**/*.ini",
+    "migration/**/*.mako",
+    "i18n/**/*.mo",
+    "i18n/**/*.pot",
+    "**/*.json",
+    "**/*.js",
+    "**/*.less",
+    "**/*.css",
+    "**/*.yml",
+]
+
+# Babel configuration for i18n
+[tool.babel.extract_messages]
+keywords = "translate isPlural"
+add_comments = "TRANSLATORS:"
+output_file = "ckanext/chat/i18n/ckanext-chat.pot"
+width = 80
+
+[tool.babel.init_catalog]
+domain = "ckanext-chat"
+input_file = "ckanext/chat/i18n/ckanext-chat.pot"
+output_dir = "ckanext/chat/i18n"
+
+[tool.babel.update_catalog]
+domain = "ckanext-chat"
+input_file = "ckanext/chat/i18n/ckanext-chat.pot"
+output_dir = "ckanext/chat/i18n"
+previous = true
+
+[tool.babel.compile_catalog]
+domain = "ckanext-chat"
+directory = "ckanext/chat/i18n"
+statistics = true
+
+# Pytest configuration
+[tool.pytest.ini_options]
+addopts = "--ckan-ini=test.ini"
+
+# Setuptools-scm configuration for dynamic versioning from git tags
+[tool.setuptools_scm]
+# Version is automatically derived from git tags
+# Use tags like 'v0.2.0', 'v0.3.0', etc.
+# Dev versions between tags will be like '0.1.5a1.post1.dev27+g1500c3d'
+fallback_version = "0.0.0.dev0"

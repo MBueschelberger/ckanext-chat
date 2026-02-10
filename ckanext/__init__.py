@@ -1,11 +1,4 @@
-# encoding: utf-8
-
-# this is a namespace package
-try:
-    import pkg_resources
-
-    pkg_resources.declare_namespace(__name__)
-except ImportError:
-    import pkgutil
-
-    __path__ = pkgutil.extend_path(__path__, __name__)
+# This is a namespace package (PEP 420)
+# Modern Python 3 uses implicit namespace packages
+# This file should remain empty or minimal
+__path__ = __import__('pkgutil').extend_path(__path__, __name__)

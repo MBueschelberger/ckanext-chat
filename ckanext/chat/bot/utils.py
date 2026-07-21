@@ -1,6 +1,8 @@
 import asyncio
+import json
 import re
 import time
+from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
 import ckan.plugins.toolkit as toolkit
@@ -95,12 +97,18 @@ class DynamicResource(BaseModel):
 
 class FuncSignature(BaseModel):
     doc: Any
+    defaults: Optional[Dict[str, Any]] = {}
 
 
 CKAN_ACTIONS: Dict[str, FuncSignature] = {}
 
 
-def get_ckan_action(action: str = "") -> FuncSignature:
+@lru_cache(maxsize=1)
+def get_ckan_actions() -> Dict[str,str]:
+    """
+    Get all CKAN actions with LRU caching.
+    Cache is cleared when CKAN is restarted.
+    """
     global CKAN_ACTIONS
     if not CKAN_ACTIONS:
         from ckan.logic import _actions
@@ -110,10 +118,278 @@ def get_ckan_action(action: str = "") -> FuncSignature:
         for item in actions:
             doc = help_show({}, {"name": item})
             CKAN_ACTIONS[item] = FuncSignature(doc=doc).model_dump()
+    return {k: v["doc"].strip().splitlines()[0] if v.get("doc") else "" for k, v in CKAN_ACTIONS.items()}
+
+def extract_defaults_from_signature(action_name: str) -> Dict[str, Any]:
+    """
+    Extract default parameter values directly from Python function signature.
+    This is completely dynamic and adapts to API changes automatically.
+    
+    Args:
+        action_name: The CKAN action name
+        
+    Returns:
+        Dictionary mapping parameter names to their default values
+    """
+    try:
+        import inspect
+        from ckan.logic import get_action
+        
+        # Get the actual action function
+        action_func = get_action(action_name)
+        
+        # Get its signature
+        sig = inspect.signature(action_func)
+        
+        # Extract parameters with defaults
+        defaults = {}
+        for param_name, param in sig.parameters.items():
+            # Skip framework parameters
+            if param_name in ('context', 'data_dict'):
+                continue
+                
+            # Check if parameter has a default value
+            if param.default != inspect.Parameter.empty:
+                defaults[param_name] = param.default
+        
+        return defaults
+        
+    except Exception as e:
+        log.debug(f"Could not inspect signature for {action_name}: {e}")
+        return {}
+
+
+def get_ckan_action(action: str) -> FuncSignature:
+    global CKAN_ACTIONS
+    if not CKAN_ACTIONS:
+        from ckan.logic import _actions
+        from ckan.logic.action.get import help_show
+
+        actions = [key for key in _actions.keys() if "_update" not in key]
+        for item in actions:
+            doc = help_show({}, {"name": item})
+            # Extract defaults from signature
+            defaults = extract_defaults_from_signature(item)
+            CKAN_ACTIONS[item] = FuncSignature(doc=doc, defaults=defaults).model_dump()
     if action in CKAN_ACTIONS.keys():
         return CKAN_ACTIONS[action]
     else:
-        return CKAN_ACTIONS
+        return None
+
+
+def parse_default_value(value_str: str) -> Any:
+    """Convert string representation of default value to actual Python type"""
+    value_str = value_str.strip()
+    
+    # Remove markdown/rst backticks that CKAN uses in docstrings
+    value_str = value_str.replace('``', '').strip()
+    
+    # Remove trailing punctuation from docstring capture (., ,, ;)
+    value_str = value_str.rstrip('.,;')
+    
+    # Remove surrounding quotes (matched pairs)
+    if value_str.startswith(("'", '"')) and value_str.endswith(("'", '"')) and len(value_str) >= 2:
+        value_str = value_str[1:-1].strip()
+    
+    # Remove unmatched quotes (parsing artifacts)
+    if value_str.count("'") == 1:
+        value_str = value_str.replace("'", "")
+    if value_str.count('"') == 1:
+        value_str = value_str.replace('"', "")
+    
+    # Clean again after quote removal
+    value_str = value_str.strip().rstrip('.,;')
+    
+    # Boolean values
+    if value_str.lower() in ('true', 'false'):
+        return value_str.lower() == 'true'
+    
+    # None/null values
+    if value_str.lower() in ('none', 'null'):
+        return None
+    
+    # Integer values
+    try:
+        return int(value_str)
+    except ValueError:
+        pass
+    
+    # Float values
+    try:
+        return float(value_str)
+    except ValueError:
+        pass
+    
+    # Return as-is if we can't parse it
+    return value_str
+
+
+def extract_param_defaults(action_doc: str) -> Dict[str, Any]:
+    """
+    Parse CKAN action docstring to extract parameter defaults dynamically.
+    
+    Looks for patterns like:
+    - :param name: (optional, default: value)
+    - :param name: description (default: value)
+    - :param name: ... Default: value
+    
+    Args:
+        action_doc: The docstring from help_show()
+        
+    Returns:
+        Dictionary mapping parameter names to their default values
+    """
+    if not action_doc:
+        return {}
+    
+    defaults = {}
+    
+    # Try multiple patterns to match different docstring formats
+    patterns = [
+        # Pattern 1: :param name: ... (default: value)
+        r':param\s+(\w+):\s*[^:]*?\(default:\s*([^)]+)\)',
+        # Pattern 2: :param name: ... default: value
+        r':param\s+(\w+):\s*[^:]*?default:\s*([^),\n]+)',
+        # Pattern 3: :param name: ... Default: value (capital D)
+        r':param\s+(\w+):\s*[^:]*?Default:\s*([^),\n]+)',
+        # Pattern 4: (optional, default: value) anywhere after param
+        r':param\s+(\w+):[^:]*?\(optional[^)]*default:\s*([^)]+)\)',
+    ]
+    
+    for pattern in patterns:
+        for match in re.finditer(pattern, action_doc, re.MULTILINE | re.IGNORECASE):
+            param_name = match.group(1)
+            if param_name not in defaults:  # Don't override if already found
+                default_value_str = match.group(2).strip().rstrip(')')
+                defaults[param_name] = parse_default_value(default_value_str)
+    
+    return defaults
+
+
+def merge_with_smart_defaults(action: str, provided_params: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Merge provided parameters with defaults extracted dynamically from action metadata.
+    
+    Pure dynamic approach using three tiers:
+    1. Signature inspection (Python code defaults - most accurate)
+    2. Docstring parsing (documented defaults from help_show)
+    3. User parameters (always take precedence, except empty strings)
+    
+    Zero hardcoding - everything extracted dynamically from CKAN.
+    
+    Args:
+        action: The CKAN action name
+        provided_params: Parameters provided by the user/agent
+        
+    Returns:
+        Merged dictionary with defaults filled in (provided params take precedence)
+    """
+    action_info = get_ckan_action(action)
+    
+    if not action_info:
+        return provided_params
+    
+    # Filter out empty strings and None - treat as not provided
+    # Empty string "" should use defaults, not override them
+    filtered_params = {
+        k: v for k, v in provided_params.items() 
+        if v != "" and v is not None
+    }
+    
+    # Tier 1: Signature defaults (from Python function signature)
+    sig_defaults = action_info.get('defaults', {})
+    
+    # Tier 2: Docstring defaults (from help_show documentation)
+    doc_defaults = extract_param_defaults(action_info.get('doc', ''))
+    
+    # Merge: signature defaults override docstring (more authoritative)
+    defaults = {**doc_defaults, **sig_defaults}
+    
+    # Tier 3: User params always override everything (but not empty strings)
+    merged = {**defaults, **filtered_params}
+    
+    log.debug(f"merge_with_smart_defaults: action={action}, sig_defaults={sig_defaults}, doc_defaults={doc_defaults}, filtered_params={filtered_params}, merged={merged}")
+    
+    return merged
+
+
+def detect_pagination_params(action_doc: str) -> Optional[Dict[str, str]]:
+    """
+    Detect pagination parameters from CKAN action documentation.
+    
+    Looks for common pagination patterns:
+    - limit/offset
+    - rows/start
+    - per_page/page
+    
+    Args:
+        action_doc: The docstring from help_show()
+        
+    Returns:
+        Dict with 'limit' and 'offset' keys mapping to actual parameter names,
+        or None if no pagination params found
+    """
+    if not action_doc:
+        return None
+    
+    pagination_keywords = {
+        'limit': ['limit', 'rows', 'per_page'],
+        'offset': ['offset', 'start', 'page']
+    }
+    
+    found_params = {}
+    doc_lower = action_doc.lower()
+    
+    # Check for each pagination keyword
+    for param_type, keywords in pagination_keywords.items():
+        for keyword in keywords:
+            # Look for :param keyword: in docstring
+            if f':param {keyword}' in doc_lower:
+                found_params[param_type] = keyword
+                break
+    
+    # Only return if we found at least a limit parameter
+    return found_params if 'limit' in found_params else None
+
+
+def generate_pagination_hint(action_name: str, estimated_tokens: int, items_count: int, pagination_params: Optional[Dict[str, str]]) -> Optional[str]:
+    """
+    Generate pagination hint if response is large and action supports pagination.
+    
+    Args:
+        action_name: The CKAN action name
+        estimated_tokens: Estimated token count of response
+        items_count: Number of items in response
+        pagination_params: Dict with pagination parameter names (from detect_pagination_params)
+        
+    Returns:
+        Pagination hint string, or None if not needed
+    """
+    # Only suggest pagination if response is large (>2000 tokens)
+    if estimated_tokens < 2000:
+        return None
+    
+    # Only suggest if action supports pagination
+    if not pagination_params:
+        return None
+    
+    limit_param = pagination_params.get('limit', 'limit')
+    offset_param = pagination_params.get('offset', 'offset')
+    
+    # Calculate suggested page size and number of pages
+    suggested_limit = min(50, max(10, items_count // 10))
+    estimated_pages = (items_count + suggested_limit - 1) // suggested_limit if items_count > 0 else 1
+    
+    hint = (
+        f"Response is large ({estimated_tokens} tokens, {items_count} items). "
+        f"Consider pagination:\n"
+        f"- Use '{limit_param}' parameter to set page size (suggested: {suggested_limit})\n"
+        f"- Use '{offset_param}' parameter to iterate through pages\n"
+        f"- Estimated pages needed: {estimated_pages}\n"
+        f"Example: {action_name}({limit_param}={suggested_limit}, {offset_param}=0)"
+    )
+    
+    return hint
 
 
 # --------------------- CKAN Routing and URL Helpers ---------------------
@@ -212,25 +488,155 @@ def truncate_value(value, max_length):
 
 
 def truncate_by_depth(data, max_depth, current_depth=0, placeholder="..."):
+    """
+    Truncate data by depth, removing empty/None values completely.
+    This keeps the response minimal and meaningful.
+    """
     if current_depth >= max_depth:
         return placeholder
+    
     if isinstance(data, dict):
-        return {
-            key: truncate_by_depth(
+        result = {}
+        for key, value in data.items():
+            # Skip None, empty strings, empty lists, empty dicts
+            if value in (None, "", [], {}):
+                continue
+            
+            truncated = truncate_by_depth(
                 truncate_value(value, max_length=200),
                 max_depth,
                 current_depth + 1,
                 placeholder,
             )
-            for key, value in data.items()
-        }
+            
+            # Only include if the truncated value is meaningful
+            if truncated not in (None, "", [], {}, placeholder):
+                result[key] = truncated
+        
+        return result
+    
     if isinstance(data, list):
-        data = truncate_value(data, max_length=200)
-        return [
-            truncate_by_depth(item, max_depth, current_depth + 1, placeholder)
-            for item in data
-        ]
+        # Filter out None/empty items first
+        filtered = [item for item in data if item not in (None, "", [], {})]
+        data = truncate_value(filtered, max_length=200)
+        
+        result = []
+        for item in data:
+            truncated = truncate_by_depth(item, max_depth, current_depth + 1, placeholder)
+            # Only include meaningful items
+            if truncated not in (None, "", [], {}, placeholder):
+                result.append(truncated)
+        
+        return result
+    
     return data
+
+
+def smart_truncate_response(response: Any, max_tokens: int = 1500) -> Dict[str, Any]:
+    """
+    Intelligently truncate CKAN response based on structure and size.
+    
+    Strategy:
+    - Small responses (<500 tokens): No truncation
+    - Medium responses (500-1.5K tokens): Depth truncation (keeps all items, limits detail)
+    - Large responses (>1.5K tokens): Combined depth + item limit
+    
+    Args:
+        response: Raw CKAN API response
+        max_tokens: Maximum token budget (default: 8000)
+        
+    Returns:
+        Dict with truncated data and metadata about truncation
+    """
+    # Estimate size
+    json_str = json.dumps(response)
+    estimated_tokens = len(json_str) // 4
+    total_count = 1
+    
+    # Count items
+    if isinstance(response, list):
+        total_count = len(response)
+        items = response
+    elif isinstance(response, dict) and 'results' in response:
+        total_count = response.get('count', len(response['results']))
+        items = response['results']
+    elif isinstance(response, dict):
+        items = response
+        total_count = 1
+    else:
+        items = response
+        total_count = 1
+    
+    # Decision tree
+    if estimated_tokens < 500:
+        # Small response - no truncation needed
+        return {
+            'data': process_entity(response),
+            'truncated': False,
+            'truncation_method': 'none',
+            'total_items': total_count,
+            'showing_items': total_count if isinstance(items, list) else 1,
+            'estimated_tokens': estimated_tokens
+        }
+    
+    elif estimated_tokens < 1500:
+        # Medium response - use depth truncation (keeps all items, less detail)
+        # Process entities FIRST (before truncation to avoid DynamicResource errors)
+        processed_response = process_entity(response)
+        truncated_data = truncate_by_depth(processed_response, max_depth=3)
+        
+        # Re-estimate after truncation
+        new_json_str = json.dumps(truncated_data)
+        new_tokens = len(new_json_str) // 4
+        
+        return {
+            'data': truncated_data,
+            'truncated': True,
+            'truncation_method': 'depth',
+            'total_items': total_count,
+            'showing_items': total_count if isinstance(items, list) else 1,
+            'estimated_tokens': new_tokens,
+            'original_tokens': estimated_tokens
+        }
+    
+    else:
+        # Large response - combine depth truncation + item limit
+        # Process entities FIRST (before truncation to avoid DynamicResource errors)
+        processed_response = process_entity(response)
+        
+        # Then limit items and truncate (reduced to 5 items for speed)
+        if isinstance(processed_response, dict) and 'results' in processed_response:
+            # Keep top-level structure, truncate individual results
+            limited_response = {**processed_response}
+            limited_response['results'] = [
+                truncate_by_depth(item, max_depth=2) for item in processed_response['results'][:5]
+            ]
+        elif isinstance(processed_response, list):
+            limited_response = [truncate_by_depth(item, max_depth=2) for item in processed_response[:5]]
+        else:
+            limited_response = truncate_by_depth(processed_response, max_depth=2)
+        
+        # Calculate actual showing count
+        if isinstance(response, dict) and 'results' in response:
+            showing_count = min(5, len(response['results']))
+        elif isinstance(response, list):
+            showing_count = min(5, len(response))
+        else:
+            showing_count = 1
+        
+        # Re-estimate after truncation
+        new_json_str = json.dumps(limited_response)
+        new_tokens = len(new_json_str) // 4
+        
+        return {
+            'data': limited_response,
+            'truncated': True,
+            'truncation_method': 'depth+limit',
+            'total_items': total_count,
+            'showing_items': showing_count,
+            'estimated_tokens': new_tokens,
+            'original_tokens': estimated_tokens
+        }
 
 
 def unpack_lazy_json(obj):
@@ -247,12 +653,9 @@ def process_entity(data: Any, depth: int = 0, max_depth: int = 4) -> Any:
     #log.debug(f"{type(data)},{depth},{max_depth}")
     if depth > max_depth:
         log.warning("Max recursion depth reached")
-        #data=truncate_by_depth(data,max_depth)
         return None
-
+    data = unpack_lazy_json(data)
     if isinstance(data, dict):
-        data = unpack_lazy_json(data)
-        #log.debug(data.keys())
         if "resources" in data:
             try:
                 #log.debug("Dataset")

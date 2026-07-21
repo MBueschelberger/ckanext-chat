@@ -13,6 +13,8 @@ from flask import Blueprint, current_app, jsonify, request
 from flask.views import MethodView
 from loguru import logger
 from pydantic_ai.messages import TextPart
+from pydantic_ai.usage import UsageLimits
+
 
 # from ckanext.chat.bot.agent import (Deps, async_agent_response,
 #                                     exception_to_model_response,
@@ -72,10 +74,10 @@ class ChatView(MethodView):
         )
 
 def ask():
-    logger.debug(request.form)
+    #logger.debug(request.form)
     user_input = request.form.get("text")
     history = request.form.get("history", "")
-    research= request.form.get("reserach", False)
+    research = request.form.get("research", False)
     max_retries = 3
     attempt = 0
     tkuser = toolkit.current_user
@@ -140,12 +142,14 @@ async def _agent_worker(prompt: str, history: str, user_id: str, research: bool 
             user_prompt=prompt,
             message_history=msg_history,
             deps=deps,
+            usage_limits=UsageLimits(request_limit=10,total_tokens_limit=1000000),
         )
     else:
         r = agent.run(
             user_prompt=prompt,
             message_history=msg_history,
             deps=deps,
+            usage_limits=UsageLimits(request_limit=6,total_tokens_limit=200000),
         )
 
     logger.debug(f"Worker done, result: {r}")

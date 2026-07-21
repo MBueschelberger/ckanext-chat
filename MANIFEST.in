@@ -1,6 +1,12 @@
-include README.rst
+include README.md
 include LICENSE
 include requirements.txt
-recursive-include ckanext/chat *.html *.json *.js *.less *.css *.mo *.yml
+include dev-requirements.txt
+include test.ini
+include ckanext-chat.PNG
+
+recursive-include ckanext/chat *.html *.json *.js *.less *.css *.mo *.pot *.po *.yml
 recursive-include ckanext/chat/migration *.ini *.py *.mako
-recursive-include ckanext/chat/public *.*
+recursive-include ckanext/chat/public *
+recursive-include ckanext/chat/templates *
+recursive-include ckanext/chat/assets *

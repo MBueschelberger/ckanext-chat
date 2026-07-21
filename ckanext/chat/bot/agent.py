@@ -58,7 +58,7 @@ rag_model_settings = OpenAIModelSettings(
     # openai_reasoning_effort= "low"
 )
 model = OpenAIModel(
-    "gpt-4o",
+    deployment,
     provider=AzureProvider(
         azure_endpoint=toolkit.config.get(
             "ckanext.chat.completion_url", "https://your.chat.api"
@@ -69,7 +69,7 @@ model = OpenAIModel(
 )
 
 think_model = OpenAIModel(
-    "gpt-4.1-mini",
+    deployment,
     provider=AzureProvider(
         azure_endpoint=toolkit.config.get(
             "ckanext.chat.completion_url", "https://your.chat.api"
@@ -91,6 +91,7 @@ think_model = OpenAIModel(
 # --------------------- Milvus and CKAN Setup ---------------------
 
 milvus_url = toolkit.config.get("ckanext.chat.milvus_url", "")
+milvus_token = toolkit.config.get("ckanext.chat.milvus_token", "")
 collection_name = toolkit.config.get("ckanext.chat.collection_name", "")
 embedding_model = toolkit.config.get(
     "ckanext.chat.embedding_model", "text-embedding-3-small"
@@ -99,24 +100,32 @@ embedding_api = toolkit.config.get("ckanext.chat.embedding_api", "")
 
 vector_dim = None
 if milvus_url:
-    milvus_client = MilvusClient(uri=milvus_url)
+    try:
+        milvus_client = MilvusClient(uri=milvus_url, token=milvus_token) if milvus_token else MilvusClient(uri=milvus_url)
+    except Exception as e:
+        log.warning(f"Milvus connection failed: {e}")
+        milvus_client = None
     if milvus_client:
-        collection_info = milvus_client.describe_collection(
-            collection_name=collection_name
-        )
-        vector_field = None
-        for entry in collection_info["fields"]:
-            if "params" in entry.keys() and "dim" in entry["params"].keys():
-                vector_field = entry
-                break
-        if vector_field:
-            vector_dim = vector_field["params"]["dim"]
-            field_name = vector_field["name"]
-            log.debug(f"Found vector field: {field_name}")
-            log.debug(f"Vector dimension is: {vector_dim}")
-        else:
+        try:
+            collection_info = milvus_client.describe_collection(
+                collection_name=collection_name
+            )
+            vector_field = None
+            for entry in collection_info["fields"]:
+                if "params" in entry.keys() and "dim" in entry["params"].keys():
+                    vector_field = entry
+                    break
+            if vector_field:
+                vector_dim = vector_field["params"]["dim"]
+                field_name = vector_field["name"]
+                log.debug(f"Found vector field: {field_name}")
+                log.debug(f"Vector dimension is: {vector_dim}")
+            else:
+                vector_dim = None
+                log.debug("No vector field found in the collection schema.")
+        except Exception as e:
+            log.warning(f"Milvus collection lookup failed: {e}")
             vector_dim = None
-            log.debug("No vector field found in the collection schema.")
     else:
         log.debug("Milvus client not initialized.")
 else:

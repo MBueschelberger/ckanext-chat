@@ -91,34 +91,38 @@ app = Flask(__name__)
 
 # --------------------- Model & Agent Setup ---------------------
 
-# Azure Setup
-deployment = toolkit.config.get("ckanext.chat.deployment", "gpt-4o-mini")
+
+def build_model(model_name: str = None) -> OpenAIChatModel:
+    provider_type = toolkit.config.get("ckanext.chat.provider", "azure")
+    name = model_name or toolkit.config.get("ckanext.chat.model_name") or toolkit.config.get("ckanext.chat.deployment", "gpt-4o-mini")
+    base_url = toolkit.config.get("ckanext.chat.base_url") or toolkit.config.get("ckanext.chat.completion_url", "https://your.chat.api")
+    api_key = toolkit.config.get("ckanext.chat.api_key") or toolkit.config.get("ckanext.chat.api_token", "your-api-token")
+    api_version = toolkit.config.get("ckanext.chat.api_version", "2024-06-01")
+
+    if provider_type == "azure":
+        provider = AzureProvider(
+            azure_endpoint=base_url,
+            api_version=api_version,
+            api_key=api_key,
+        )
+    elif provider_type == "openai":
+        from pydantic_ai.providers.openai import OpenAIProvider
+        provider = OpenAIProvider(base_url=base_url, api_key=api_key)
+    else:
+        raise ValueError(f"Unknown provider: {provider_type!r}. Use 'azure' or 'openai'.")
+
+    return OpenAIChatModel(name, provider=provider)
+
+
+deployment = toolkit.config.get("ckanext.chat.model_name") or toolkit.config.get("ckanext.chat.deployment", "gpt-4o-mini")
 rag_model_settings = OpenAIModelSettings(
     model_name=deployment,
     max_tokens=16384,
-    # openai_reasoning_effort= "low"
 )
-model = OpenAIChatModel(
-    "gpt-4o-mini",
-    provider=AzureProvider(
-        azure_endpoint=toolkit.config.get(
-            "ckanext.chat.completion_url", "https://your.chat.api"
-        ),
-        api_version="2024-06-01",
-        api_key=toolkit.config.get("ckanext.chat.api_token", "your-api-token"),
-    ),
-)
+model = build_model()
 
-think_model = OpenAIChatModel(
-    "gpt-4.1-mini",
-    provider=AzureProvider(
-        azure_endpoint=toolkit.config.get(
-            "ckanext.chat.completion_url", "https://your.chat.api"
-        ),
-        api_version="2024-06-01",
-        api_key=toolkit.config.get("ckanext.chat.api_token", "your-api-token"),
-    ),
-)
+think_model_name = toolkit.config.get("ckanext.chat.think_model_name") or toolkit.config.get("ckanext.chat.model_name") or "gpt-4.1-mini"
+think_model = build_model(think_model_name)
 
 # --------------------- Milvus and CKAN Setup ---------------------
 

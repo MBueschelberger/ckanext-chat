@@ -30,12 +30,19 @@ class ChatPlugin(plugins.SingletonPlugin, DefaultTranslation):
         group = key.ckanext.chat
         declaration.declare_bool(group.ssl_verify, True)
         declaration.declare(group.completion_url, "https://your.chat.api")
-        declaration.declare(group.deployment, "gpt-4-vision-preview")
+        declaration.declare(group.deployment, "gpt-4o-mini")
         declaration.declare(group.api_token, "your-api-token")
         declaration.declare(group.embedding_model, "text-embedding-3-small")
         declaration.declare(group.embedding_api, "")
         declaration.declare(group.milvus_url, "")
         declaration.declare(group.collection_name, "")
+        declaration.declare(group.provider, "azure")
+        declaration.declare(group.model_name, "")
+        declaration.declare(group.think_model_name, "")
+        declaration.declare(group.base_url, "")
+        declaration.declare(group.api_key, "")
+        declaration.declare(group.api_version, "2024-06-01")
+        declaration.declare(group.mcp_url, "")
 
     # IBlueprint
 

@@ -777,9 +777,12 @@ async def ckan_run(ctx: RunContext[Deps], command: str, parameters: dict={}) -> 
     Returns:
         str: The result of the CKAN action as a JSON string, or an error message in case of failure.
     """
+    if is_action_blocked(command):
+        return json.dumps({"status": "fail", "action_name": command, "result": f"Action '{command}' is blocked. Destructive actions (_delete, _purge) are not allowed."})
+
     # Normalize parameters to handle JSON boolean/null conversions
     parameters = normalize_parameters(parameters)
-    
+
     start_time = datetime.now(timezone.utc)
     log.info(f"ckan_run starting: action='{command}', params={json.dumps(parameters)[:100]}")
     
@@ -974,6 +977,14 @@ def run_action(ctx: RunContext[Deps], action_name: str, parameters: Dict) -> Any
     Returns:
         Dict: Validation result with metrics only (no actual data)
     """
+    if is_action_blocked(action_name):
+        return {
+            'success': False,
+            'error': f"Action '{action_name}' is blocked. Destructive actions (_delete, _purge) are not allowed.",
+            'error_type': 'ActionBlocked',
+            'parameters_attempted': parameters
+        }
+
     # Track what parameters were auto-added
     merged_parameters = merge_with_smart_defaults(action_name, parameters)
     params_added = {k: v for k, v in merged_parameters.items() if k not in parameters}
@@ -1441,8 +1452,18 @@ async def literature_analyse(doc: TextResource, question: str, ssl_verify: bool 
         return json.dumps({"answer": "", "source": str(doc.url), "error": [f"Unexpected error: {type(e).__name__}: {str(e)}"]})
 
 
+BLOCKED_ACTION_SUFFIXES = ("_delete", "_purge")
+
+
+def is_action_blocked(action_name: str) -> bool:
+    return any(action_name.endswith(suffix) for suffix in BLOCKED_ACTION_SUFFIXES)
+
+
 def get_user_token(user_id: str) -> Optional[str]:
     user = CKANmodel.User.get(user_reference=user_id)
+    if not user:
+        log.error(f"get_user_token: user not found for id={user_id}")
+        return None
     context = {
         "user": user.name,
         "auth_user_obj": user,
@@ -1450,12 +1471,23 @@ def get_user_token(user_id: str) -> Optional[str]:
         "session": CKANmodel.Session,
         "ignore_auth": False,
     }
-    parameters = {"user": user.name, "name": "chat_agent"}
     try:
-        response = toolkit.get_action("api_token_create")(context, parameters)
+        existing_tokens = toolkit.get_action("api_token_list")(context, {"user": user.name})
+        for tok in existing_tokens:
+            if tok.get("name") == "chat_agent":
+                toolkit.get_action("api_token_revoke")(context, {"jti": tok["id"]})
+                break
     except Exception as e:
-        return e
-    if "token" in response.keys():
-        token = response["token"].decode("utf-8")
+        log.warning(f"get_user_token: could not check/revoke existing tokens: {e}")
+
+    try:
+        response = toolkit.get_action("api_token_create")(context, {"user": user.name, "name": "chat_agent"})
+    except Exception as e:
+        log.error(f"get_user_token: token creation failed: {e}")
+        return None
+    if "token" in response:
+        token = response["token"]
+        if isinstance(token, bytes):
+            token = token.decode("utf-8")
         return token
     return None

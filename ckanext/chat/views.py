@@ -1,5 +1,5 @@
 import asyncio
-import multiprocessing as mp
+import json
 import os
 import sys
 from distutils.util import strtobool
@@ -12,13 +12,10 @@ from ckan.common import _, current_user
 from flask import Blueprint, current_app, jsonify, request
 from flask.views import MethodView
 from loguru import logger
-from pydantic_ai.messages import TextPart
+from pydantic_ai.messages import ModelMessagesTypeAdapter, TextPart
+from pydantic_ai.mcp import MCPServerHTTP
 from pydantic_ai.usage import UsageLimits
 
-
-# from ckanext.chat.bot.agent import (Deps, async_agent_response,
-#                                     exception_to_model_response,
-#                                     user_input_to_model_request)
 from ckanext.chat.bot.agent import (exception_to_model_response,
                                     user_input_to_model_request)
 from ckanext.chat.helpers import service_available
@@ -73,87 +70,133 @@ class ChatView(MethodView):
             },
         )
 
+MAX_HISTORY_MESSAGES = 100
+MAX_MESSAGE_CONTENT_LENGTH = 50000
+VALID_MESSAGE_KINDS = {"request", "response"}
+
+
+def _validate_history(history_str: str):
+    if not history_str:
+        return None
+    try:
+        history_list = json.loads(history_str)
+    except (json.JSONDecodeError, TypeError):
+        logger.warning("Invalid history JSON, ignoring")
+        return None
+
+    if not isinstance(history_list, list):
+        return None
+    if len(history_list) > MAX_HISTORY_MESSAGES:
+        history_list = history_list[-MAX_HISTORY_MESSAGES:]
+
+    for msg in history_list:
+        if isinstance(msg, dict):
+            kind = msg.get("kind", "")
+            if kind not in VALID_MESSAGE_KINDS:
+                logger.warning(f"Rejected history message with invalid kind: {kind}")
+                return None
+            for part in msg.get("parts", []):
+                if isinstance(part, dict):
+                    content = part.get("content", "")
+                    if isinstance(content, str) and len(content) > MAX_MESSAGE_CONTENT_LENGTH:
+                        part["content"] = content[:MAX_MESSAGE_CONTENT_LENGTH]
+
+    return ModelMessagesTypeAdapter.validate_python(history_list)
+
+
 def ask():
-    #logger.debug(request.form)
     user_input = request.form.get("text")
     history = request.form.get("history", "")
     research = request.form.get("research", False)
-    max_retries = 3
-    attempt = 0
     tkuser = toolkit.current_user
     debug = bool(strtobool(os.environ.get("DEBUG", "false")))
-    # If they're not a logged in user, don't allow them to see content
+
     if tkuser.name is None:
         return {"success": False, "msg": "Must be logged in to view site"}
-    while attempt < max_retries:
-        try:
-            response = asyncio.run(
-                async_agent_response(user_input, history, user_id=tkuser.id, research=research),
-                debug=debug,
-            )
-            # Now response is guaranteed to have new_messages() if no exception occurred.
-            # Ensure new_messages() is awaited in the sync wrapper if it's async
-            messages = response.new_messages()
-            # for msg in messages:
-            #    logger.debug(msg)
-            # remove empty text responses parts
-            [
-                [
-                    message.parts.remove(part)
-                    for part in message.parts
-                    if isinstance(part, TextPart) and part.content == ""
-                ]
-                for message in messages
-            ]
-            return jsonify({"response": messages})
 
-        except Exception as e:
-            user_promt = user_input_to_model_request(user_input)
-            error_response = exception_to_model_response(e)
-            logger.error(error_response)
-            return jsonify({"response": [user_promt, error_response]})
-
-def async_agent_response(prompt: str, history: str, user_id: str, research: bool = False) -> Any:
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
     try:
-        return loop.run_until_complete(_agent_worker(prompt, history, user_id, research))
-    finally:
-        loop.close()
+        response = asyncio.run(
+            _agent_worker(user_input, history, user_id=tkuser.id, research=research),
+            debug=debug,
+        )
+        messages = response.new_messages()
+        [
+            [
+                message.parts.remove(part)
+                for part in message.parts
+                if isinstance(part, TextPart) and part.content == ""
+            ]
+            for message in messages
+        ]
+        return jsonify({"response": messages})
+
+    except Exception as e:
+        user_promt = user_input_to_model_request(user_input)
+        error_response = exception_to_model_response(e)
+        logger.error(error_response)
+        return jsonify({"response": [user_promt, error_response]})
+
 
 async def _agent_worker(prompt: str, history: str, user_id: str, research: bool = False) -> Any:
-    from loguru import logger
+    from loguru import logger as _logger
     from ckanext.chat.bot.agent import (
-        Deps, agent, research_agent, convert_to_model_messages
+        Deps, agent, research_agent,
+        mcp_available, get_user_token, config,
     )
     from ckanext.chat.bot.utils import init_dynamic_models, dynamic_models_initialized
 
-    logger = logger.bind(process="worker", user_id=user_id)
-    logger.debug(f"Worker starting for {user_id}")
+    log = _logger.bind(process="worker", user_id=user_id)
+    log.debug(f"Worker starting for {user_id}")
 
     if not dynamic_models_initialized:
         init_dynamic_models()
 
     deps = Deps(user_id=user_id)
-    msg_history = convert_to_model_messages(history)
+    msg_history = _validate_history(history)
 
-    if research:
-        r = research_agent.run(
-            user_prompt=prompt,
-            message_history=msg_history,
-            deps=deps,
-            usage_limits=UsageLimits(request_limit=10,total_tokens_limit=1000000),
-        )
+    mcp_server = None
+    use_mcp = mcp_available()
+
+    if use_mcp:
+        token = get_user_token(user_id)
+        if token:
+            mcp_url = (
+                toolkit.config.get("ckanext.chat.mcp_url")
+                or (toolkit.config.get("ckan.site_url", "") + "/mcp")
+            )
+            mcp_server = MCPServerHTTP(
+                mcp_url,
+                headers={"Authorization": token},
+            )
+            log.info(f"MCP path enabled, url={mcp_url}")
+        else:
+            log.warning("MCP available but token creation failed, falling back to ckan_agent")
+            use_mcp = False
+
+    if use_mcp:
+        log.info("Using MCP execution path")
     else:
-        r = agent.run(
-            user_prompt=prompt,
-            message_history=msg_history,
-            deps=deps,
-            usage_limits=UsageLimits(request_limit=6,total_tokens_limit=200000),
-        )
+        log.info("Using ckan_agent fallback path")
 
-    logger.debug(f"Worker done, result: {r}")
-    await logger.complete()
+    mcp_servers = [mcp_server] if mcp_server else []
+
+    active_agent = research_agent if research else agent
+    limits = (
+        UsageLimits(request_limit=10, total_tokens_limit=config.MAX_TOKENS_RESEARCH_AGENT)
+        if research else
+        UsageLimits(request_limit=6, total_tokens_limit=config.MAX_TOKENS_FRONT_AGENT)
+    )
+
+    r = await active_agent.run(
+        user_prompt=prompt,
+        message_history=msg_history,
+        deps=deps,
+        usage_limits=limits,
+        mcp_servers=mcp_servers,
+    )
+
+    log.debug(f"Worker done, result type: {type(r)}")
+    await _logger.complete()
     return r
 
 

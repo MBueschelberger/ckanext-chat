@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union, Literal
 import aiofiles
 import aiohttp
 import ckan.model as CKANmodel
+import ckan.plugins as plugins
 import ckan.plugins.toolkit as toolkit
 import requests
 
@@ -112,6 +113,10 @@ def build_model(model_name: str = None) -> OpenAIChatModel:
         raise ValueError(f"Unknown provider: {provider_type!r}. Use 'azure' or 'openai'.")
 
     return OpenAIChatModel(name, provider=provider)
+
+
+def mcp_available() -> bool:
+    return plugins.plugin_loaded('mcp')
 
 
 deployment = toolkit.config.get("ckanext.chat.model_name") or toolkit.config.get("ckanext.chat.deployment", "gpt-4o-mini")

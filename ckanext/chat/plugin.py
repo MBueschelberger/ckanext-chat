@@ -3,7 +3,7 @@ import ckan.plugins.toolkit as toolkit
 from ckan.config.declaration import Declaration, Key
 from ckan.lib.plugins import DefaultTranslation
 
-from ckanext.chat import action, auth, helpers, views
+from ckanext.chat import action, api, auth, helpers, views
 
 
 class ChatPlugin(plugins.SingletonPlugin, DefaultTranslation):
@@ -47,7 +47,7 @@ class ChatPlugin(plugins.SingletonPlugin, DefaultTranslation):
     # IBlueprint
 
     def get_blueprint(self):
-        return views.get_blueprint()
+        return [views.get_blueprint(), api.get_api_blueprint()]
 
     # ITemplateHelpers
 

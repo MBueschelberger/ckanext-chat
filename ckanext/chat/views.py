@@ -13,7 +13,6 @@ from flask import Blueprint, current_app, jsonify, request
 from flask.views import MethodView
 from loguru import logger
 from pydantic_ai.messages import ModelMessagesTypeAdapter, TextPart
-from pydantic_ai.mcp import MCPServerHTTP
 from pydantic_ai.usage import UsageLimits
 
 from ckanext.chat.bot.agent import (exception_to_model_response,
@@ -154,31 +153,24 @@ async def _agent_worker(prompt: str, history: str, user_id: str, research: bool 
     deps = Deps(user_id=user_id)
     msg_history = _validate_history(history)
 
-    mcp_server = None
-    use_mcp = mcp_available()
-
-    if use_mcp:
-        token = get_user_token(user_id)
-        if token:
-            mcp_url = (
-                toolkit.config.get("ckanext.chat.mcp_url")
-                or (toolkit.config.get("ckan.site_url", "") + "/mcp")
-            )
-            mcp_server = MCPServerHTTP(
-                mcp_url,
-                headers={"Authorization": token},
-            )
-            log.info(f"MCP path enabled, url={mcp_url}")
+    if mcp_available():
+        base = toolkit.config.get("ckanext.chat.mcp_url") or toolkit.config.get("ckan.site_url")
+        if not base:
+            log.warning("MCP available but no mcp_url or site_url configured, falling back to ckan_agent")
         else:
-            log.warning("MCP available but token creation failed, falling back to ckan_agent")
-            use_mcp = False
+            token = get_user_token(user_id)
+            if token:
+                mcp_url = base.rstrip("/") + "/mcp" if not toolkit.config.get("ckanext.chat.mcp_url") else base
+                deps.mcp_token = token
+                deps.mcp_url = mcp_url
+                log.info(f"MCP path enabled, url={mcp_url}")
+            else:
+                log.warning("MCP available but token creation failed, falling back to ckan_agent")
 
-    if use_mcp:
-        log.info("Using MCP execution path")
+    if deps.mcp_url:
+        log.info("Using MCP execution path (JSON-RPC)")
     else:
         log.info("Using ckan_agent fallback path")
-
-    mcp_servers = [mcp_server] if mcp_server else []
 
     active_agent = research_agent if research else agent
     limits = (
@@ -192,7 +184,6 @@ async def _agent_worker(prompt: str, history: str, user_id: str, research: bool 
         message_history=msg_history,
         deps=deps,
         usage_limits=limits,
-        mcp_servers=mcp_servers,
     )
 
     log.debug(f"Worker done, result type: {type(r)}")

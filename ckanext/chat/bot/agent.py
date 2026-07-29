@@ -189,6 +189,8 @@ class Deps:
     milvus_client: MilvusClient = field(default_factory=lambda: milvus_client)
     openai: OpenAIChatModel = field(default_factory=lambda: model)
     embeddings: Union[OAI_Embeddings, str] = field(default=embedding_api)
+    mcp_token: Optional[str] = None
+    mcp_url: Optional[str] = None
     embedding_model: str = field(default_factory=lambda: embedding_model)
     max_context_length: int = 8192
     collection_name: str = collection_name
@@ -749,6 +751,88 @@ def normalize_parameters(params: dict) -> dict:
         log.debug(f"normalize_parameters converted: {', '.join(conversions_made)}")
     
     return normalized
+
+
+async def _mcp_jsonrpc(url: str, token: str, method: str, params: dict = None) -> dict:
+    async with aiohttp.ClientSession() as session:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params or {},
+        }
+        headers = {"Authorization": token, "Content-Type": "application/json"}
+        async with session.post(url, json=payload, headers=headers) as resp:
+            data = await resp.json()
+            if "error" in data:
+                raise RuntimeError(f"MCP error: {data['error'].get('message', data['error'])}")
+            return data.get("result", {})
+
+
+@agent.tool
+@research_agent.tool
+async def mcp_tools(ctx: RunContext[Deps]) -> str:
+    """List available MCP tools with their operations and parameter schemas.
+    Call this first to discover what CKAN entity tools are available via MCP.
+    Only works when MCP is enabled.
+
+    Returns:
+        str: JSON list of available tools with names, descriptions and schemas.
+    """
+    if not ctx.deps.mcp_url or not ctx.deps.mcp_token:
+        return json.dumps({"error": "MCP not available. Use ckan_run instead."})
+    try:
+        result = await _mcp_jsonrpc(ctx.deps.mcp_url, ctx.deps.mcp_token, "tools/list")
+        tools = result.get("tools", [])
+        summary = []
+        for t in tools:
+            entry = {"name": t["name"], "description": t.get("description", "")[:200]}
+            schema = t.get("inputSchema", {})
+            ops = schema.get("properties", {}).get("operation", {}).get("enum", [])
+            if ops:
+                entry["operations"] = ops
+            summary.append(entry)
+        return json.dumps(summary)
+    except Exception as e:
+        log.error(f"mcp_tools error: {e}")
+        return json.dumps({"error": f"Failed to list MCP tools: {e}"})
+
+
+@agent.tool
+@research_agent.tool
+async def mcp_call(ctx: RunContext[Deps], tool_name: str, operation: str, arguments: dict = {}) -> str:
+    """Call an MCP tool by name with an operation and arguments.
+    Use mcp_tools first to discover available tools and operations.
+    Only works when MCP is enabled.
+
+    Args:
+        ctx: Runtime dependencies
+        tool_name: MCP tool name (e.g. 'ckan_package', 'ckan_resource')
+        operation: Operation to perform (e.g. 'search', 'show', 'list')
+        arguments: Additional arguments for the operation
+    Returns:
+        str: JSON result from the MCP tool call
+    """
+    if not ctx.deps.mcp_url or not ctx.deps.mcp_token:
+        return json.dumps({"error": "MCP not available. Use ckan_run instead."})
+
+    if is_action_blocked(f"{tool_name}_{operation}"):
+        return json.dumps({"error": f"Operation '{operation}' on '{tool_name}' is blocked."})
+
+    try:
+        call_args = {**arguments, "operation": operation}
+        result = await _mcp_jsonrpc(
+            ctx.deps.mcp_url, ctx.deps.mcp_token,
+            "tools/call",
+            {"name": tool_name, "arguments": call_args},
+        )
+        content = result.get("content", [])
+        texts = [c.get("text", "") for c in content if c.get("type") == "text"]
+        meta = result.get("_meta", {})
+        return json.dumps({"data": texts[0] if len(texts) == 1 else texts, "meta": meta})
+    except Exception as e:
+        log.error(f"mcp_call error: tool={tool_name}, op={operation}, error={e}")
+        return json.dumps({"error": f"MCP call failed: {e}"})
 
 
 @agent.tool

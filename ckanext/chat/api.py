@@ -6,14 +6,11 @@ import uuid
 from distutils.util import strtobool
 from typing import Any
 
-import ckan.model as CKANmodel
+import ckan.lib.api_token as api_token
 import ckan.plugins.toolkit as toolkit
 from flask import Blueprint, Response, jsonify, request, stream_with_context
 from loguru import logger
-from pydantic_ai.messages import (
-    ModelMessagesTypeAdapter, ModelRequest, UserPromptPart,
-)
-from pydantic_ai.mcp import MCPServerHTTP
+from pydantic_ai.messages import ModelMessagesTypeAdapter
 from pydantic_ai.usage import UsageLimits
 
 api_blueprint = Blueprint("chat_api", __name__)
@@ -30,17 +27,9 @@ def _authenticate():
     if not token:
         return None, _error_response("Invalid Authorization header", 401, "invalid_api_key")
 
-    try:
-        data = toolkit.get_action("api_token_decode")({"ignore_auth": True}, {"token": token})
-    except Exception:
-        data = None
-
-    if not data or not data.get("jti"):
-        return None, _error_response("Invalid API token", 401, "invalid_api_key")
-
-    user = CKANmodel.User.get(data.get("user_id") or data.get("sub"))
+    user = api_token.get_user_from_token(token)
     if not user:
-        return None, _error_response("User not found", 401, "invalid_api_key")
+        return None, _error_response("Invalid API token", 401, "invalid_api_key")
 
     return user, None
 
@@ -85,7 +74,7 @@ def _openai_messages_to_prompt(messages: list) -> tuple[str, list]:
     return prompt, history_parts
 
 
-async def _run_agent_for_api(prompt: str, history_parts: list, user_id: str, research: bool = False) -> Any:
+def _setup_agent_run(user_id: str, history_parts: list, research: bool):
     from ckanext.chat.bot.agent import (
         Deps, agent, research_agent,
         mcp_available, get_user_token, config,
@@ -96,6 +85,16 @@ async def _run_agent_for_api(prompt: str, history_parts: list, user_id: str, res
         init_dynamic_models()
 
     deps = Deps(user_id=user_id)
+
+    if mcp_available():
+        base = toolkit.config.get("ckanext.chat.mcp_url") or toolkit.config.get("ckan.site_url")
+        if base:
+            token = get_user_token(user_id)
+            if token:
+                mcp_url = base if toolkit.config.get("ckanext.chat.mcp_url") else base.rstrip("/") + "/mcp"
+                deps.mcp_token = token
+                deps.mcp_url = mcp_url
+
     msg_history = None
     if history_parts:
         try:
@@ -103,73 +102,32 @@ async def _run_agent_for_api(prompt: str, history_parts: list, user_id: str, res
         except Exception:
             msg_history = None
 
-    mcp_servers = []
-    if mcp_available():
-        token = get_user_token(user_id)
-        if token:
-            mcp_url = (
-                toolkit.config.get("ckanext.chat.mcp_url")
-                or (toolkit.config.get("ckan.site_url", "") + "/mcp")
-            )
-            mcp_servers = [MCPServerHTTP(mcp_url, headers={"Authorization": token})]
-
     active_agent = research_agent if research else agent
     limits = (
         UsageLimits(request_limit=10, total_tokens_limit=config.MAX_TOKENS_RESEARCH_AGENT)
         if research else
         UsageLimits(request_limit=6, total_tokens_limit=config.MAX_TOKENS_FRONT_AGENT)
     )
+    return active_agent, deps, msg_history, limits
 
+
+async def _run_agent_for_api(prompt: str, history_parts: list, user_id: str, research: bool = False) -> Any:
+    active_agent, deps, msg_history, limits = _setup_agent_run(user_id, history_parts, research)
     return await active_agent.run(
         user_prompt=prompt,
         message_history=msg_history,
         deps=deps,
         usage_limits=limits,
-        mcp_servers=mcp_servers,
     )
 
 
 async def _run_agent_stream(prompt: str, history_parts: list, user_id: str, research: bool = False):
-    from ckanext.chat.bot.agent import (
-        Deps, agent, research_agent,
-        mcp_available, get_user_token, config,
-    )
-    from ckanext.chat.bot.utils import init_dynamic_models, dynamic_models_initialized
-
-    if not dynamic_models_initialized:
-        init_dynamic_models()
-
-    deps = Deps(user_id=user_id)
-    msg_history = None
-    if history_parts:
-        try:
-            msg_history = ModelMessagesTypeAdapter.validate_python(history_parts)
-        except Exception:
-            msg_history = None
-
-    mcp_servers = []
-    if mcp_available():
-        token = get_user_token(user_id)
-        if token:
-            mcp_url = (
-                toolkit.config.get("ckanext.chat.mcp_url")
-                or (toolkit.config.get("ckan.site_url", "") + "/mcp")
-            )
-            mcp_servers = [MCPServerHTTP(mcp_url, headers={"Authorization": token})]
-
-    active_agent = research_agent if research else agent
-    limits = (
-        UsageLimits(request_limit=10, total_tokens_limit=config.MAX_TOKENS_RESEARCH_AGENT)
-        if research else
-        UsageLimits(request_limit=6, total_tokens_limit=config.MAX_TOKENS_FRONT_AGENT)
-    )
-
+    active_agent, deps, msg_history, limits = _setup_agent_run(user_id, history_parts, research)
     async with active_agent.run_stream(
         user_prompt=prompt,
         message_history=msg_history,
         deps=deps,
         usage_limits=limits,
-        mcp_servers=mcp_servers,
     ) as stream:
         async for chunk in stream.stream_text(delta=True):
             yield chunk

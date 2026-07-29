@@ -12,7 +12,7 @@ from ckan.lib.lazyjson import LazyJSONObject
 from ckan.model.package import Package
 from ckan.model.resource import Resource
 from loguru import logger
-from pydantic import BaseModel, ValidationError, computed_field, root_validator
+from pydantic import BaseModel, ValidationError, computed_field, model_validator
 
 log = logger.bind(module=__name__)
 
@@ -47,20 +47,21 @@ class DynamicDataset(BaseModel):
     class Config:
         extra = "allow"
 
-    @root_validator(pre=True)
-    def calculate_computed_field(cls, values):
+    @model_validator(mode='before')
+    @classmethod
+    def calculate_computed_field(cls, data):
         route = find_route_by_endpoint("dataset.read")
         ckan_url = toolkit.config.get("ckan.site_url")
         if route and ckan_url:
-            values["view_url"] = str(route.build_url(base_url=ckan_url,fill={"id": values.get("id")}))
-        resources = values.get("resources")
+            data["view_url"] = str(route.build_url(base_url=ckan_url,fill={"id": data.get("id")}))
+        resources = data.get("resources")
         if not isinstance(resources, list):
             raise ValueError(
                 'Input should have a "resources" key with a list of resources.'
             )
         validated_resources = [DynamicResource(**resource) for resource in resources]
-        values["resources"] = validated_resources
-        return values
+        data["resources"] = validated_resources
+        return data
 
     @classmethod
     def from_ckan(cls, package: Package) -> "DynamicDataset":
@@ -75,13 +76,14 @@ class DynamicResource(BaseModel):
     class Config:
         extra = "allow"
 
-    @root_validator(pre=True)
-    def calculate_computed_field(cls, values):
+    @model_validator(mode='before')
+    @classmethod
+    def calculate_computed_field(cls, data):
         route = find_route_by_endpoint("resource.read")
         ckan_url = toolkit.config.get("ckan.site_url")
         if route and ckan_url:
-            values["view_url"] = str(route.build_url(fill={"id": values.get("id")}))
-        return values
+            data["view_url"] = str(route.build_url(fill={"id": data.get("id")}))
+        return data
 
     @classmethod
     def from_ckan(cls, resource: Resource) -> "DynamicResource":
@@ -413,11 +415,12 @@ class RouteModel(BaseModel):
     variables: Optional[list] = []
     full_url_pattern: Optional[str]
 
-    @root_validator(pre=True)
-    def calculate_computed_field(cls, values):
-        values["variables"] = extract_variables(values["rule"])
-        values["full_url_pattern"] = VARIABLE_REGEX.sub(repl, values["rule"])
-        return values
+    @model_validator(mode='before')
+    @classmethod
+    def calculate_computed_field(cls, data):
+        data["variables"] = extract_variables(data["rule"])
+        data["full_url_pattern"] = VARIABLE_REGEX.sub(repl, data["rule"])
+        return data
 
     def build_url(
         self,

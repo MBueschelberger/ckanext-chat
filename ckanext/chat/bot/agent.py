@@ -24,7 +24,7 @@ from pydantic_ai.exceptions import (AgentRunError, FallbackExceptionGroup,
                                     UsageLimitExceeded)
 from pydantic_ai.messages import (ModelMessagesTypeAdapter, ModelRequest,
                                   ModelResponse, TextPart, UserPromptPart)
-from pydantic_ai.models.openai import OpenAIModel, OpenAIModelSettings
+from pydantic_ai.models.openai import OpenAIChatModel, OpenAIModelSettings
 from pydantic_ai.providers.azure import AzureProvider
 from pydantic_ai.usage import UsageLimits
 from pymilvus import MilvusClient
@@ -98,7 +98,7 @@ rag_model_settings = OpenAIModelSettings(
     max_tokens=16384,
     # openai_reasoning_effort= "low"
 )
-model = OpenAIModel(
+model = OpenAIChatModel(
     "gpt-4o-mini",
     provider=AzureProvider(
         azure_endpoint=toolkit.config.get(
@@ -109,7 +109,7 @@ model = OpenAIModel(
     ),
 )
 
-think_model = OpenAIModel(
+think_model = OpenAIChatModel(
     "gpt-4.1-mini",
     provider=AzureProvider(
         azure_endpoint=toolkit.config.get(
@@ -178,7 +178,7 @@ def get_http_session() -> aiohttp.ClientSession:
 class Deps:
     user_id: str
     milvus_client: MilvusClient = field(default_factory=lambda: milvus_client)
-    openai: OpenAIModel = field(default_factory=lambda: model)
+    openai: OpenAIChatModel = field(default_factory=lambda: model)
     embeddings: Union[OAI_Embeddings, str] = field(default=embedding_api)
     embedding_model: str = field(default_factory=lambda: embedding_model)
     max_context_length: int = 8192
@@ -657,23 +657,21 @@ ckan_agent_prompt = (
 agent = Agent(
     model=model,
     deps_type=Deps,
-    system_prompt="".join(front_agent_prompt),
+    instructions="".join(front_agent_prompt),
     retries=3,
-    # model_settings=OpenAIModelSettings(openai_reasoning_effort= "low")
 )
 
 research_agent= Agent(
     model=think_model,
     deps_type=Deps,
-    system_prompt="".join(research_agent_prompt),
+    instructions="".join(research_agent_prompt),
     retries=3,
-    # model_settings=OpenAIModelSettings(openai_reasoning_effort= "low")
 )
 ckan_agent = Agent(
     model=model,
     deps_type=Deps,
     output_type=CKANResult,
-    system_prompt="".join(ckan_agent_prompt),
+    instructions="".join(ckan_agent_prompt),
     retries=5,
 )
 
@@ -682,17 +680,15 @@ rag_agent = Agent(
     model=model,
     deps_type=Deps,
     output_type=LitSearchResult,
-    system_prompt="".join(rag_prompt),
-    #retries=3,
+    instructions="".join(rag_prompt),
     model_settings=rag_model_settings,
-    # model_settings=OpenAIModelSettings(openai_reasoning_effort= "low")
 )
 
 doc_agent = Agent(
     model=model,
     deps_type=TextResource,
     output_type=AnalyseResult,
-    system_prompt="".join(doc_prompt),
+    instructions="".join(doc_prompt),
     retries=3,
     model_settings=rag_model_settings,
 )

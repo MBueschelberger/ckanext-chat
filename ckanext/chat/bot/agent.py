@@ -437,16 +437,20 @@ front_agent_prompt = (
     "Only delete and purge operations are blocked.\n\n"
 
     "CRITICAL RULES for CKAN queries:\n"
-    "1. For ANY dataset query, use package_search (not package_list).\n"
+    "1. For dataset LISTING/SEARCH, use package_search (not package_list).\n"
     "   - package_search returns full metadata and supports private datasets.\n"
     "   - package_list only returns names.\n"
     "2. ALWAYS include 'include_private': True for package_search.\n"
     "3. Search patterns:\n"
     "   - All datasets: q='*:*', include_private=True\n"
-    "   - By tag: q='tags:climate', include_private=True\n"
-    "   - By keyword: q='water', include_private=True\n"
-    "4. For specific dataset details: use package_show with dataset ID.\n"
-    "5. NEVER execute delete or purge operations.\n\n"
+    "   - By tag: q='tags:TAG_NAME', include_private=True\n"
+    "   - By keyword: q='KEYWORD', include_private=True\n"
+    "   - By organization: q='owner_org:ORG_ID', include_private=True\n"
+    "     OR: q='*:*', fq='owner_org:ORG_ID', include_private=True\n"
+    "4. For specific dataset details: use package_show with id=DATASET_ID_OR_NAME.\n"
+    "5. For specific resource details: use resource_show with id=RESOURCE_ID.\n"
+    "   Do NOT use package_search to look up a resource by ID.\n"
+    "6. NEVER execute delete or purge operations.\n\n"
     
     "**literature_search:**\n"
     "- ALWAYS rephrase user query for better semantic matching\n"
@@ -593,9 +597,10 @@ ckan_agent_prompt = (
     "- 'rows': 10 (pagination - reasonable default)\n"
     "- 'start': 0 (pagination - first page)\n"
     
-    "For other actions:\n"
+    "For other actions (resource_show, organization_show, *_create, *_patch, etc.):\n"
+    "- Pass action and parameters through as-is — do NOT redirect them\n"
     "- Trust merge_with_smart_defaults() to add required parameters\n"
-    "- You focus on dataset search actions\n\n"
+    "- resource_show needs 'id', organization_show needs 'id', etc.\n\n"
     
     "EXECUTION PROCESS:\n"
     "1. Analyze received action and CHANGE IT if needed:\n"
@@ -902,7 +907,7 @@ async def ckan_run(ctx: RunContext[Deps], command: str, parameters: dict={}) -> 
                 truncated = smart_truncate_response(response)
 
                 result_dict = ckan_result.model_dump()
-                result_dict['data'] = truncated['data']
+                result_dict['result'] = truncated['data']
                 result_dict['_truncated'] = truncated['truncated']
                 result_dict['_truncation_method'] = truncated['truncation_method']
                 result_dict['_total_items'] = truncated['total_items']

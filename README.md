@@ -267,6 +267,36 @@ UWSGI_OPTS="--socket /tmp/uwsgi.sock \
 UWSGI_HARAKIRI="3000"
 ```
 
+## Round-Trip Integration Test
+
+A live integration test that drives CKAN CRUD operations through the chat completions
+endpoint using natural language. Analogous to ckanext-mcp's `test_crud_lifecycle.py`
+but LLM-driven.
+
+The test creates an org, dataset, resource, patches metadata, searches, and cleans up:
+
+```bash
+# With API token
+python ckanext/chat/tests/test_chat_roundtrip.py \
+  --url http://localhost:80 \
+  --token YOUR_CKAN_API_TOKEN \
+  --verbose
+
+# With username/password (creates its own token)
+python ckanext/chat/tests/test_chat_roundtrip.py \
+  --url http://localhost:80 \
+  --user ckan_admin --password your_password \
+  --verbose
+
+# Cleanup leftover test artifacts from previous runs
+python ckanext/chat/tests/test_chat_roundtrip.py \
+  --url http://localhost:80 --token YOUR_TOKEN --cleanup
+```
+
+Since responses depend on LLM behavior, some verification checks may fail
+even when the underlying CKAN operations succeed. The CRUD steps (create, patch)
+are the primary validation; search/show checks verify response quality.
+
 ## Developer Installation
 
 ```bash

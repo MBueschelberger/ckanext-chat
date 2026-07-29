@@ -18,6 +18,14 @@ api_blueprint = Blueprint("chat_api", __name__)
 log = logger.bind(module=__name__)
 
 
+@api_blueprint.before_request
+def _capture_app():
+    from ckanext.chat import views
+    if views.global_ckan_app is None:
+        from flask import current_app
+        views.global_ckan_app = current_app._get_current_object()
+
+
 def _authenticate():
     auth_header = request.headers.get("Authorization", "")
     if not auth_header:

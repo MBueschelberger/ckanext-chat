@@ -418,7 +418,7 @@ front_agent_prompt = (
     
     "DECISION TREE:\n"
     "1. Analyze user question type:\n"
-    "   - CKAN data query (datasets, resources, orgs) → use ckan_run\n"
+    "   - CKAN operation (search, list, create, update, show) → use ckan_run\n"
     "   - General knowledge/literature → use literature_search\n"
     "   - Document analysis (specific file) → use literature_analyse\n"
     "   - Mixed query → literature_search first, then ckan_run if needed\n\n"
@@ -430,9 +430,11 @@ front_agent_prompt = (
 
     "TOOL USAGE GUIDELINES:\n\n"
 
-    "**CKAN DATA ACCESS:**\n"
-    "Use ckan_run for all CKAN data queries. It handles action validation,\n"
-    "parameter optimization, and MCP integration automatically.\n\n"
+    "**CKAN OPERATIONS (read AND write):**\n"
+    "Use ckan_run for ALL CKAN operations: search, show, list, create, update, patch.\n"
+    "It handles action validation, parameter optimization, and MCP integration automatically.\n"
+    "You CAN create organizations, datasets, resources, and update/patch them via ckan_run.\n"
+    "Only delete and purge operations are blocked.\n\n"
 
     "CRITICAL RULES for CKAN queries:\n"
     "1. For ANY dataset query, use package_search (not package_list).\n"
@@ -776,12 +778,22 @@ async def _mcp_fetch_data(url: str, token: str, action: str, params: dict) -> Op
         "package_search": ("ckan_package", "search"),
         "package_show": ("ckan_package", "show"),
         "package_list": ("ckan_package", "list"),
+        "package_create": ("ckan_package", "create"),
+        "package_update": ("ckan_package", "update"),
+        "package_patch": ("ckan_package", "patch"),
         "resource_show": ("ckan_resource", "show"),
         "resource_search": ("ckan_resource", "search"),
+        "resource_create": ("ckan_resource", "create"),
+        "resource_update": ("ckan_resource", "update"),
+        "resource_patch": ("ckan_resource", "patch"),
         "organization_list": ("ckan_organization", "list"),
         "organization_show": ("ckan_organization", "show"),
+        "organization_create": ("ckan_organization", "create"),
+        "organization_update": ("ckan_organization", "update"),
+        "organization_patch": ("ckan_organization", "patch"),
         "group_list": ("ckan_group", "list"),
         "group_show": ("ckan_group", "show"),
+        "group_create": ("ckan_group", "create"),
         "tag_list": ("ckan_tag", "list"),
         "user_show": ("ckan_user", "show"),
     }

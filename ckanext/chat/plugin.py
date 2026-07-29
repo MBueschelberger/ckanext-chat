@@ -42,7 +42,6 @@ class ChatPlugin(plugins.SingletonPlugin, DefaultTranslation):
         declaration.declare(group.base_url, "")
         declaration.declare(group.api_key, "")
         declaration.declare(group.api_version, "2024-06-01")
-        declaration.declare(group.mcp_url, "")
 
     # IBlueprint
 

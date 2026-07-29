@@ -422,17 +422,17 @@ front_agent_prompt = (
     "   - General knowledge/literature → use literature_search\n"
     "   - Document analysis (specific file) → use literature_analyse\n"
     "   - Mixed query → literature_search first, then ckan_run if needed\n\n"
-    
+
     "2. Execute efficiently:\n"
     "   - Maximum 3 tool calls per response (e.g., search + analyze + ckan)\n"
     "   - Prefer single comprehensive call over multiple small ones\n"
     "   - Only call tools when necessary\n\n"
-    
+
     "TOOL USAGE GUIDELINES:\n\n"
 
-    "**CKAN DATA ACCESS (MCP or ckan_run):**\n"
-    "If MCP tools are available (e.g. ckan_package, ckan_resource), use them directly.\n"
-    "If only ckan_run is available, use that instead.\n\n"
+    "**CKAN DATA ACCESS:**\n"
+    "Use ckan_run for all CKAN data queries. It handles action validation,\n"
+    "parameter optimization, and MCP integration automatically.\n\n"
 
     "CRITICAL RULES for CKAN queries:\n"
     "1. For ANY dataset query, use package_search (not package_list).\n"
@@ -537,7 +537,7 @@ research_agent_prompt = (
     "TOOL USAGE:\n"
     "**literature_search:** Rephrase query, max 3 calls\n"
     "**literature_analyse:** Extract precise evidence, max 5 calls\n"
-    "**CKAN data:** If MCP tools available, use them directly. Otherwise use ckan_run. Max 2 calls.\n"
+    "**CKAN data:** Use ckan_run for CKAN queries. It handles MCP integration automatically. Max 2 calls.\n"
     "  Always use package_search (not package_list), always include_private=True.\n\n"
     
     "CITATION FORMAT:\n"
@@ -630,19 +630,19 @@ ckan_agent_prompt = (
     "5. Return CKANResult with status, action_name, parameters, result, comment\n\n"
     
     "EXAMPLES:\n"
-    
+
     "Example 1 - Action Correction:\n"
     "Input: action='package_list', parameters={}\n"
     "Think: 'package_list is suboptimal, redirecting to package_search'\n"
     "Execute: run_action('package_search', {'q': '*:*', 'include_private': True, 'rows': 10, 'start': 0})\n"
     "Return: status='success', action_name='package_search', comment='Redirected from package_list for richer data'\n"
-    
+
     "Example 2 - Parameter Completion:\n"
     "Input: action='package_search', parameters={'q': 'climate'}\n"
     "Think: 'Missing include_private and pagination'\n"
     "Execute: run_action('package_search', {'q': 'climate', 'include_private': True, 'rows': 10, 'start': 0})\n"
     "Return: status='success', action_name='package_search', parameters_auto_added={'include_private': True, 'rows': 10, 'start': 0}\n"
-    
+
     "Example 3 - Large Result:\n"
     "Execute: run_action returns items_returned=127\n"
     "Return: status='success', comment='Large result (127 items). Consider pagination: rows=10, start=0/10/20...'\n\n"
@@ -754,6 +754,7 @@ def normalize_parameters(params: dict) -> dict:
 
 
 async def _mcp_jsonrpc(url: str, token: str, method: str, params: dict = None) -> dict:
+    ssl_verify = toolkit.config.get("ckanext.chat.ssl_verify", True)
     async with aiohttp.ClientSession() as session:
         payload = {
             "jsonrpc": "2.0",
@@ -762,77 +763,46 @@ async def _mcp_jsonrpc(url: str, token: str, method: str, params: dict = None) -
             "params": params or {},
         }
         headers = {"Authorization": token, "Content-Type": "application/json"}
-        async with session.post(url, json=payload, headers=headers) as resp:
+        async with session.post(url, json=payload, headers=headers, ssl=ssl_verify) as resp:
             data = await resp.json()
             if "error" in data:
                 raise RuntimeError(f"MCP error: {data['error'].get('message', data['error'])}")
             return data.get("result", {})
 
 
-@agent.tool
-@research_agent.tool
-async def mcp_tools(ctx: RunContext[Deps]) -> str:
-    """List available MCP tools with their operations and parameter schemas.
-    Call this first to discover what CKAN entity tools are available via MCP.
-    Only works when MCP is enabled.
-
-    Returns:
-        str: JSON list of available tools with names, descriptions and schemas.
-    """
-    if not ctx.deps.mcp_url or not ctx.deps.mcp_token:
-        return json.dumps({"error": "MCP not available. Use ckan_run instead."})
+async def _mcp_fetch_data(url: str, token: str, action: str, params: dict) -> Optional[dict]:
+    """Fetch data via MCP JSON-RPC, mapping CKAN action to MCP tool+operation."""
+    action_to_mcp = {
+        "package_search": ("ckan_package", "search"),
+        "package_show": ("ckan_package", "show"),
+        "package_list": ("ckan_package", "list"),
+        "resource_show": ("ckan_resource", "show"),
+        "resource_search": ("ckan_resource", "search"),
+        "organization_list": ("ckan_organization", "list"),
+        "organization_show": ("ckan_organization", "show"),
+        "group_list": ("ckan_group", "list"),
+        "group_show": ("ckan_group", "show"),
+        "tag_list": ("ckan_tag", "list"),
+        "user_show": ("ckan_user", "show"),
+    }
+    mapping = action_to_mcp.get(action)
+    if not mapping:
+        return None
+    tool_name, operation = mapping
     try:
-        result = await _mcp_jsonrpc(ctx.deps.mcp_url, ctx.deps.mcp_token, "tools/list")
-        tools = result.get("tools", [])
-        summary = []
-        for t in tools:
-            entry = {"name": t["name"], "description": t.get("description", "")[:200]}
-            schema = t.get("inputSchema", {})
-            ops = schema.get("properties", {}).get("operation", {}).get("enum", [])
-            if ops:
-                entry["operations"] = ops
-            summary.append(entry)
-        return json.dumps(summary)
-    except Exception as e:
-        log.error(f"mcp_tools error: {e}")
-        return json.dumps({"error": f"Failed to list MCP tools: {e}"})
-
-
-@agent.tool
-@research_agent.tool
-async def mcp_call(ctx: RunContext[Deps], tool_name: str, operation: str, arguments: dict = {}) -> str:
-    """Call an MCP tool by name with an operation and arguments.
-    Use mcp_tools first to discover available tools and operations.
-    Only works when MCP is enabled.
-
-    Args:
-        ctx: Runtime dependencies
-        tool_name: MCP tool name (e.g. 'ckan_package', 'ckan_resource')
-        operation: Operation to perform (e.g. 'search', 'show', 'list')
-        arguments: Additional arguments for the operation
-    Returns:
-        str: JSON result from the MCP tool call
-    """
-    if not ctx.deps.mcp_url or not ctx.deps.mcp_token:
-        return json.dumps({"error": "MCP not available. Use ckan_run instead."})
-
-    if is_action_blocked(f"{tool_name}_{operation}"):
-        return json.dumps({"error": f"Operation '{operation}' on '{tool_name}' is blocked."})
-
-    try:
-        call_args = {**arguments, "operation": operation}
-        result = await _mcp_jsonrpc(
-            ctx.deps.mcp_url, ctx.deps.mcp_token,
-            "tools/call",
-            {"name": tool_name, "arguments": call_args},
-        )
+        call_args = {**params, "operation": operation}
+        result = await _mcp_jsonrpc(url, token, "tools/call", {"name": tool_name, "arguments": call_args})
         content = result.get("content", [])
         texts = [c.get("text", "") for c in content if c.get("type") == "text"]
-        meta = result.get("_meta", {})
-        return json.dumps({"data": texts[0] if len(texts) == 1 else texts, "meta": meta})
+        if texts:
+            try:
+                return json.loads(texts[0])
+            except (json.JSONDecodeError, IndexError):
+                return {"raw": texts[0] if len(texts) == 1 else texts}
+        return result
     except Exception as e:
-        log.error(f"mcp_call error: tool={tool_name}, op={operation}, error={e}")
-        return json.dumps({"error": f"MCP call failed: {e}"})
+        log.warning(f"MCP fetch failed for {action}, falling back to direct: {e}")
+        return None
 
 
 @agent.tool
@@ -887,30 +857,38 @@ async def ckan_run(ctx: RunContext[Deps], command: str, parameters: dict={}) -> 
                 f"action={ckan_result.action_name}, "
                 f"result_preview={str(ckan_result.result)[:100]}")
         
-        # If successful, fetch and truncate data separately for front_agent
         if ckan_result.status == 'success':
             try:
-                # CRITICAL: Use the CORRECTED action name from ckan_agent, not the original command
                 corrected_action = ckan_result.action_name or command
                 corrected_params = ckan_result.parameters or parameters
-                
-                # Fetch data separately (not sent to ckan_agent LLM)
                 merged_params = merge_with_smart_defaults(corrected_action, corrected_params)
-                user = CKANmodel.User.get(user_reference=ctx.deps.user_id)
-                context = {
-                    "user": user.name,
-                    "auth_user_obj": user,
-                    "model": CKANmodel,
-                    "session": CKANmodel.Session,
-                    "ignore_auth": False,
-                }
-                
-                response = toolkit.get_action(corrected_action)(context, merged_params)
-                
-                # Apply smart truncation
+
+                response = None
+                fetch_method = "direct"
+
+                # Try MCP first if available
+                if ctx.deps.mcp_url and ctx.deps.mcp_token:
+                    response = await _mcp_fetch_data(
+                        ctx.deps.mcp_url, ctx.deps.mcp_token,
+                        corrected_action, merged_params,
+                    )
+                    if response is not None:
+                        fetch_method = "mcp"
+
+                # Fallback to direct toolkit call
+                if response is None:
+                    user = CKANmodel.User.get(user_reference=ctx.deps.user_id)
+                    context = {
+                        "user": user.name,
+                        "auth_user_obj": user,
+                        "model": CKANmodel,
+                        "session": CKANmodel.Session,
+                        "ignore_auth": False,
+                    }
+                    response = toolkit.get_action(corrected_action)(context, merged_params)
+
                 truncated = smart_truncate_response(response)
-                
-                # Combine ckan_agent result with truncated data
+
                 result_dict = ckan_result.model_dump()
                 result_dict['data'] = truncated['data']
                 result_dict['_truncated'] = truncated['truncated']
@@ -918,19 +896,19 @@ async def ckan_run(ctx: RunContext[Deps], command: str, parameters: dict={}) -> 
                 result_dict['_total_items'] = truncated['total_items']
                 result_dict['_showing_items'] = truncated['showing_items']
                 result_dict['_estimated_tokens'] = truncated['estimated_tokens']
-                
+
                 total_duration_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
                 log.info(f"ckan_run data fetch complete: action='{command}', "
+                        f"method={fetch_method}, "
                         f"truncation={truncated['truncation_method']}, "
                         f"items={truncated['showing_items']}/{truncated['total_items']}, "
                         f"total_duration_ms={total_duration_ms:.0f}")
-                
+
                 final_result = json.dumps(result_dict)
                 log.debug(f"ckan_run final result size: {len(final_result)} chars")
                 return final_result
             except Exception as e:
                 log.error(f"ckan_run data fetch error: {str(e)[:200]}")
-                # Return original result if data fetching fails
                 return r.output.model_dump_json()
         
         # If failed, log and return as-is

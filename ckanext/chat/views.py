@@ -154,18 +154,16 @@ async def _agent_worker(prompt: str, history: str, user_id: str, research: bool 
     msg_history = _validate_history(history)
 
     if mcp_available():
-        base = toolkit.config.get("ckanext.chat.mcp_url") or toolkit.config.get("ckan.site_url")
-        if not base:
-            log.warning("MCP available but no mcp_url or site_url configured, falling back to ckan_agent")
+        host = toolkit.config.get("ckan.devserver.host", "localhost")
+        port = toolkit.config.get("ckan.devserver.port", "5000")
+        mcp_url = f"http://{host}:{port}/mcp"
+        token = get_user_token(user_id)
+        if token:
+            deps.mcp_token = token
+            deps.mcp_url = mcp_url
+            log.info(f"MCP path enabled, url={mcp_url}")
         else:
-            token = get_user_token(user_id)
-            if token:
-                mcp_url = base.rstrip("/") + "/mcp" if not toolkit.config.get("ckanext.chat.mcp_url") else base
-                deps.mcp_token = token
-                deps.mcp_url = mcp_url
-                log.info(f"MCP path enabled, url={mcp_url}")
-            else:
-                log.warning("MCP available but token creation failed, falling back to ckan_agent")
+            log.warning("MCP available but token creation failed, falling back to ckan_agent")
 
     if deps.mcp_url:
         log.info("Using MCP execution path (JSON-RPC)")

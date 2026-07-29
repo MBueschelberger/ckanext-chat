@@ -32,23 +32,35 @@ User --> Chat UI (/chat)  --> front_agent / research_agent
 
 ## ckanext-mcp Integration
 
-When [ckanext-mcp](https://github.com/Mat-O-Lab/ckanext-mcp) is installed and loaded, the chat agent can call CKAN actions through its MCP endpoint instead of the internal `ckan_agent` intermediary.
+When [ckanext-mcp](https://github.com/Mat-O-Lab/ckanext-mcp) is installed and loaded, the data fetch layer
+uses MCP's JSON-RPC endpoint instead of direct `toolkit.get_action()` calls.
 
-**Why prefer MCP over the built-in ckan_agent path:**
+**How the data flow works:**
 
-- **No double-agent overhead.** The default path runs `front_agent -> ckan_agent -> run_action`, where ckan_agent is a separate LLM call that validates and optimizes the action. With MCP, the front_agent calls the MCP endpoint directly -- one LLM call instead of two, saving tokens and latency.
-- **Better tool schemas.** ckanext-mcp generates full JSON Schema definitions for each CKAN action with typed parameters, enums, and defaults. The agent gets proper tool definitions rather than a free-text command string.
-- **Smart defaults and pagination.** MCP applies intelligent parameter defaults and pagination hints at the server level, so the agent doesn't need to learn these patterns.
-- **Consistent auth model.** MCP calls go through CKAN's standard HTTP auth pipeline with API tokens. The user's permissions are enforced the same way as any API call.
-- **Tool discovery.** The agent can call `mcp_tools` to discover all available CKAN entity tools and their operations at runtime.
+```
+front_agent -> ckan_run -> ckan_agent (validate/correct action + params)
+                        -> MCP fetch (preferred) or direct Python (fallback)
+                        -> smart_truncate -> return to front_agent
+```
+
+The `ckan_agent` LLM validates and optimizes the action (e.g. redirecting `package_list`
+to `package_search`, adding `include_private=True`). The actual data fetch goes through MCP
+when available, falling back to direct `toolkit.get_action()` calls if MCP is not loaded
+or the action is not mapped.
+
+**Why MCP improves the data fetch:**
+
+- **Consistent auth model.** MCP calls go through CKAN's HTTP auth pipeline with per-user API tokens. Permissions are enforced the same way as any API call.
+- **Smart defaults and pagination.** MCP applies intelligent parameter defaults at the server level.
+- **Supports full CRUD.** Read (search, show, list) and write (create, update, patch) operations are all routed through MCP when available.
 
 **How it works:**
 
-The plugin detects whether `ckanext-mcp` is loaded at request time using `ckan.plugins.plugin_loaded('mcp')`. If available, it creates a per-user API token and sets up the MCP connection via JSON-RPC. The agent then has access to `mcp_tools` (discovery) and `mcp_call` (execution) tools alongside `ckan_run`.
+The plugin detects `ckanext-mcp` at request time via `ckan.plugins.plugin_loaded('mcp')`.
+If available, it creates a per-user API token and derives the MCP URL from
+`ckan.devserver.host` and `ckan.devserver.port` (internal HTTP, no SSL).
 
-If MCP is unavailable or the URL is not configured, the agent falls back to the `ckan_run -> ckan_agent` path transparently.
-
-To enable, add `mcp` to `ckan.plugins`. The MCP URL is derived automatically from `ckan.site_url` + `/mcp` -- no extra configuration needed.
+To enable, add `mcp` to `ckan.plugins` -- no extra configuration needed.
 
 ## OpenAI-Compatible Chat Completions API
 

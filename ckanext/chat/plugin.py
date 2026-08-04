@@ -3,7 +3,7 @@ import ckan.plugins.toolkit as toolkit
 from ckan.config.declaration import Declaration, Key
 from ckan.lib.plugins import DefaultTranslation
 
-from ckanext.chat import action, auth, helpers, views
+from ckanext.chat import action, api, auth, helpers, views
 
 
 class ChatPlugin(plugins.SingletonPlugin, DefaultTranslation):
@@ -37,11 +37,17 @@ class ChatPlugin(plugins.SingletonPlugin, DefaultTranslation):
         declaration.declare(group.milvus_url, "")
         declaration.declare(group.milvus_token, "")
         declaration.declare(group.collection_name, "")
+        declaration.declare(group.provider, "azure")
+        declaration.declare(group.model_name, "")
+        declaration.declare(group.think_model_name, "")
+        declaration.declare(group.base_url, "")
+        declaration.declare(group.api_key, "")
+        declaration.declare(group.api_version, "2024-06-01")
 
     # IBlueprint
 
     def get_blueprint(self):
-        return views.get_blueprint()
+        return [views.get_blueprint(), api.get_api_blueprint()]
 
     # ITemplateHelpers
 

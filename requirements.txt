@@ -1,4 +1,4 @@
-pydantic-ai-slim[openai,logfire]==1.32.0
+pydantic-ai-slim[openai,logfire]>=1.107.0,<2.0
 openai
 logfire[httpx]
 nest_asyncio
@@ -6,5 +6,5 @@ pymilvus==2.5.5
 tiktoken
 regex
 aiofiles
-aiohttp[speedups]
+aiohttp
 loguru

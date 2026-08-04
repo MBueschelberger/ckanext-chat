@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union, Literal
 import aiofiles
 import aiohttp
 import ckan.model as CKANmodel
+import ckan.plugins as plugins
 import ckan.plugins.toolkit as toolkit
 import requests
 
@@ -24,7 +25,7 @@ from pydantic_ai.exceptions import (AgentRunError, FallbackExceptionGroup,
                                     UsageLimitExceeded)
 from pydantic_ai.messages import (ModelMessagesTypeAdapter, ModelRequest,
                                   ModelResponse, TextPart, UserPromptPart)
-from pydantic_ai.models.openai import OpenAIModel, OpenAIModelSettings
+from pydantic_ai.models.openai import OpenAIChatModel, OpenAIModelSettings
 from pydantic_ai.providers.azure import AzureProvider
 from pydantic_ai.usage import UsageLimits
 from pymilvus import MilvusClient
@@ -91,34 +92,42 @@ app = Flask(__name__)
 
 # --------------------- Model & Agent Setup ---------------------
 
-# Azure Setup
-deployment = toolkit.config.get("ckanext.chat.deployment", "gpt-4o-mini")
+
+def build_model(model_name: str = None) -> OpenAIChatModel:
+    provider_type = toolkit.config.get("ckanext.chat.provider", "azure")
+    name = model_name or toolkit.config.get("ckanext.chat.model_name") or toolkit.config.get("ckanext.chat.deployment", "gpt-4o-mini")
+    base_url = toolkit.config.get("ckanext.chat.base_url") or toolkit.config.get("ckanext.chat.completion_url", "https://your.chat.api")
+    api_key = toolkit.config.get("ckanext.chat.api_key") or toolkit.config.get("ckanext.chat.api_token", "your-api-token")
+    api_version = toolkit.config.get("ckanext.chat.api_version", "2024-06-01")
+
+    if provider_type == "azure":
+        provider = AzureProvider(
+            azure_endpoint=base_url,
+            api_version=api_version,
+            api_key=api_key,
+        )
+    elif provider_type == "openai":
+        from pydantic_ai.providers.openai import OpenAIProvider
+        provider = OpenAIProvider(base_url=base_url, api_key=api_key)
+    else:
+        raise ValueError(f"Unknown provider: {provider_type!r}. Use 'azure' or 'openai'.")
+
+    return OpenAIChatModel(name, provider=provider)
+
+
+def mcp_available() -> bool:
+    return plugins.plugin_loaded('mcp')
+
+
+deployment = toolkit.config.get("ckanext.chat.model_name") or toolkit.config.get("ckanext.chat.deployment", "gpt-4o-mini")
 rag_model_settings = OpenAIModelSettings(
     model_name=deployment,
     max_tokens=16384,
-    # openai_reasoning_effort= "low"
 )
-model = OpenAIModel(
-    deployment,
-    provider=AzureProvider(
-        azure_endpoint=toolkit.config.get(
-            "ckanext.chat.completion_url", "https://your.chat.api"
-        ),
-        api_version="2024-06-01",
-        api_key=toolkit.config.get("ckanext.chat.api_token", "your-api-token"),
-    ),
-)
+model = build_model()
 
-think_model = OpenAIModel(
-    deployment,
-    provider=AzureProvider(
-        azure_endpoint=toolkit.config.get(
-            "ckanext.chat.completion_url", "https://your.chat.api"
-        ),
-        api_version="2024-06-01",
-        api_key=toolkit.config.get("ckanext.chat.api_token", "your-api-token"),
-    ),
-)
+think_model_name = toolkit.config.get("ckanext.chat.think_model_name") or toolkit.config.get("ckanext.chat.model_name") or "gpt-4.1-mini"
+think_model = build_model(think_model_name)
 
 # --------------------- Milvus and CKAN Setup ---------------------
 
@@ -187,8 +196,10 @@ def get_http_session() -> aiohttp.ClientSession:
 class Deps:
     user_id: str
     milvus_client: MilvusClient = field(default_factory=lambda: milvus_client)
-    openai: OpenAIModel = field(default_factory=lambda: model)
+    openai: OpenAIChatModel = field(default_factory=lambda: model)
     embeddings: Union[OAI_Embeddings, str] = field(default=embedding_api)
+    mcp_token: Optional[str] = None
+    mcp_url: Optional[str] = None
     embedding_model: str = field(default_factory=lambda: embedding_model)
     max_context_length: int = 8192
     collection_name: str = collection_name
@@ -416,44 +427,39 @@ front_agent_prompt = (
     
     "DECISION TREE:\n"
     "1. Analyze user question type:\n"
-    "   - CKAN data query (datasets, resources, orgs) → use ckan_run\n"
+    "   - CKAN operation (search, list, create, update, show) → use ckan_run\n"
     "   - General knowledge/literature → use literature_search\n"
     "   - Document analysis (specific file) → use literature_analyse\n"
     "   - Mixed query → literature_search first, then ckan_run if needed\n\n"
-    
+
     "2. Execute efficiently:\n"
     "   - Maximum 3 tool calls per response (e.g., search + analyze + ckan)\n"
     "   - Prefer single comprehensive call over multiple small ones\n"
     "   - Only call tools when necessary\n\n"
-    
+
     "TOOL USAGE GUIDELINES:\n\n"
-    
-    "**ckan_run - CRITICAL RULES:**\n"
-    "1. For ANY dataset query (\"show me datasets\", \"what datasets\", \"list datasets\"), ALWAYS use:\n"
-    "   → ckan_run('package_search', {'q': '*:*', 'include_private': True})\n"
-    "   \n"
-    "2. NEVER use 'package_list' - it doesn't show metadata or private datasets\n"
-    "   \n"
-    "3. For searching specific datasets:\n"
-    "   - By tag: ckan_run('package_search', {'q': 'tags:climate', 'include_private': True})\n"
-    "   - By keyword: ckan_run('package_search', {'q': 'water', 'include_private': True})\n"
-    "   - All datasets: ckan_run('package_search', {'q': '*:*', 'include_private': True})\n"
-    "   \n"
-    "4. ALWAYS include 'include_private': True (boolean True, NOT string 'true')\n"
-    "   - This shows BOTH public AND private datasets user has access to\n"
-    "   - Without it, users only see public datasets\n"
-    "   \n"
-    "5. Example conversation:\n"
-    "   User: \"What datasets do I have?\"\n"
-    "   ✅ CORRECT: ckan_run('package_search', {'q': '*:*', 'include_private': True})\n"
-    "   ❌ WRONG: ckan_run('package_list', {}) or ckan_run('package_list', {'limit': 10})\n"
-    "   \n"
-    "6. Only use other actions for specific needs:\n"
-    "   - 'package_show': Get details of ONE specific dataset by ID\n"
-    "   - 'organization_list': List organizations\n"
-    "   - 'group_list': List groups\n"
-    "   \n"
-    "7. Warn before write/delete operations\n\n"
+
+    "**CKAN OPERATIONS (read AND write):**\n"
+    "Use ckan_run for ALL CKAN operations: search, show, list, create, update, patch.\n"
+    "It handles action validation, parameter optimization, and MCP integration automatically.\n"
+    "You CAN create organizations, datasets, resources, and update/patch them via ckan_run.\n"
+    "Only delete and purge operations are blocked.\n\n"
+
+    "CRITICAL RULES for CKAN queries:\n"
+    "1. For dataset LISTING/SEARCH, use package_search (not package_list).\n"
+    "   - package_search returns full metadata and supports private datasets.\n"
+    "   - package_list only returns names.\n"
+    "2. ALWAYS include 'include_private': True for package_search.\n"
+    "3. Search patterns:\n"
+    "   - All datasets: q='*:*', include_private=True\n"
+    "   - By tag: q='tags:TAG_NAME', include_private=True\n"
+    "   - By keyword: q='KEYWORD', include_private=True\n"
+    "   - By organization: q='owner_org:ORG_ID', include_private=True\n"
+    "     OR: q='*:*', fq='owner_org:ORG_ID', include_private=True\n"
+    "4. For specific dataset details: use package_show with id=DATASET_ID_OR_NAME.\n"
+    "5. For specific resource details: use resource_show with id=RESOURCE_ID.\n"
+    "   Do NOT use package_search to look up a resource by ID.\n"
+    "6. NEVER execute delete or purge operations.\n\n"
     
     "**literature_search:**\n"
     "- ALWAYS rephrase user query for better semantic matching\n"
@@ -546,7 +552,8 @@ research_agent_prompt = (
     "TOOL USAGE:\n"
     "**literature_search:** Rephrase query, max 3 calls\n"
     "**literature_analyse:** Extract precise evidence, max 5 calls\n"
-    "**ckan_run:** Only if CKAN-specific question, max 2 calls\n\n"
+    "**CKAN data:** Use ckan_run for CKAN queries. It handles MCP integration automatically. Max 2 calls.\n"
+    "  Always use package_search (not package_list), always include_private=True.\n\n"
     
     "CITATION FORMAT:\n"
     "- Inline: [Author Year](highlight_url)\n"
@@ -599,9 +606,10 @@ ckan_agent_prompt = (
     "- 'rows': 10 (pagination - reasonable default)\n"
     "- 'start': 0 (pagination - first page)\n"
     
-    "For other actions:\n"
+    "For other actions (resource_show, organization_show, *_create, *_patch, etc.):\n"
+    "- Pass action and parameters through as-is — do NOT redirect them\n"
     "- Trust merge_with_smart_defaults() to add required parameters\n"
-    "- You focus on dataset search actions\n\n"
+    "- resource_show needs 'id', organization_show needs 'id', etc.\n\n"
     
     "EXECUTION PROCESS:\n"
     "1. Analyze received action and CHANGE IT if needed:\n"
@@ -638,19 +646,19 @@ ckan_agent_prompt = (
     "5. Return CKANResult with status, action_name, parameters, result, comment\n\n"
     
     "EXAMPLES:\n"
-    
+
     "Example 1 - Action Correction:\n"
     "Input: action='package_list', parameters={}\n"
     "Think: 'package_list is suboptimal, redirecting to package_search'\n"
     "Execute: run_action('package_search', {'q': '*:*', 'include_private': True, 'rows': 10, 'start': 0})\n"
     "Return: status='success', action_name='package_search', comment='Redirected from package_list for richer data'\n"
-    
+
     "Example 2 - Parameter Completion:\n"
     "Input: action='package_search', parameters={'q': 'climate'}\n"
     "Think: 'Missing include_private and pagination'\n"
     "Execute: run_action('package_search', {'q': 'climate', 'include_private': True, 'rows': 10, 'start': 0})\n"
     "Return: status='success', action_name='package_search', parameters_auto_added={'include_private': True, 'rows': 10, 'start': 0}\n"
-    
+
     "Example 3 - Large Result:\n"
     "Execute: run_action returns items_returned=127\n"
     "Return: status='success', comment='Large result (127 items). Consider pagination: rows=10, start=0/10/20...'\n\n"
@@ -666,23 +674,21 @@ ckan_agent_prompt = (
 agent = Agent(
     model=model,
     deps_type=Deps,
-    system_prompt="".join(front_agent_prompt),
+    instructions="".join(front_agent_prompt),
     retries=3,
-    # model_settings=OpenAIModelSettings(openai_reasoning_effort= "low")
 )
 
 research_agent= Agent(
     model=think_model,
     deps_type=Deps,
-    system_prompt="".join(research_agent_prompt),
+    instructions="".join(research_agent_prompt),
     retries=3,
-    # model_settings=OpenAIModelSettings(openai_reasoning_effort= "low")
 )
 ckan_agent = Agent(
     model=model,
     deps_type=Deps,
     output_type=CKANResult,
-    system_prompt="".join(ckan_agent_prompt),
+    instructions="".join(ckan_agent_prompt),
     retries=5,
 )
 
@@ -691,17 +697,15 @@ rag_agent = Agent(
     model=model,
     deps_type=Deps,
     output_type=LitSearchResult,
-    system_prompt="".join(rag_prompt),
-    #retries=3,
+    instructions="".join(rag_prompt),
     model_settings=rag_model_settings,
-    # model_settings=OpenAIModelSettings(openai_reasoning_effort= "low")
 )
 
 doc_agent = Agent(
     model=model,
     deps_type=TextResource,
     output_type=AnalyseResult,
-    system_prompt="".join(doc_prompt),
+    instructions="".join(doc_prompt),
     retries=3,
     model_settings=rag_model_settings,
 )
@@ -765,6 +769,68 @@ def normalize_parameters(params: dict) -> dict:
     return normalized
 
 
+async def _mcp_jsonrpc(url: str, token: str, method: str, params: dict = None) -> dict:
+    ssl_verify = toolkit.config.get("ckanext.chat.ssl_verify", True)
+    async with aiohttp.ClientSession() as session:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params or {},
+        }
+        headers = {"Authorization": token, "Content-Type": "application/json"}
+        async with session.post(url, json=payload, headers=headers, ssl=ssl_verify) as resp:
+            data = await resp.json()
+            if "error" in data:
+                raise RuntimeError(f"MCP error: {data['error'].get('message', data['error'])}")
+            return data.get("result", {})
+
+
+async def _mcp_fetch_data(url: str, token: str, action: str, params: dict) -> Optional[dict]:
+    """Fetch data via MCP JSON-RPC, mapping CKAN action to MCP tool+operation."""
+    action_to_mcp = {
+        "package_search": ("ckan_package", "search"),
+        "package_show": ("ckan_package", "show"),
+        "package_list": ("ckan_package", "list"),
+        "package_create": ("ckan_package", "create"),
+        "package_update": ("ckan_package", "update"),
+        "package_patch": ("ckan_package", "patch"),
+        "resource_show": ("ckan_resource", "show"),
+        "resource_search": ("ckan_resource", "search"),
+        "resource_create": ("ckan_resource", "create"),
+        "resource_update": ("ckan_resource", "update"),
+        "resource_patch": ("ckan_resource", "patch"),
+        "organization_list": ("ckan_organization", "list"),
+        "organization_show": ("ckan_organization", "show"),
+        "organization_create": ("ckan_organization", "create"),
+        "organization_update": ("ckan_organization", "update"),
+        "organization_patch": ("ckan_organization", "patch"),
+        "group_list": ("ckan_group", "list"),
+        "group_show": ("ckan_group", "show"),
+        "group_create": ("ckan_group", "create"),
+        "tag_list": ("ckan_tag", "list"),
+        "user_show": ("ckan_user", "show"),
+    }
+    mapping = action_to_mcp.get(action)
+    if not mapping:
+        return None
+    tool_name, operation = mapping
+    try:
+        call_args = {**params, "operation": operation}
+        result = await _mcp_jsonrpc(url, token, "tools/call", {"name": tool_name, "arguments": call_args})
+        content = result.get("content", [])
+        texts = [c.get("text", "") for c in content if c.get("type") == "text"]
+        if texts:
+            try:
+                return json.loads(texts[0])
+            except (json.JSONDecodeError, IndexError):
+                return {"raw": texts[0] if len(texts) == 1 else texts}
+        return result
+    except Exception as e:
+        log.warning(f"MCP fetch failed for {action}, falling back to direct: {e}")
+        return None
+
+
 @agent.tool
 @research_agent.tool
 async def ckan_run(ctx: RunContext[Deps], command: str, parameters: dict={}) -> str:
@@ -781,9 +847,12 @@ async def ckan_run(ctx: RunContext[Deps], command: str, parameters: dict={}) -> 
     Returns:
         str: The result of the CKAN action as a JSON string, or an error message in case of failure.
     """
+    if is_action_blocked(command):
+        return json.dumps({"status": "fail", "action_name": command, "result": f"Action '{command}' is blocked. Destructive actions (_delete, _purge) are not allowed."})
+
     # Normalize parameters to handle JSON boolean/null conversions
     parameters = normalize_parameters(parameters)
-    
+
     start_time = datetime.now(timezone.utc)
     log.info(f"ckan_run starting: action='{command}', params={json.dumps(parameters)[:100]}")
     
@@ -814,50 +883,58 @@ async def ckan_run(ctx: RunContext[Deps], command: str, parameters: dict={}) -> 
                 f"action={ckan_result.action_name}, "
                 f"result_preview={str(ckan_result.result)[:100]}")
         
-        # If successful, fetch and truncate data separately for front_agent
         if ckan_result.status == 'success':
             try:
-                # CRITICAL: Use the CORRECTED action name from ckan_agent, not the original command
                 corrected_action = ckan_result.action_name or command
                 corrected_params = ckan_result.parameters or parameters
-                
-                # Fetch data separately (not sent to ckan_agent LLM)
                 merged_params = merge_with_smart_defaults(corrected_action, corrected_params)
-                user = CKANmodel.User.get(user_reference=ctx.deps.user_id)
-                context = {
-                    "user": user.name,
-                    "auth_user_obj": user,
-                    "model": CKANmodel,
-                    "session": CKANmodel.Session,
-                    "ignore_auth": False,
-                }
-                
-                response = toolkit.get_action(corrected_action)(context, merged_params)
-                
-                # Apply smart truncation
+
+                response = None
+                fetch_method = "direct"
+
+                # Try MCP first if available
+                if ctx.deps.mcp_url and ctx.deps.mcp_token:
+                    response = await _mcp_fetch_data(
+                        ctx.deps.mcp_url, ctx.deps.mcp_token,
+                        corrected_action, merged_params,
+                    )
+                    if response is not None:
+                        fetch_method = "mcp"
+
+                # Fallback to direct toolkit call
+                if response is None:
+                    user = CKANmodel.User.get(user_reference=ctx.deps.user_id)
+                    context = {
+                        "user": user.name,
+                        "auth_user_obj": user,
+                        "model": CKANmodel,
+                        "session": CKANmodel.Session,
+                        "ignore_auth": False,
+                    }
+                    response = toolkit.get_action(corrected_action)(context, merged_params)
+
                 truncated = smart_truncate_response(response)
-                
-                # Combine ckan_agent result with truncated data
+
                 result_dict = ckan_result.model_dump()
-                result_dict['data'] = truncated['data']
+                result_dict['result'] = truncated['data']
                 result_dict['_truncated'] = truncated['truncated']
                 result_dict['_truncation_method'] = truncated['truncation_method']
                 result_dict['_total_items'] = truncated['total_items']
                 result_dict['_showing_items'] = truncated['showing_items']
                 result_dict['_estimated_tokens'] = truncated['estimated_tokens']
-                
+
                 total_duration_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
                 log.info(f"ckan_run data fetch complete: action='{command}', "
+                        f"method={fetch_method}, "
                         f"truncation={truncated['truncation_method']}, "
                         f"items={truncated['showing_items']}/{truncated['total_items']}, "
                         f"total_duration_ms={total_duration_ms:.0f}")
-                
+
                 final_result = json.dumps(result_dict)
                 log.debug(f"ckan_run final result size: {len(final_result)} chars")
                 return final_result
             except Exception as e:
                 log.error(f"ckan_run data fetch error: {str(e)[:200]}")
-                # Return original result if data fetching fails
                 return r.output.model_dump_json()
         
         # If failed, log and return as-is
@@ -978,6 +1055,14 @@ def run_action(ctx: RunContext[Deps], action_name: str, parameters: Dict) -> Any
     Returns:
         Dict: Validation result with metrics only (no actual data)
     """
+    if is_action_blocked(action_name):
+        return {
+            'success': False,
+            'error': f"Action '{action_name}' is blocked. Destructive actions (_delete, _purge) are not allowed.",
+            'error_type': 'ActionBlocked',
+            'parameters_attempted': parameters
+        }
+
     # Track what parameters were auto-added
     merged_parameters = merge_with_smart_defaults(action_name, parameters)
     params_added = {k: v for k, v in merged_parameters.items() if k not in parameters}
@@ -1445,8 +1530,18 @@ async def literature_analyse(doc: TextResource, question: str, ssl_verify: bool 
         return json.dumps({"answer": "", "source": str(doc.url), "error": [f"Unexpected error: {type(e).__name__}: {str(e)}"]})
 
 
+BLOCKED_ACTION_SUFFIXES = ("_delete", "_purge")
+
+
+def is_action_blocked(action_name: str) -> bool:
+    return any(action_name.endswith(suffix) for suffix in BLOCKED_ACTION_SUFFIXES)
+
+
 def get_user_token(user_id: str) -> Optional[str]:
     user = CKANmodel.User.get(user_reference=user_id)
+    if not user:
+        log.error(f"get_user_token: user not found for id={user_id}")
+        return None
     context = {
         "user": user.name,
         "auth_user_obj": user,
@@ -1454,12 +1549,23 @@ def get_user_token(user_id: str) -> Optional[str]:
         "session": CKANmodel.Session,
         "ignore_auth": False,
     }
-    parameters = {"user": user.name, "name": "chat_agent"}
     try:
-        response = toolkit.get_action("api_token_create")(context, parameters)
+        existing_tokens = toolkit.get_action("api_token_list")(context, {"user": user.name})
+        for tok in existing_tokens:
+            if tok.get("name") == "chat_agent":
+                toolkit.get_action("api_token_revoke")(context, {"jti": tok["id"]})
+                break
     except Exception as e:
-        return e
-    if "token" in response.keys():
-        token = response["token"].decode("utf-8")
+        log.warning(f"get_user_token: could not check/revoke existing tokens: {e}")
+
+    try:
+        response = toolkit.get_action("api_token_create")(context, {"user": user.name, "name": "chat_agent"})
+    except Exception as e:
+        log.error(f"get_user_token: token creation failed: {e}")
+        return None
+    if "token" in response:
+        token = response["token"]
+        if isinstance(token, bytes):
+            token = token.decode("utf-8")
         return token
     return None

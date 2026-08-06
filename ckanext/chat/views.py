@@ -193,6 +193,7 @@ async def _agent_worker(prompt: str, history: str, user_id: str, research: bool 
 blueprint.add_url_rule(
     "/chat",
     view_func=ChatView.as_view(str("chat")),
+    strict_slashes=False,
 )
 
 blueprint.add_url_rule(

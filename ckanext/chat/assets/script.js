@@ -557,7 +557,7 @@ ckan.module("chat-module", function ($, _) {
         icon.addClass("d-none");
 
         if (!chatHistory.length) {
-          $.post("chat/ask", {
+          $.post("/chat/ask", {
             text: "Output only a 3-word title for this question: " + text +". Return only the 3-word title as plain text, with no explanations, punctuation, or formatting.",
           })
             .done(function (data) {
@@ -614,7 +614,7 @@ ckan.module("chat-module", function ($, _) {
       var self = this;
       $.ajax({
         type: "POST",
-        url: "chat/ask",
+        url: "/chat/ask",
         data: {
           text: text,
           history: JSON.stringify(history),

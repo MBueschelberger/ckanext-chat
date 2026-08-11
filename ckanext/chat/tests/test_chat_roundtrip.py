@@ -57,12 +57,13 @@ class ChatRoundtripTest:
 
     # -- helpers --
 
-    def _chat(self, user_msg: str, timeout: int = 120) -> str:
-        """Send a message to chat completions endpoint and return assistant reply."""
+    def _chat(self, user_msg: str, timeout: int = 300) -> str:
+        """Send a streaming message to chat completions endpoint and return assembled reply."""
         self.history.append({"role": "user", "content": user_msg})
         payload = {
             "model": "default",
             "messages": self.history,
+            "stream": True,
         }
         if self.verbose:
             print(f"\n  >>> {user_msg[:120]}...")
@@ -75,16 +76,32 @@ class ChatRoundtripTest:
                 "Content-Type": "application/json",
             },
             timeout=timeout,
+            stream=True,
         )
         resp.raise_for_status()
-        data = resp.json()
 
-        assistant_msg = data["choices"][0]["message"]["content"]
-        self.history.append({"role": "assistant", "content": assistant_msg})
+        assistant_msg = ""
+        for line in resp.iter_lines(decode_unicode=True):
+            if not line or not line.startswith("data: "):
+                continue
+            data_str = line[len("data: "):]
+            if data_str.strip() == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data_str)
+                delta = chunk["choices"][0].get("delta", {})
+                content = delta.get("content", "")
+                if content:
+                    assistant_msg += content
+                    if self.verbose:
+                        print(content, end="", flush=True)
+            except (json.JSONDecodeError, KeyError, IndexError):
+                continue
 
         if self.verbose:
-            print(f"  <<< {assistant_msg[:200]}...")
+            print()
 
+        self.history.append({"role": "assistant", "content": assistant_msg})
         return assistant_msg
 
     def _ckan_get(self, action: str, params: dict = None) -> dict:

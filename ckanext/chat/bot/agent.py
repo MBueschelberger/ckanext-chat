@@ -853,9 +853,11 @@ async def ckan_run(ctx: RunContext[Deps], command: str, parameters: dict={}) -> 
     # Normalize parameters to handle JSON boolean/null conversions
     parameters = normalize_parameters(parameters)
 
+    import time as _time
+    t0 = _time.monotonic()
     start_time = datetime.now(timezone.utc)
     log.info(f"ckan_run starting: action='{command}', params={json.dumps(parameters)[:100]}")
-    
+
     try:
         r = await asyncio.wait_for(
             ckan_agent.run(
@@ -869,13 +871,12 @@ async def ckan_run(ctx: RunContext[Deps], command: str, parameters: dict={}) -> 
             ),
             timeout=config.CKAN_RUN_TIMEOUT
         )
-        
-        # Track usage metrics
+
+        t_agent = _time.monotonic()
         usage = r.usage()
-        duration_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
-        log.info(f"ckan_run agent validation: action='{command}', "
-                f"tokens=[request:{usage.request_tokens}, response:{usage.response_tokens}, total:{usage.total_tokens}], "
-                f"duration_ms={duration_ms:.0f}")
+        log.info(f"ckan_run agent done: action='{command}', "
+                f"agent_time={t_agent - t0:.1f}s, "
+                f"requests={usage.request_tokens}req/{usage.response_tokens}resp/{usage.total_tokens}total")
         
         # Log what ckan_agent returned
         ckan_result = r.output
@@ -892,6 +893,7 @@ async def ckan_run(ctx: RunContext[Deps], command: str, parameters: dict={}) -> 
                 response = None
                 fetch_method = "direct"
 
+                t_fetch_start = _time.monotonic()
                 # Try MCP first if available
                 if ctx.deps.mcp_url and ctx.deps.mcp_token:
                     response = await _mcp_fetch_data(
@@ -912,6 +914,7 @@ async def ckan_run(ctx: RunContext[Deps], command: str, parameters: dict={}) -> 
                         "ignore_auth": False,
                     }
                     response = toolkit.get_action(corrected_action)(context, merged_params)
+                t_fetch_end = _time.monotonic()
 
                 truncated = smart_truncate_response(response)
 
@@ -923,15 +926,13 @@ async def ckan_run(ctx: RunContext[Deps], command: str, parameters: dict={}) -> 
                 result_dict['_showing_items'] = truncated['showing_items']
                 result_dict['_estimated_tokens'] = truncated['estimated_tokens']
 
-                total_duration_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
-                log.info(f"ckan_run data fetch complete: action='{command}', "
+                t_total = _time.monotonic()
+                log.info(f"ckan_run complete: action='{command}', "
                         f"method={fetch_method}, "
-                        f"truncation={truncated['truncation_method']}, "
-                        f"items={truncated['showing_items']}/{truncated['total_items']}, "
-                        f"total_duration_ms={total_duration_ms:.0f}")
+                        f"agent={t_agent - t0:.1f}s, fetch={t_fetch_end - t_fetch_start:.1f}s, total={t_total - t0:.1f}s, "
+                        f"items={truncated['showing_items']}/{truncated['total_items']}")
 
                 final_result = json.dumps(result_dict)
-                log.debug(f"ckan_run final result size: {len(final_result)} chars")
                 return final_result
             except Exception as e:
                 log.error(f"ckan_run data fetch error: {str(e)[:200]}")
@@ -1077,10 +1078,11 @@ def run_action(ctx: RunContext[Deps], action_name: str, parameters: Dict) -> Any
     }
     
     try:
-        # Execute CKAN action
+        import time as _time
+        t_action = _time.monotonic()
         response = toolkit.get_action(action_name)(context, merged_parameters)
-        
-        # Measure response (but don't process it)
+        log.info(f"run_action executed: action='{action_name}', time={_time.monotonic() - t_action:.3f}s")
+
         json_str = json.dumps(response)
         response_size_bytes = len(json_str)
         estimated_tokens = response_size_bytes // 4
@@ -1328,7 +1330,7 @@ async def get_embedding(chunks: List[str], model: str, api_url, vector_dim: int)
     if response.status_code == 200:
         return response.json()["embeddings"]
     else:
-        return {"error": response.status_code, "message": response.text}
+        raise RuntimeError(f"Embedding service error {response.status_code}: {response.text}")
 
 
 @rag_agent.tool

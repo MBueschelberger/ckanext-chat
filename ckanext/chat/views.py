@@ -24,7 +24,7 @@ logger.remove()
 if bool(strtobool(os.environ.get("DEBUG", "false"))):
     log_level = "DEBUG"
 else:
-    log_level = "ERROR"
+    log_level = "INFO"
 logger.add(
     sys.stderr,
     format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level} | [{name}] {message}",

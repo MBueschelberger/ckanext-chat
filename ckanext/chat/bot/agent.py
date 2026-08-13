@@ -1361,33 +1361,32 @@ async def rag_search(
             vector_dim=ctx.deps.vector_dim,
         )
         log.info(f"rag_search embedding done, starting milvus search")
-        num_results = 0
         hits = []
-        filter_ids = []
-        while num_results < limit:
-            log.debug(f"{search_query} filtered by: {filter_ids}")
+        seen_ids = set()
+        while len(hits) < limit:
+            filter_ids = list(seen_ids)
             search_res = ctx.deps.milvus_client.search(
                 collection_name=ctx.deps.collection_name,
                 data=query_vectors,
                 search_params={"metric_type": "COSINE", "params": {"level": 1}},
-                limit=6,
+                limit=limit,
                 filter_params={"ids": filter_ids} if filter_ids else None,
                 filter="id not in {ids}" if filter_ids else None,
                 output_fields=list(VectorMeta.__fields__.keys()),
                 consistency_level="Bounded",
             )
-            if search_res:
-                for i in range(len(query_vectors)):
-                    hit = [RagHit(**item) for item in search_res[i]]
-                    hits += hit
-                    filter_ids += list(set(hit.id for hit in hits))
-                    # log.debug(hits)
-                distinct_sources = list(set(hit.entity.source for hit in hits))
-                num_results = len(distinct_sources)
-                log.info(
-                    f"rag_search milvus: {num_results}/{limit} distinct sources found"
-                )
-        log.info(f"rag_search completed: {len(hits)} hits from {num_results} sources")
+            new_hits = 0
+            for result_per_vector in search_res:
+                for item in result_per_vector:
+                    rag_hit = RagHit(**item)
+                    if rag_hit.id not in seen_ids:
+                        seen_ids.add(rag_hit.id)
+                        hits.append(rag_hit)
+                        new_hits += 1
+            if new_hits == 0:
+                break
+            log.info(f"rag_search milvus: {len(hits)}/{limit} unique hits")
+        log.info(f"rag_search completed: {len(hits)} hits")
         return hits
         
 

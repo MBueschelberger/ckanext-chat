@@ -761,15 +761,15 @@ def _fuzzy_search_sync(
     try:
         match, fuzzy_pat = try_match(pat=pattern, text=text, max_err=max_err)
     except regex.error as e:
-        print(f"Initial regex failed for pattern '{pattern}': {e}")
+        log.debug(f"Initial regex failed for pattern '{pattern[:80]}': {e}")
         match = None
 
     if not match:
         escaped = regex.escape(pattern)
         try:
-            match, fuzzy_pat = try_match(pat=pattern, text=text, max_err=max_err)
+            match, fuzzy_pat = try_match(pat=escaped, text=text, max_err=max_err)
         except regex.error as e:
-            print(f"Escaped regex also failed for pattern '{escaped}': {e}")
+            log.debug(f"Escaped regex also failed for pattern '{escaped[:80]}': {e}")
             return "", -1, -1
 
     if not match:

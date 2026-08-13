@@ -1386,6 +1386,7 @@ async def rag_search(
             if new_hits == 0:
                 break
             log.info(f"rag_search milvus: {len(hits)}/{limit} unique hits")
+        hits = hits[:limit]
         log.info(f"rag_search completed: {len(hits)} hits")
         return hits
         

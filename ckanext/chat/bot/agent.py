@@ -50,7 +50,7 @@ class AgentConfig:
     """Centralized configuration for agent timeouts, limits, and retries"""
     # Timeout settings (in seconds)
     CKAN_RUN_TIMEOUT: int = 90
-    LITERATURE_SEARCH_TIMEOUT: int = 30
+    LITERATURE_SEARCH_TIMEOUT: int = 60
     LITERATURE_ANALYSE_TIMEOUT: int = 120
     
     # Token limits

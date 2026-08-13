@@ -633,9 +633,11 @@ ckan.module("chat-module", function ($, _) {
       var statusEl = $(
         '<div class="message bot-message" id="stream-status">' +
           '<span class="col-2 chatavatar"><i class="fas fa-robot"></i></span>' +
-          '<div class="col-auto text">' +
-            '<i class="fas fa-spinner fa-spin"></i> ' +
-            '<span class="status-text">Processing...</span>' +
+          '<div class="col-auto text status-list">' +
+            '<div class="status-line active">' +
+              '<i class="fas fa-spinner fa-spin"></i> ' +
+              '<span>Processing...</span>' +
+            '</div>' +
           "</div>" +
         "</div>",
       );
@@ -693,7 +695,18 @@ ckan.module("chat-module", function ($, _) {
                   if (eventType === "status" && dataStr) {
                     try {
                       var data = JSON.parse(dataStr);
-                      statusEl.find(".status-text").text(data.message);
+                      var list = statusEl.find(".status-list");
+                      list.find(".status-line.active")
+                        .removeClass("active")
+                        .find("i")
+                        .removeClass("fa-spinner fa-spin")
+                        .addClass("fa-check");
+                      list.append(
+                        '<div class="status-line active">' +
+                          '<i class="fas fa-spinner fa-spin"></i> ' +
+                          "<span>" + $("<span>").text(data.message).html() + "</span>" +
+                        "</div>"
+                      );
                       statusEl[0].scrollIntoView({
                         behavior: "smooth",
                         block: "start",

@@ -131,6 +131,7 @@ ckan.module("chat-module", function ($, _) {
 
     // Called automatically when the module is instantiated
     initialize: function () {
+      this.abortController = null;
       this.bindUI();
       this.loadPreviousChats();
       this.loadChat();
@@ -155,6 +156,9 @@ ckan.module("chat-module", function ($, _) {
       });
       this.el.find("#regenerateButton").on("click", function () {
         self.regenerateFailedMessage();
+      });
+      this.el.find("#abortButton").on("click", function () {
+        self.abortStream();
       });
       // Bind keydown event for the user input textarea
       this.el.find("#userInput").on("keydown", function (e) {
@@ -528,6 +532,13 @@ ckan.module("chat-module", function ($, _) {
       return null;
     },
 
+    abortStream: function () {
+      if (this.abortController) {
+        this.abortController.abort();
+        this.abortController = null;
+      }
+    },
+
     // Send a user message and then trigger a bot reply
     sendMessage: function () {
       var self = this;
@@ -548,10 +559,12 @@ ckan.module("chat-module", function ($, _) {
         self.appendMessage(messageObject);
         var chatHistory = self.getChatHistory();
         var sendButton = this.el.find("#sendButton");
+        var abortButton = this.el.find("#abortButton");
         var spinner = sendButton.find(".spinner-border");
         var buttonText = sendButton.find(".button-text");
         var icon = sendButton.find(".fa-paper-plane");
-        sendButton.prop("disabled", true);
+        sendButton.addClass("d-none");
+        abortButton.removeClass("d-none");
         spinner.removeClass("d-none");
         buttonText.addClass("d-none");
         icon.addClass("d-none");
@@ -570,7 +583,8 @@ ckan.module("chat-module", function ($, _) {
                 spinner.addClass("d-none");
                 buttonText.removeClass("d-none");
                 icon.removeClass("d-none");
-                sendButton.prop("disabled", false);
+                sendButton.removeClass("d-none");
+                abortButton.addClass("d-none");
               });
             })
             .fail(function () {
@@ -578,7 +592,8 @@ ckan.module("chat-module", function ($, _) {
               spinner.addClass("d-none");
               buttonText.removeClass("d-none");
               icon.removeClass("d-none");
-              sendButton.prop("disabled", false);
+              sendButton.removeClass("d-none");
+              abortButton.addClass("d-none");
             });
         } else {
           // Wenn Chat-Historie vorhanden ist, sende die Bot-Nachricht direkt
@@ -586,7 +601,8 @@ ckan.module("chat-module", function ($, _) {
             spinner.addClass("d-none");
             buttonText.removeClass("d-none");
             icon.removeClass("d-none");
-            sendButton.prop("disabled", false);
+            sendButton.removeClass("d-none");
+            abortButton.addClass("d-none");
           });
         }
       }
@@ -626,6 +642,8 @@ ckan.module("chat-module", function ($, _) {
       chatbox.append(statusEl);
       statusEl[0].scrollIntoView({ behavior: "smooth", block: "start" });
 
+      self.abortController = new AbortController();
+
       var params = new URLSearchParams();
       params.append("text", text);
       params.append("history", JSON.stringify(history));
@@ -636,6 +654,7 @@ ckan.module("chat-module", function ($, _) {
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: params,
         credentials: "same-origin",
+        signal: self.abortController.signal,
       })
         .then(function (response) {
           if (!response.ok) {
@@ -651,6 +670,7 @@ ckan.module("chat-module", function ($, _) {
               .then(function (result) {
                 if (result.done) {
                   statusEl.remove();
+                  self.abortController = null;
                   if (callback) callback();
                   return;
                 }
@@ -696,9 +716,14 @@ ckan.module("chat-module", function ($, _) {
                 processChunk();
               })
               .catch(function (err) {
-                console.error("Stream read error:", err);
                 statusEl.remove();
-                alert("Ein Fehler ist aufgetreten: " + err);
+                self.abortController = null;
+                if (err.name === "AbortError") {
+                  console.log("Stream aborted by user");
+                } else {
+                  console.error("Stream read error:", err);
+                  alert("Ein Fehler ist aufgetreten: " + err);
+                }
                 if (callback) callback();
               });
           }
@@ -707,7 +732,12 @@ ckan.module("chat-module", function ($, _) {
         })
         .catch(function (err) {
           statusEl.remove();
-          alert("Ein Fehler ist aufgetreten: " + err);
+          self.abortController = null;
+          if (err.name === "AbortError") {
+            console.log("Stream aborted by user");
+          } else {
+            alert("Ein Fehler ist aufgetreten: " + err);
+          }
           if (callback) callback();
         });
     },

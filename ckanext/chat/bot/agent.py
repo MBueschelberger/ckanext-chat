@@ -205,7 +205,15 @@ class Deps:
     collection_name: str = collection_name
     vector_dim: int = vector_dim
     http_session: aiohttp.ClientSession = field(default_factory=get_http_session)
-    #file: Optional[TextResource] = None
+    status_queue: Optional[asyncio.Queue] = None
+
+
+def _push_status(deps, message: str):
+    if deps.status_queue is not None:
+        try:
+            deps.status_queue.put_nowait(message)
+        except Exception:
+            pass
 
 @dataclass
 class StringSlice:
@@ -853,6 +861,8 @@ async def ckan_run(ctx: RunContext[Deps], command: str, parameters: dict={}) -> 
     # Normalize parameters to handle JSON boolean/null conversions
     parameters = normalize_parameters(parameters)
 
+    _push_status(ctx.deps, f"CKAN: {command}")
+
     import time as _time
     t0 = _time.monotonic()
     start_time = datetime.now(timezone.utc)
@@ -931,6 +941,8 @@ async def ckan_run(ctx: RunContext[Deps], command: str, parameters: dict={}) -> 
                         f"method={fetch_method}, "
                         f"agent={t_agent - t0:.1f}s, fetch={t_fetch_end - t_fetch_start:.1f}s, total={t_total - t0:.1f}s, "
                         f"items={truncated['showing_items']}/{truncated['total_items']}")
+
+                _push_status(ctx.deps, f"CKAN complete: {truncated['showing_items']}/{truncated['total_items']} items ({t_total - t0:.1f}s)")
 
                 final_result = json.dumps(result_dict)
                 return final_result
@@ -1353,6 +1365,7 @@ async def rag_search(
     if not ctx.deps.milvus_client or not ctx.deps.embeddings:
         return "The Milvus Client was not setup properly, no rag_search supported in the moment."
     else:
+        _push_status(ctx.deps, f"Vector search: {len(search_query)} queries, limit={limit}")
         log.info(f"rag_search starting: queries={len(search_query)} limit={limit}")
         query_vectors = await get_embedding(
             search_query,
@@ -1387,6 +1400,7 @@ async def rag_search(
                 break
             log.info(f"rag_search milvus: {len(hits)}/{limit} unique hits")
         hits = hits[:limit]
+        _push_status(ctx.deps, f"Vector search complete: {len(hits)} hits")
         log.info(f"rag_search completed: {len(hits)} hits")
         return hits
         
@@ -1401,8 +1415,9 @@ async def literature_search(
     ctx: RunContext[Deps], search_question: str, num_results: int = 5
 ) -> list[str]:
     start_time = datetime.now(timezone.utc)
+    _push_status(ctx.deps, f"Literature search: \"{search_question[:80]}\"")
     log.info(f"literature_search starting: query='{search_question[:100]}...', num_results={num_results}")
-    
+
     for attempt in range(config.MAX_RETRIES_LITERATURE_SEARCH):
         try:
             log.debug(f"literature_search attempt {attempt+1}/{config.MAX_RETRIES_LITERATURE_SEARCH}")
@@ -1421,10 +1436,11 @@ async def literature_search(
             # Track usage metrics
             usage = r.usage()
             duration_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
+            _push_status(ctx.deps, f"Literature search complete ({duration_ms/1000:.1f}s)")
             log.info(f"literature_search completed: attempt={attempt+1}, "
                     f"tokens=[request:{usage.request_tokens}, response:{usage.response_tokens}, total:{usage.total_tokens}], "
                     f"duration_ms={duration_ms:.0f}")
-            
+
             return r.output.model_dump_json()
             
         except asyncio.TimeoutError:
@@ -1460,24 +1476,27 @@ async def literature_search(
     # Should not reach here, but just in case
     raise RuntimeError("All literature_search retries exhausted")
 
-@agent.tool_plain
-@research_agent.tool_plain
-async def literature_analyse(doc: TextResource, question: str, ssl_verify: bool = None) -> list[str]:
+@agent.tool
+@research_agent.tool
+async def literature_analyse(ctx: RunContext[Deps], doc: TextResource, question: str, ssl_verify: bool = None) -> list[str]:
     """
     Analyze a document to answer a question.
-    
+
     Args:
+        ctx: The runtime context with dependencies
         doc: TextResource with document URL
         question: Question to answer
         ssl_verify: Whether to verify SSL certificates. Defaults to config value.
-    
+
     Returns:
         JSON string with analysis results
     """
     # Read SSL verification from config if not explicitly provided
     if ssl_verify is None:
         ssl_verify = toolkit.config.get("ckanext.chat.ssl_verify", True)
-    
+
+    doc_filename = str(doc.url).rsplit('/', 1)[-1][:60] if doc.url else "unknown"
+    _push_status(ctx.deps, f"Analyzing: {doc_filename}")
     start_time = datetime.now(timezone.utc)
     log.info(f"literature_analyse starting: doc_url='{doc.url}', question='{question[:100]}...'")
     
@@ -1509,14 +1528,16 @@ async def literature_analyse(doc: TextResource, question: str, ssl_verify: bool 
         # Track usage metrics
         usage = r.usage()
         duration_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
+        _push_status(ctx.deps, f"Analysis complete: {doc_filename} ({duration_ms/1000:.1f}s)")
         log.info(f"literature_analyse completed: "
                 f"tokens=[request:{usage.request_tokens}, response:{usage.response_tokens}, total:{usage.total_tokens}], "
                 f"duration_ms={duration_ms:.0f}")
-        
+
         return r.output.model_dump_json()
-        
+
     except asyncio.TimeoutError:
         duration_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
+        _push_status(ctx.deps, f"Analysis timeout: {doc_filename}")
         log.error(f"literature_analyse timeout after {duration_ms:.0f}ms, limit=120000ms")
         return json.dumps({"answer": "", "source": str(doc.url), "error": ["Analysis timeout after 120 seconds"]})
         

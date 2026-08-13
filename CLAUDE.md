@@ -69,6 +69,32 @@ python ckanext/chat/tests/test_chat_roundtrip.py --url http://localhost:80 --tok
 flake8 . --count --select=E901,E999,F821,F822,F823 --show-source --statistics --exclude ckan
 ```
 
+## Streaming Status Protocol
+
+The `/chat/v1/chat/completions` endpoint (SSE streaming mode) emits inline status markers while sub-agents work:
+
+```
+[status]Literature search: "PFAS alternatives"[/status]
+[status]Vector search: 2 queries, limit=15[/status]
+[status]Vector search complete: 18 hits[/status]
+[status]Analyzing: iwm_bericht_v1204_2023.md[/status]
+[status]Analysis complete: iwm_bericht_v1204_2023.md (84.8s)[/status]
+```
+
+- Markers appear as content deltas in standard OpenAI SSE chunks, before the final answer text
+- Format: `[status]message[/status]\n` — clients parse these to render spinners/badges
+- Implemented via `asyncio.Queue` in `Deps.status_queue`, pushed from tools with `_push_status()`
+- Only active during streaming (`status_queue` is `None` for non-streaming requests)
+- `_run_agent_stream` in `api.py` runs the agent in a background task and polls both the status queue and text output queue every 200ms
+
+### Implementation details
+
+- `Deps.status_queue: Optional[asyncio.Queue]` — set by `_run_agent_stream`, `None` otherwise
+- `_push_status(deps, message)` helper in `bot/agent.py` — no-op when queue is `None`
+- `literature_analyse` was changed from `@agent.tool_plain` to `@agent.tool` to access `ctx.deps`
+- `_run_agent_stream` uses `asyncio.create_task` for the agent worker; main loop exits when `output_queue` receives `None` sentinel or `task.done()` (safety fallback)
+- Status-emitting tools: `ckan_run`, `rag_search`, `literature_search`, `literature_analyse`
+
 ## Conventions
 
 - Commit messages: lowercase, optional conventional prefixes (`feat:`, `fix:`, `docs:`, `refactor:`)

@@ -131,21 +131,62 @@ async def _run_agent_for_api(prompt: str, history_parts: list, user_id: str, res
 
 async def _run_agent_stream(prompt: str, history_parts: list, user_id: str, research: bool = False):
     active_agent, deps, msg_history, limits = _setup_agent_run(user_id, history_parts, research)
+
+    status_queue = asyncio.Queue()
+    deps.status_queue = status_queue
+    output_queue = asyncio.Queue()
+
     t0 = time.monotonic()
     first_chunk = True
     chunk_count = 0
-    async with active_agent.run_stream(
-        user_prompt=prompt,
-        message_history=msg_history,
-        deps=deps,
-        usage_limits=limits,
-    ) as stream:
-        async for chunk in stream.stream_text(delta=True):
-            chunk_count += 1
-            if first_chunk:
-                log.info(f"stream first-chunk after {time.monotonic() - t0:.1f}s")
-                first_chunk = False
-            yield chunk
+
+    async def _agent_worker():
+        try:
+            async with active_agent.run_stream(
+                user_prompt=prompt,
+                message_history=msg_history,
+                deps=deps,
+                usage_limits=limits,
+            ) as stream:
+                async for chunk in stream.stream_text(delta=True):
+                    await output_queue.put(chunk)
+        finally:
+            await output_queue.put(None)
+
+    task = asyncio.create_task(_agent_worker())
+
+    def _drain_status():
+        chunks = []
+        while not status_queue.empty():
+            try:
+                chunks.append(status_queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        return chunks
+
+    running = True
+    while running:
+        for status in _drain_status():
+            yield f"[status]{status}[/status]\n"
+
+        try:
+            chunk = await asyncio.wait_for(output_queue.get(), timeout=0.2)
+            if chunk is None:
+                running = False
+            else:
+                chunk_count += 1
+                if first_chunk:
+                    log.info(f"stream first-chunk after {time.monotonic() - t0:.1f}s")
+                    first_chunk = False
+                yield chunk
+        except asyncio.TimeoutError:
+            if task.done():
+                running = False
+
+    for status in _drain_status():
+        yield f"[status]{status}[/status]\n"
+
+    await task
     log.info(f"stream finished: {chunk_count} chunks in {time.monotonic() - t0:.1f}s")
 
 

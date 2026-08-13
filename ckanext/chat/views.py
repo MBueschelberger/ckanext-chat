@@ -9,7 +9,7 @@ import ckan.lib.base as base
 import ckan.lib.helpers as core_helpers
 import ckan.plugins.toolkit as toolkit
 from ckan.common import _, current_user
-from flask import Blueprint, current_app, jsonify, request
+from flask import Blueprint, Response, current_app, jsonify, request, stream_with_context
 from flask.views import MethodView
 from loguru import logger
 from pydantic_ai.messages import ModelMessagesTypeAdapter, TextPart
@@ -136,7 +136,9 @@ def ask():
         return jsonify({"response": [user_promt, error_response]})
 
 
-async def _agent_worker(prompt: str, history: str, user_id: str, research: bool = False) -> Any:
+async def _agent_worker(prompt: str, history: str, user_id: str,
+                        research: bool = False,
+                        status_queue: 'asyncio.Queue | None' = None) -> Any:
     from loguru import logger as _logger
     from ckanext.chat.bot.agent import (
         Deps, agent, research_agent,
@@ -150,7 +152,7 @@ async def _agent_worker(prompt: str, history: str, user_id: str, research: bool 
     if not dynamic_models_initialized:
         init_dynamic_models()
 
-    deps = Deps(user_id=user_id)
+    deps = Deps(user_id=user_id, status_queue=status_queue)
     msg_history = _validate_history(history)
 
     if mcp_available():
@@ -189,6 +191,97 @@ async def _agent_worker(prompt: str, history: str, user_id: str, research: bool 
     return r
 
 
+async def _stream_with_status(prompt, history, user_id, research=False):
+    status_queue = asyncio.Queue()
+    result_queue = asyncio.Queue()
+
+    async def _worker():
+        try:
+            r = await _agent_worker(prompt, history, user_id, research,
+                                    status_queue=status_queue)
+            await result_queue.put(('result', r))
+        except Exception as e:
+            await result_queue.put(('error', e))
+        finally:
+            await status_queue.put(None)
+
+    task = asyncio.create_task(_worker())
+
+    running = True
+    while running:
+        try:
+            status = await asyncio.wait_for(status_queue.get(), timeout=0.2)
+            if status is None:
+                running = False
+            else:
+                yield ('status', status)
+        except asyncio.TimeoutError:
+            if task.done():
+                running = False
+
+    while not status_queue.empty():
+        try:
+            s = status_queue.get_nowait()
+            if s is not None:
+                yield ('status', s)
+        except asyncio.QueueEmpty:
+            break
+
+    await task
+
+    result_type, result_value = await result_queue.get()
+    yield (result_type, result_value)
+
+
+def ask_stream():
+    user_input = request.form.get("text")
+    history = request.form.get("history", "")
+    research = request.form.get("research", False)
+    tkuser = toolkit.current_user
+
+    if tkuser.name is None:
+        return jsonify({"success": False, "msg": "Must be logged in to view site"})
+
+    def generate():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            gen = _stream_with_status(user_input, history, tkuser.id, research)
+            ait = gen.__aiter__()
+            while True:
+                try:
+                    event_type, value = loop.run_until_complete(ait.__anext__())
+                except StopAsyncIteration:
+                    break
+
+                if event_type == 'status':
+                    yield f"event: status\ndata: {json.dumps({'message': value})}\n\n"
+                elif event_type == 'result':
+                    messages = value.new_messages()
+                    for message in messages:
+                        message.parts[:] = [
+                            p for p in message.parts
+                            if not (isinstance(p, TextPart) and p.content == "")
+                        ]
+                    serialized = ModelMessagesTypeAdapter.dump_python(messages, mode='json')
+                    yield f"event: done\ndata: {json.dumps({'response': serialized})}\n\n"
+                elif event_type == 'error':
+                    logger.error(f"ask_stream agent error: {value}")
+                    user_prompt = user_input_to_model_request(user_input)
+                    error_response = exception_to_model_response(value)
+                    serialized = ModelMessagesTypeAdapter.dump_python(
+                        [user_prompt, error_response], mode='json'
+                    )
+                    yield f"event: done\ndata: {json.dumps({'response': serialized})}\n\n"
+        finally:
+            loop.close()
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
 
 blueprint.add_url_rule(
     "/chat",
@@ -199,6 +292,12 @@ blueprint.add_url_rule(
 blueprint.add_url_rule(
     "/chat/ask",
     view_func=ask,
+    methods=["POST"],
+)
+
+blueprint.add_url_rule(
+    "/chat/ask/stream",
+    view_func=ask_stream,
     methods=["POST"],
 )
 

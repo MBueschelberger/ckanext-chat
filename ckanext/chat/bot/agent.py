@@ -1323,9 +1323,12 @@ async def get_embedding(chunks: List[str], model: str, api_url, vector_dim: int)
         return [vec.embedding for vec in emb_r.data]
     headers = {"accept": "application/json", "Content-Type": "application/json"}
     data = {"chunks": chunks, "model": model}
+    embedding_timeout = int(toolkit.config.get("ckanext.chat.embedding_timeout", 15))
+    log.info(f"get_embedding requesting {api_url} model={model} chunks={len(chunks)} timeout={embedding_timeout}s")
     response = requests.post(
-        api_url, headers=headers, data=json.dumps(data), verify=False
+        api_url, headers=headers, data=json.dumps(data), verify=False, timeout=embedding_timeout
     )
+    log.info(f"get_embedding response status={response.status_code}")
 
     if response.status_code == 200:
         return response.json()["embeddings"]
@@ -1350,12 +1353,14 @@ async def rag_search(
     if not ctx.deps.milvus_client or not ctx.deps.embeddings:
         return "The Milvus Client was not setup properly, no rag_search supported in the moment."
     else:
+        log.info(f"rag_search starting: queries={len(search_query)} limit={limit}")
         query_vectors = await get_embedding(
             search_query,
             model=ctx.deps.embedding_model,
             api_url=ctx.deps.embeddings,
             vector_dim=ctx.deps.vector_dim,
         )
+        log.info(f"rag_search embedding done, starting milvus search")
         num_results = 0
         hits = []
         filter_ids = []
@@ -1379,9 +1384,10 @@ async def rag_search(
                     # log.debug(hits)
                 distinct_sources = list(set(hit.entity.source for hit in hits))
                 num_results = len(distinct_sources)
-                log.debug(
-                    f"Rag search for:{search_query} with limit: {limit} returned {num_results} results."
+                log.info(
+                    f"rag_search milvus: {num_results}/{limit} distinct sources found"
                 )
+        log.info(f"rag_search completed: {len(hits)} hits from {num_results} sources")
         return hits
         
 

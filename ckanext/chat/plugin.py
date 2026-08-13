@@ -43,6 +43,7 @@ class ChatPlugin(plugins.SingletonPlugin, DefaultTranslation):
         declaration.declare(group.base_url, "")
         declaration.declare(group.api_key, "")
         declaration.declare(group.api_version, "2024-06-01")
+        declaration.declare_int(group.embedding_timeout, 15)
 
     # IBlueprint
 

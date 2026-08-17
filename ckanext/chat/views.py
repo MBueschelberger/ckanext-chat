@@ -208,9 +208,9 @@ async def _agent_worker(prompt: str, history: str, user_id: str,
 
     active_agent = research_agent if research else agent
     limits = (
-        UsageLimits(request_limit=10, total_tokens_limit=config.MAX_TOKENS_RESEARCH_AGENT)
+        UsageLimits(request_limit=config.REQUEST_LIMIT_RESEARCH_AGENT, total_tokens_limit=config.MAX_TOKENS_RESEARCH_AGENT)
         if research else
-        UsageLimits(request_limit=6, total_tokens_limit=config.MAX_TOKENS_FRONT_AGENT)
+        UsageLimits(request_limit=config.REQUEST_LIMIT_FRONT_AGENT, total_tokens_limit=config.MAX_TOKENS_FRONT_AGENT)
     )
 
     r = await active_agent.run(

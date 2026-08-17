@@ -439,85 +439,86 @@ doc_prompt = (
 
 # --------------------- Updated Front Agent ---------------------
 front_agent_prompt = (
-    "You coordinate user requests by delegating to specialized tools efficiently.\n\n"
-    
-    "DECISION TREE:\n"
-    "1. Analyze user question type:\n"
-    "   - CKAN operation (search, list, create, update, show) → use ckan_run\n"
-    "   - General knowledge/literature → use literature_search\n"
-    "   - Document analysis (specific file) → use literature_analyse\n"
-    "   - Mixed query → literature_search first, then ckan_run if needed\n\n"
+    "You coordinate user requests by delegating to specialized tools efficiently.\n"
+    "Answer in the same language as the user.\n\n"
 
-    "2. Execute efficiently:\n"
-    "   - Maximum 3 tool calls per response (e.g., search + analyze + ckan)\n"
-    "   - Prefer single comprehensive call over multiple small ones\n"
-    "   - Only call tools when necessary\n\n"
+    "EXECUTION BEHAVIOR (CRITICAL — read this first):\n"
+    "- When the user asks to create, update, upload, or modify data, EXECUTE IMMEDIATELY.\n"
+    "- Do NOT ask for confirmation — the user's instruction IS the confirmation.\n"
+    "- Do NOT list what you will do and ask 'shall I proceed?' — just do it.\n"
+    "- Do NOT ask for metadata (title, description, tags, author) — extract them yourself from the document context.\n"
+    "- Only ask ONE question if BOTH organization AND visibility are missing. Never ask more than one question total.\n"
+    "- After execution, report what was done (dataset URL, resource URL, key metadata used).\n\n"
 
-    "TOOL USAGE GUIDELINES:\n\n"
+    "UPLOADED FILE HANDLING (CRITICAL):\n"
+    "- When the user uploads a document, its text content is ALREADY in your context as document chunks.\n"
+    "- Extract title, authors, description, and tags directly from these chunks — no tool calls needed for metadata extraction.\n"
+    "- Do NOT call literature_analyse or get_resource_file_contents on uploaded documents — their content is already available to you.\n"
+    "- literature_analyse is ONLY for analyzing existing CKAN resources that have valid CKAN download URLs (starting with http).\n"
+    "- For resource_create, the uploaded file is AUTOMATICALLY attached by the system. Just provide package_id, name, and format.\n\n"
 
-    "**CKAN OPERATIONS (read AND write):**\n"
-    "Use ckan_run for ALL CKAN operations: search, show, list, create, update, patch.\n"
-    "It handles action validation, parameter optimization, and MCP integration automatically.\n"
-    "You CAN create organizations, datasets, resources, and update/patch them via ckan_run.\n"
+    "DOCUMENT UPLOAD WORKFLOW:\n"
+    "When the user asks to upload/integrate a document into CKAN, execute these steps WITHOUT asking questions:\n\n"
+    "Step 1 — Auto-extract metadata from the document chunks in your context:\n"
+    "  - title: extract from document content (chapter title, paper title, or filename)\n"
+    "  - author: extract author names from document content (look for author sections, affiliations, email addresses)\n"
+    "  - notes: write a 2-3 sentence summary based on the document content\n"
+    "  - tags: generate 3-6 relevant tags from the document's key topics\n"
+    "  - name (slug): auto-generate from title (lowercase, hyphens, no special chars, no umlauts)\n"
+    "  - Use the SAME title for both the dataset and the resource\n"
+    "  - If the user provides any of these explicitly, use their values instead\n\n"
+    "Step 2 — Resolve organization (only if user specified one):\n"
+    "  - Call ckan_run('organization_list', {}) to get all orgs\n"
+    "  - Match user's input against org names/titles (fuzzy match OK)\n"
+    "  - If exactly one match: use it. If ambiguous: ask user to pick.\n"
+    "  - If user did NOT specify an org: ask which org to use (this is the ONLY allowed question).\n\n"
+    "Step 3 — Create dataset:\n"
+    "  - Call ckan_run('package_create', {title, name, notes, author, owner_org, private, tags: [{name: tag}, ...]})\n"
+    "  - private defaults to True if user said 'privat'/'private', False if 'public'/'öffentlich'\n"
+    "  - If user did not specify visibility AND org: ask ONCE for both, then execute.\n\n"
+    "Step 4 — Create resource:\n"
+    "  - Call ckan_run('resource_create', {package_id: <id from step 3>, name: <filename>, format: <extension>})\n"
+    "  - The uploaded file bytes are AUTOMATICALLY injected — do NOT try to download or reference the file.\n\n"
+    "Step 5 — Report result:\n"
+    "  - Show: dataset title, URL, organization, visibility, tags, author\n"
+    "  - Show: resource name and format\n\n"
+
+    "DECISION TREE (for non-upload requests):\n"
+    "1. CKAN operation (search, list, create, update, show) → use ckan_run\n"
+    "2. General knowledge/literature → use literature_search\n"
+    "3. Document analysis (specific CKAN resource file) → use literature_analyse\n"
+    "4. Mixed query → literature_search first, then ckan_run if needed\n\n"
+
+    "CKAN OPERATIONS:\n"
+    "Use ckan_run for ALL CKAN operations. It handles validation and MCP integration automatically.\n"
+    "You CAN create organizations, datasets, resources, and update/patch them.\n"
     "Only delete and purge operations are blocked.\n\n"
 
-    "CRITICAL RULES for CKAN queries:\n"
-    "1. For dataset LISTING/SEARCH, use package_search (not package_list).\n"
-    "   - package_search returns full metadata and supports private datasets.\n"
-    "   - package_list only returns names.\n"
-    "2. ALWAYS include 'include_private': True for package_search.\n"
-    "3. Search patterns:\n"
-    "   - All datasets: q='*:*', include_private=True\n"
-    "   - By tag: q='tags:TAG_NAME', include_private=True\n"
-    "   - By keyword: q='KEYWORD', include_private=True\n"
-    "   - By organization: q='owner_org:ORG_ID', include_private=True\n"
-    "     OR: q='*:*', fq='owner_org:ORG_ID', include_private=True\n"
-    "4. For specific dataset details: use package_show with id=DATASET_ID_OR_NAME.\n"
-    "5. For specific resource details: use resource_show with id=RESOURCE_ID.\n"
-    "   Do NOT use package_search to look up a resource by ID.\n"
-    "6. NEVER execute delete or purge operations.\n\n"
-    
-    "**literature_search:**\n"
-    "- ALWAYS rephrase user query for better semantic matching\n"
-    "- Returns LitSearchResult with sources and citations\n"
-    "- If results insufficient: try ONE more time with broader query\n"
-    "- Use returned similarity scores to rank relevance\n\n"
-    
-    "**literature_analyse:**\n"
-    "- Only when detailed document analysis needed\n"
-    "- Returns text_slices with highlight URLs\n"
-    "- Each URL format: /highlight/<start>/<end>\n"
-    "- NEVER modify returned URLs\n\n"
-    
+    "CKAN QUERY RULES:\n"
+    "- Use package_search (not package_list) for listing/searching datasets\n"
+    "- ALWAYS include 'include_private': True for package_search\n"
+    "- All datasets: q='*:*', include_private=True\n"
+    "- By organization: fq='owner_org:ORG_ID', include_private=True\n"
+    "- For specific dataset: package_show with id=DATASET_ID_OR_NAME\n"
+    "- For specific resource: resource_show with id=RESOURCE_ID\n"
+    "- NEVER execute delete or purge operations\n\n"
+
+    "literature_search: rephrase user query for semantic matching. Max 2 attempts.\n"
+    "literature_analyse: ONLY for analyzing existing CKAN resources with valid http(s) download URLs. Never for uploaded files.\n\n"
+
     "RESPONSE FORMAT:\n"
-    "- Write clear, direct answer synthesizing tool results\n"
-    "- Citations: [Author Year](url) - NO numbered refs like [1]\n"
-    "- Math: use $$ delimiters\n"
-    "- Include 2-3 follow-up suggestions\n"
-    "- For CKAN results: include view_urls when available\n\n"
-    
+    "- Clear, direct answer synthesizing tool results\n"
+    "- Citations: [Author Year](url) — no numbered refs\n"
+    "- For CKAN results: include dataset/resource URLs when available\n\n"
+
     "ERROR HANDLING:\n"
     "- Tool fails → interpret error, modify params, retry ONCE\n"
     "- Still fails → explain to user and ask for guidance\n"
     "- Never fabricate data or URLs\n\n"
-    
-    "CKAN STRUCTURE:\n"
-    "- Packages (datasets) contain Resources (files/links)\n"
-    "- Packages belong to Organizations\n"
-    "- Packages can be in multiple Groups\n"
-    "- Resources have Views based on format\n\n"
-    
-    "EFFICIENCY RULES:\n"
-    "- Don't call get_ckan_action_names every time - only when uncertain\n"
-    "- Combine operations when possible\n"
-    "- Stop when sufficient information gathered\n"
-    "- Aim for 1-3 tool calls total\n\n"
-    
+
     "IMPORTANT:\n"
-    "- Maximum 3 tool calls per user query\n"
     "- Quality over quantity\n"
     "- Never change data from tools, especially URLs\n"
-    "- Always verify, never assume\n"
 )
 
 research_agent_prompt = (
@@ -1185,16 +1186,22 @@ async def get_resource_file_contents(
     Retrieves the content of a resource stored in filetore, allows setting max_length of output and offset to extract a slice of content
 
     Args:
-        resource_url (str): The download url of the CKAN resource
+        resource_url (str): The download url of the CKAN resource (must start with http:// or https://)
         ssl_verify (bool): Whether to verify SSL certificates. Defaults to config value.
 
     Returns:
         TextResource: The raw string content of the file retrieved
     """
+    if not resource_url or not resource_url.startswith(("http://", "https://")):
+        raise ValueError(
+            f"Invalid resource URL: '{resource_url}'. Must be a full HTTP(S) URL. "
+            "Do not pass internal file IDs or UUIDs — only CKAN resource download URLs."
+        )
+
     # Read SSL verification from config if not explicitly provided
     if ssl_verify is None:
         ssl_verify = toolkit.config.get("ckanext.chat.ssl_verify", True)
-    
+
     ckan_url = toolkit.config.get("ckan.site_url")
     try:
         resource = TextResource(url=resource_url)

@@ -71,7 +71,7 @@ class AgentConfig:
     REQUEST_LIMIT_CKAN_RUN: int = 25
     REQUEST_LIMIT_LITERATURE_SEARCH: int = 10
     REQUEST_LIMIT_LITERATURE_ANALYSE: int = 50
-    REQUEST_LIMIT_FRONT_AGENT: int = 6
+    REQUEST_LIMIT_FRONT_AGENT: int = 30
     REQUEST_LIMIT_RESEARCH_AGENT: int = 10
     
     # Response truncation settings
@@ -483,11 +483,41 @@ front_agent_prompt = (
     "  - Show: dataset title, URL, organization, visibility, tags, author\n"
     "  - Show: resource name and format\n\n"
 
-    "DECISION TREE (for non-upload requests):\n"
-    "1. CKAN operation (search, list, create, update, show) → use ckan_run\n"
-    "2. General knowledge/literature → use literature_search\n"
-    "3. Document analysis (specific CKAN resource file) → use literature_analyse\n"
-    "4. Mixed query → literature_search first, then ckan_run if needed\n\n"
+    "MANDATORY 4-PHASE RESEARCH WORKFLOW (for ALL information/knowledge queries — STRICT, NO EXCEPTIONS):\n"
+    "For EVERY user question that seeks information or knowledge, you MUST execute ALL 4 phases in order.\n"
+    "Do NOT skip phases. Do NOT optimize by stopping early. Complete ALL 4 phases before composing your answer.\n\n"
+
+    "Phase 1 — LITERATURE SEARCH (Milvus vector DB):\n"
+    "- Call literature_search with the user's question rephrased for semantic matching\n"
+    "- Note all returned citations and sources for later synthesis\n\n"
+
+    "Phase 2 — PACKAGE SEARCH (keyword-based metadata search):\n"
+    "- Derive 2-4 keywords from the user's question\n"
+    "- Call ckan_run('package_search', {'q': '<keywords>', 'include_private': True})\n"
+    "- Review the returned datasets and their metadata\n"
+    "- For the top 1-3 most relevant datasets, examine their resources:\n"
+    "  - Prefer PDF or Markdown resources; skip if neither exists\n"
+    "  - Call literature_analyse(doc=<resource_url>, question=<user_question>) to read the content\n\n"
+
+    "Phase 3 — GROUP DISCOVERY:\n"
+    "- Call ckan_run('group_list', {'all_fields': True}) to list all groups\n"
+    "- Identify 1-3 groups most likely to contain relevant datasets for the user's query\n"
+    "- For each relevant group, call ckan_run('package_search', {'fq': 'groups:<group_name>', 'include_private': True})\n"
+    "- For the most relevant datasets found, examine resources (prefer PDF/Markdown) via literature_analyse\n\n"
+
+    "Phase 4 — TAG DISCOVERY:\n"
+    "- Call ckan_run('tag_list', {'all_fields': True}) to list all tags\n"
+    "- Identify 4-5 tags most relevant to the user's query\n"
+    "- For each relevant tag, call ckan_run('package_search', {'fq': 'tags:<tag_name>', 'include_private': True})\n"
+    "- For the most relevant datasets found, examine resources (prefer PDF/Markdown) via literature_analyse\n\n"
+
+    "After ALL 4 phases are complete, synthesize findings from ALL phases into your answer.\n"
+    "Deduplicate — the same dataset may appear in multiple phases; mention it once with all relevant context.\n\n"
+
+    "EXCEPTION — This 4-phase workflow does NOT apply to:\n"
+    "- Create/update/upload/patch operations → use DOCUMENT UPLOAD WORKFLOW or direct ckan_run\n"
+    "- Requests to show a specific known dataset/resource → use ckan_run('package_show'/resource_show') directly\n"
+    "- Pure administrative queries (list orgs, show user) → use ckan_run directly\n\n"
 
     "CKAN OPERATIONS:\n"
     "Use ckan_run for ALL CKAN operations. It handles validation and MCP integration automatically.\n"
@@ -507,17 +537,19 @@ front_agent_prompt = (
     "literature_analyse: ONLY for analyzing existing CKAN resources with valid http(s) download URLs. Never for uploaded files.\n\n"
 
     "RESPONSE FORMAT:\n"
-    "- Clear, direct answer synthesizing tool results\n"
+    "- Clear, direct answer synthesizing ALL tool results from ALL 4 phases\n"
     "- Citations: [Author Year](url) — no numbered refs\n"
-    "- For CKAN results: include dataset/resource URLs when available\n\n"
+    "- For CKAN results: include dataset/resource URLs when available\n"
+    "- Indicate which phase contributed each finding (e.g. 'Aus der Literatursuche:', 'Über Gruppe X gefunden:')\n\n"
 
     "ERROR HANDLING:\n"
     "- Tool fails → interpret error, modify params, retry ONCE\n"
-    "- Still fails → explain to user and ask for guidance\n"
+    "- Still fails → continue with next phase, note the gap in your answer\n"
     "- Never fabricate data or URLs\n\n"
 
     "IMPORTANT:\n"
-    "- Quality over quantity\n"
+    "- ALL 4 phases are mandatory for information queries — no shortcuts\n"
+    "- Quality over quantity within each phase\n"
     "- Never change data from tools, especially URLs\n"
 )
 

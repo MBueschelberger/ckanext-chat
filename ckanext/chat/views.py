@@ -5,6 +5,7 @@ import sys
 from distutils.util import strtobool
 from typing import Any
 
+import ckan.lib.api_token as api_token
 import ckan.lib.base as base
 import ckan.lib.helpers as core_helpers
 import ckan.plugins.toolkit as toolkit
@@ -15,7 +16,7 @@ from loguru import logger
 from pydantic_ai.messages import ModelMessagesTypeAdapter, TextPart
 from pydantic_ai.usage import UsageLimits
 
-from ckanext.chat.bot.agent import (exception_to_model_response,
+from ckanext.chat.bot.agent import (UploadedFile, exception_to_model_response,
                                     user_input_to_model_request)
 from ckanext.chat.helpers import service_available
 
@@ -74,6 +75,36 @@ MAX_MESSAGE_CONTENT_LENGTH = 50000
 VALID_MESSAGE_KINDS = {"request", "response"}
 
 
+def _authenticate_request():
+    """Authenticate via API token header or CKAN session. Returns (user_id, error_response)."""
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header:
+        token = auth_header.removeprefix("Bearer ").strip()
+        if token:
+            user = api_token.get_user_from_token(token)
+            if user:
+                return user.id, None
+        return None, (jsonify({"success": False, "msg": "Invalid API token"}), 401)
+
+    tkuser = toolkit.current_user
+    if tkuser and not tkuser.is_anonymous and tkuser.id:
+        return tkuser.id, None
+
+    return None, (jsonify({"success": False, "msg": "Authentication required"}), 401)
+
+
+def _extract_upload():
+    """Extract uploaded file from request.files, if present."""
+    f = request.files.get("upload")
+    if f and f.filename:
+        return UploadedFile(
+            filename=f.filename,
+            content_type=f.content_type or "application/octet-stream",
+            data=f.read(),
+        )
+    return None
+
+
 def _validate_history(history_str: str):
     if not history_str:
         return None
@@ -104,18 +135,20 @@ def _validate_history(history_str: str):
 
 
 def ask():
+    user_id, auth_error = _authenticate_request()
+    if auth_error:
+        return auth_error
+
     user_input = request.form.get("text")
     history = request.form.get("history", "")
     research = request.form.get("research", False)
-    tkuser = toolkit.current_user
+    uploaded_file = _extract_upload()
     debug = bool(strtobool(os.environ.get("DEBUG", "false")))
-
-    if tkuser.name is None:
-        return {"success": False, "msg": "Must be logged in to view site"}
 
     try:
         response = asyncio.run(
-            _agent_worker(user_input, history, user_id=tkuser.id, research=research),
+            _agent_worker(user_input, history, user_id=user_id,
+                          research=research, uploaded_file=uploaded_file),
             debug=debug,
         )
         messages = response.new_messages()
@@ -138,7 +171,8 @@ def ask():
 
 async def _agent_worker(prompt: str, history: str, user_id: str,
                         research: bool = False,
-                        status_queue: 'asyncio.Queue | None' = None) -> Any:
+                        status_queue: 'asyncio.Queue | None' = None,
+                        uploaded_file: 'UploadedFile | None' = None) -> Any:
     from loguru import logger as _logger
     from ckanext.chat.bot.agent import (
         Deps, agent, research_agent,
@@ -152,7 +186,7 @@ async def _agent_worker(prompt: str, history: str, user_id: str,
     if not dynamic_models_initialized:
         init_dynamic_models()
 
-    deps = Deps(user_id=user_id, status_queue=status_queue)
+    deps = Deps(user_id=user_id, status_queue=status_queue, uploaded_file=uploaded_file)
     msg_history = _validate_history(history)
 
     if mcp_available():
@@ -191,14 +225,16 @@ async def _agent_worker(prompt: str, history: str, user_id: str,
     return r
 
 
-async def _stream_with_status(prompt, history, user_id, research=False):
+async def _stream_with_status(prompt, history, user_id, research=False,
+                              uploaded_file=None):
     status_queue = asyncio.Queue()
     result_queue = asyncio.Queue()
 
     async def _worker():
         try:
             r = await _agent_worker(prompt, history, user_id, research,
-                                    status_queue=status_queue)
+                                    status_queue=status_queue,
+                                    uploaded_file=uploaded_file)
             await result_queue.put(('result', r))
         except Exception as e:
             await result_queue.put(('error', e))
@@ -234,19 +270,21 @@ async def _stream_with_status(prompt, history, user_id, research=False):
 
 
 def ask_stream():
+    user_id, auth_error = _authenticate_request()
+    if auth_error:
+        return auth_error
+
     user_input = request.form.get("text")
     history = request.form.get("history", "")
     research = request.form.get("research", False)
-    tkuser = toolkit.current_user
-
-    if tkuser.name is None:
-        return jsonify({"success": False, "msg": "Must be logged in to view site"})
+    uploaded_file = _extract_upload()
 
     def generate():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            gen = _stream_with_status(user_input, history, tkuser.id, research)
+            gen = _stream_with_status(user_input, history, user_id, research,
+                                      uploaded_file=uploaded_file)
             ait = gen.__aiter__()
             while True:
                 try:

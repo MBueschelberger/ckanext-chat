@@ -193,6 +193,13 @@ def get_http_session() -> aiohttp.ClientSession:
     return _global_http_session
 
 @dataclass
+class UploadedFile:
+    filename: str
+    content_type: str
+    data: bytes
+
+
+@dataclass
 class Deps:
     user_id: str
     milvus_client: MilvusClient = field(default_factory=lambda: milvus_client)
@@ -206,6 +213,7 @@ class Deps:
     vector_dim: int = vector_dim
     http_session: aiohttp.ClientSession = field(default_factory=get_http_session)
     status_queue: Optional[asyncio.Queue] = None
+    uploaded_file: Optional[UploadedFile] = None
 
 
 def _push_status(deps, message: str):
@@ -926,6 +934,18 @@ async def ckan_run(ctx: RunContext[Deps], command: str, parameters: dict={}) -> 
                         "session": CKANmodel.Session,
                         "ignore_auth": False,
                     }
+                    if corrected_action in ("resource_create", "resource_patch") and ctx.deps.uploaded_file:
+                        import io
+                        from werkzeug.datastructures import FileStorage
+                        uf = ctx.deps.uploaded_file
+                        merged_params["upload"] = FileStorage(
+                            stream=io.BytesIO(uf.data),
+                            filename=uf.filename,
+                            content_type=uf.content_type,
+                        )
+                        if not merged_params.get("url"):
+                            merged_params["url"] = uf.filename
+                        log.info(f"Injected uploaded file '{uf.filename}' into {corrected_action}")
                     response = toolkit.get_action(corrected_action)(context, merged_params)
                 t_fetch_end = _time.monotonic()
 

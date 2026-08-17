@@ -104,6 +104,46 @@ The `/chat/v1/chat/completions` endpoint (SSE streaming mode) emits inline statu
 - Status-emitting tools: `ckan_run`, `rag_search`, `literature_search`, `literature_analyse`
 - Intermediate status messages cover: parameter validation, embedding generation, vector DB search, data fetching (direct/MCP), response processing, document loading, passage extraction, and retries
 
+## Authentication
+
+Both `/chat/ask` and `/chat/ask/stream` support dual authentication:
+
+1. **API token**: `Authorization: Bearer <CKAN_API_TOKEN>` header (validated via `ckan.lib.api_token`)
+2. **CKAN session**: standard session cookie (existing browser login)
+
+Token auth is checked first; session auth is the fallback. Implemented in `_authenticate_request()` in `views.py`.
+
+The `/chat/v1/chat/completions` endpoint (`api.py`) uses its own `_authenticate()` with token auth only.
+
+## File Upload (resource_create / resource_patch)
+
+The `/chat/ask` and `/chat/ask/stream` endpoints accept `multipart/form-data` with an optional `upload` field:
+
+```bash
+curl -X POST http://localhost:5000/chat/ask/stream \
+  -H "Authorization: Bearer <TOKEN>" \
+  -F "text=Lade diese CSV als Resource in Dataset xyz hoch" \
+  -F "upload=@data.csv"
+```
+
+Flow:
+1. `views.py` — `_extract_upload()` reads `request.files["upload"]` into an `UploadedFile` dataclass (filename, content_type, bytes)
+2. `UploadedFile` is stored in `Deps.uploaded_file` and passed through `_agent_worker`
+3. `agent.py` `ckan_run` — when the action is `resource_create` or `resource_patch` and `Deps.uploaded_file` is set, the file is injected as a `werkzeug.FileStorage` into the action parameters before calling `toolkit.get_action()`
+
+Key types:
+- `UploadedFile` dataclass in `bot/agent.py` (filename, content_type, data as bytes)
+- `Deps.uploaded_file: Optional[UploadedFile]` — set by views.py, consumed by `ckan_run`
+
+## Open WebUI Integration
+
+The pipe function `iwm_rag_streaming.py` connects Open WebUI to the CKAN chat endpoints:
+
+- **Without files**: routes to `/chat/v1/chat/completions` (OpenAI-compatible SSE with `[status]...[/status]` markers)
+- **With files**: routes to `/chat/ask/stream` (multipart form with `text` + `upload` fields, SSE with `event: status` / `event: done`)
+
+`file_handler = True` on the Pipe class prevents Open WebUI's default RAG processing. Files are read from Open WebUI storage via `Files.get_file_by_id()` + `Storage.get_file()` and forwarded as multipart upload.
+
 ## Conventions
 
 - Commit messages: lowercase, optional conventional prefixes (`feat:`, `fix:`, `docs:`, `refactor:`)

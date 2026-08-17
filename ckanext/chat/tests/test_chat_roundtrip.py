@@ -23,8 +23,11 @@ Usage:
 """
 
 import argparse
+import csv
+import io
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -41,6 +44,7 @@ UNIQUE_SUFFIX = uuid.uuid4().hex[:8]
 ORG_NAME = f"{TEST_PREFIX}-org-{UNIQUE_SUFFIX}"
 DATASET_NAME = f"{TEST_PREFIX}-ds-{UNIQUE_SUFFIX}"
 RESOURCE_NAME = f"{TEST_PREFIX}-res-{UNIQUE_SUFFIX}.csv"
+UPLOAD_RESOURCE_NAME = f"{TEST_PREFIX}-upload-{UNIQUE_SUFFIX}.csv"
 PATCHED_TITLE = f"Patched Dataset Title {UNIQUE_SUFFIX}"
 TAG_NAME = f"test-tag-{UNIQUE_SUFFIX}"
 
@@ -133,6 +137,35 @@ class ChatRoundtripTest:
     def _reset_history(self):
         """Start a fresh conversation (no accumulated context)."""
         self.history = []
+
+    @staticmethod
+    def _generate_csv(rows: int = 20, cols: int = 5) -> bytes:
+        """Generate a CSV with random numeric data."""
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow([f"col_{i}" for i in range(cols)])
+        for _ in range(rows):
+            writer.writerow([round(random.uniform(0, 1000), 2) for _ in range(cols)])
+        return buf.getvalue().encode("utf-8")
+
+    def _chat_upload(self, user_msg: str, file_bytes: bytes, filename: str,
+                     content_type: str = "text/csv", timeout: int = 300) -> str:
+        """Send a message with file upload to /chat/ask/stream and return the raw response."""
+        url = f"{self.base_url}/chat/ask/stream"
+        if self.verbose:
+            print(f"\n  >>> [upload: {filename}] {user_msg}")
+
+        resp = requests.post(
+            url,
+            data={"text": user_msg},
+            files={"upload": (filename, file_bytes, content_type)},
+            headers={"Authorization": f"Bearer {self.api_token}"},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        if self.verbose:
+            print(f"  <<< {resp.text}")
+        return resp.text
 
     # -- test steps --
 
@@ -287,6 +320,39 @@ class ChatRoundtripTest:
                      "example.com" in lower_reply,
                      "agent mentions example.com URL")
 
+    def step_8_upload_resource(self, pkg_id: str):
+        """Upload a generated CSV file as a new resource via /chat/ask/stream."""
+        print("\n[Step 8] Upload resource (file upload)")
+        self._reset_history()
+        csv_bytes = self._generate_csv()
+
+        reply = self._chat_upload(
+            f"Upload the attached CSV file as a new resource to the dataset with id '{pkg_id}'. "
+            f"Resource name: '{UPLOAD_RESOURCE_NAME}', format: 'CSV'. "
+            f"Tell me the resource id when done.",
+            file_bytes=csv_bytes,
+            filename=UPLOAD_RESOURCE_NAME,
+        )
+
+        result = self._ckan_get("package_show", {"id": pkg_id})
+        if result.get("success"):
+            pkg = result["result"]
+            resources = pkg.get("resources", [])
+            upload_res = [r for r in resources if r.get("name") == UPLOAD_RESOURCE_NAME]
+            self._check("uploaded resource exists", len(upload_res) > 0,
+                        f"found {len(upload_res)} matching resources out of {len(resources)}")
+            if upload_res:
+                res = upload_res[0]
+                self._check("uploaded resource format", res.get("format", "").upper() == "CSV",
+                            f"got: {res.get('format')}")
+                self._check("uploaded resource has file",
+                            res.get("url_type") == "upload" or "upload" in res.get("url", ""),
+                            f"url_type={res.get('url_type')}, url={res.get('url')}")
+                return res["id"]
+        else:
+            self._check("uploaded resource exists", False, "could not fetch dataset")
+        return None
+
     # -- cleanup --
 
     def cleanup(self):
@@ -343,6 +409,7 @@ class ChatRoundtripTest:
         print(f"  Org:      {ORG_NAME}")
         print(f"  Dataset:  {DATASET_NAME}")
         print(f"  Resource: {RESOURCE_NAME}")
+        print(f"  Upload:   {UPLOAD_RESOURCE_NAME}")
         print(f"{'='*60}")
 
         try:
@@ -366,6 +433,9 @@ class ChatRoundtripTest:
 
             if res_id:
                 self.step_7_show_resource_details(res_id)
+
+            if pkg_id:
+                self.step_8_upload_resource(pkg_id)
 
         finally:
             self.cleanup()

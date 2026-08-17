@@ -144,6 +144,21 @@ The pipe function `iwm_rag_streaming.py` connects Open WebUI to the CKAN chat en
 
 `file_handler = True` on the Pipe class prevents Open WebUI's default RAG processing. Files are read from Open WebUI storage via `Files.get_file_by_id()` + `Storage.get_file()` and forwarded as multipart upload.
 
+## CKAN Agent Bypass (Fast Path)
+
+Actions in `ckan_run` can bypass the `ckan_agent` LLM sub-agent and execute directly via `merge_with_smart_defaults` + `toolkit.get_action()`. This avoids ~30s LLM processing time and prevents parameter hallucination for simple actions.
+
+Controlled by two `ckan.ini` config keys:
+
+- `ckanext.chat.agent_bypass_actions` — comma-separated list of actions that skip the `ckan_agent` and take the fast path.
+  Default: `organization_list,organization_show,group_list,group_show,tag_list,user_show,resource_show,package_show`
+- `ckanext.chat.agent_required_suffixes` — comma-separated suffixes that always go through the `ckan_agent`, regardless of the bypass list.
+  Default: `_create,_patch`
+
+The decision logic lives in `_bypass_ckan_agent(command)` in `bot/agent.py`. The data fetching (MCP with direct toolkit fallback, file upload injection) is shared between both paths via `_ckan_fetch_data()`.
+
+Actions not in the bypass list and not matching a required suffix also go through the `ckan_agent` (e.g. `package_search`, `package_list`).
+
 ## Conventions
 
 - Commit messages: lowercase, optional conventional prefixes (`feat:`, `fix:`, `docs:`, `refactor:`)

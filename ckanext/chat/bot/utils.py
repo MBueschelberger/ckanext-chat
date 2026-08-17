@@ -246,15 +246,18 @@ def extract_param_defaults(action_doc: str) -> Dict[str, Any]:
     
     defaults = {}
     
+    # Token-level capture: RST backtick-wrapped, quoted string, or bare word
+    _val = r"""(``[^`]+``|"[^"]+"|'[^']+'|\S+)"""
+
     # Try multiple patterns to match different docstring formats
     patterns = [
-        # Pattern 1: :param name: ... (default: value)
+        # Pattern 1: :param name: ... (default: value) — bounded by parens
         r':param\s+(\w+):\s*[^:]*?\(default:\s*([^)]+)\)',
-        # Pattern 2: :param name: ... default: value
-        r':param\s+(\w+):\s*[^:]*?default:\s*([^),\n]+)',
-        # Pattern 3: :param name: ... Default: value (capital D)
-        r':param\s+(\w+):\s*[^:]*?Default:\s*([^),\n]+)',
-        # Pattern 4: (optional, default: value) anywhere after param
+        # Pattern 2: :param name: ... default: value — token-level capture
+        r':param\s+(\w+):\s*[^:]*?default:\s*' + _val,
+        # Pattern 3: :param name: ... Default: value — token-level capture
+        r':param\s+(\w+):\s*[^:]*?Default:\s*' + _val,
+        # Pattern 4: (optional, default: value) — bounded by parens
         r':param\s+(\w+):[^:]*?\(optional[^)]*default:\s*([^)]+)\)',
     ]
     
@@ -305,8 +308,9 @@ def merge_with_smart_defaults(action: str, provided_params: Dict[str, Any]) -> D
     doc_defaults = extract_param_defaults(action_info.get('doc', ''))
     
     # Merge: signature defaults override docstring (more authoritative)
-    defaults = {**doc_defaults, **sig_defaults}
-    
+    # Filter None — sending None explicitly differs from omitting the param
+    defaults = {k: v for k, v in {**doc_defaults, **sig_defaults}.items() if v is not None}
+
     # Tier 3: User params always override everything (but not empty strings)
     merged = {**defaults, **filtered_params}
     

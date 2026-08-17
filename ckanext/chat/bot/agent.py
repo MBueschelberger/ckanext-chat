@@ -867,6 +867,7 @@ async def ckan_run(ctx: RunContext[Deps], command: str, parameters: dict={}) -> 
     t0 = _time.monotonic()
     start_time = datetime.now(timezone.utc)
     log.info(f"ckan_run starting: action='{command}', params={json.dumps(parameters)[:100]}")
+    _push_status(ctx.deps, f"Validating query parameters for {command}")
 
     try:
         r = await asyncio.wait_for(
@@ -899,6 +900,7 @@ async def ckan_run(ctx: RunContext[Deps], command: str, parameters: dict={}) -> 
                 corrected_action = ckan_result.action_name or command
                 corrected_params = ckan_result.parameters or parameters
                 merged_params = merge_with_smart_defaults(corrected_action, corrected_params)
+                _push_status(ctx.deps, f"Fetching data from CKAN: {corrected_action}")
 
                 response = None
                 fetch_method = "direct"
@@ -906,6 +908,7 @@ async def ckan_run(ctx: RunContext[Deps], command: str, parameters: dict={}) -> 
                 t_fetch_start = _time.monotonic()
                 # Try MCP first if available
                 if ctx.deps.mcp_url and ctx.deps.mcp_token:
+                    _push_status(ctx.deps, f"Connecting via MCP: {corrected_action}")
                     response = await _mcp_fetch_data(
                         ctx.deps.mcp_url, ctx.deps.mcp_token,
                         corrected_action, merged_params,
@@ -926,6 +929,7 @@ async def ckan_run(ctx: RunContext[Deps], command: str, parameters: dict={}) -> 
                     response = toolkit.get_action(corrected_action)(context, merged_params)
                 t_fetch_end = _time.monotonic()
 
+                _push_status(ctx.deps, f"Processing response from {corrected_action}")
                 truncated = smart_truncate_response(response)
 
                 result_dict = ckan_result.model_dump()
@@ -1367,6 +1371,7 @@ async def rag_search(
     else:
         _push_status(ctx.deps, f"Vector search: {len(search_query)} queries, limit={limit}")
         log.info(f"rag_search starting: queries={len(search_query)} limit={limit}")
+        _push_status(ctx.deps, "Generating embeddings for search queries")
         query_vectors = await get_embedding(
             search_query,
             model=ctx.deps.embedding_model,
@@ -1374,6 +1379,7 @@ async def rag_search(
             vector_dim=ctx.deps.vector_dim,
         )
         log.info(f"rag_search embedding done, starting milvus search")
+        _push_status(ctx.deps, "Searching vector database")
         hits = []
         seen_ids = set()
         while len(hits) < limit:
@@ -1400,7 +1406,7 @@ async def rag_search(
                 break
             log.info(f"rag_search milvus: {len(hits)}/{limit} unique hits")
         hits = hits[:limit]
-        _push_status(ctx.deps, f"Vector search complete: {len(hits)} hits")
+        _push_status(ctx.deps, f"Analyzing vector search results: {len(hits)} hits")
         log.info(f"rag_search completed: {len(hits)} hits")
         return hits
         
@@ -1415,11 +1421,13 @@ async def literature_search(
     ctx: RunContext[Deps], search_question: str, num_results: int = 5
 ) -> list[str]:
     start_time = datetime.now(timezone.utc)
-    _push_status(ctx.deps, f"Literature search: \"{search_question[:80]}\"")
-    log.info(f"literature_search starting: query='{search_question[:100]}...', num_results={num_results}")
+    _push_status(ctx.deps, f"Literature search: \"{search_question}\"")
+    log.info(f"literature_search starting: query='{search_question}...', num_results={num_results}")
 
     for attempt in range(config.MAX_RETRIES_LITERATURE_SEARCH):
         try:
+            if attempt > 0:
+                _push_status(ctx.deps, f"Retrying literature search (attempt {attempt+1})")
             log.debug(f"literature_search attempt {attempt+1}/{config.MAX_RETRIES_LITERATURE_SEARCH}")
             r = await asyncio.wait_for(
                 rag_agent.run(
@@ -1495,14 +1503,16 @@ async def literature_analyse(ctx: RunContext[Deps], doc: TextResource, question:
     if ssl_verify is None:
         ssl_verify = toolkit.config.get("ckanext.chat.ssl_verify", True)
 
-    doc_filename = str(doc.url).rsplit('/', 1)[-1][:60] if doc.url else "unknown"
+    doc_filename = str(doc.url).rsplit('/', 1)[-1] if doc.url else "unknown"
     _push_status(ctx.deps, f"Analyzing: {doc_filename}")
     start_time = datetime.now(timezone.utc)
     log.info(f"literature_analyse starting: doc_url='{doc.url}', question='{question[:100]}...'")
-    
+
+    _push_status(ctx.deps, f"Loading document: {doc_filename}")
     try:
         doc=await get_resource_file_contents(resource_url=str(doc.url),ssl_verify=ssl_verify)
         log.debug(f"literature_analyse loaded document: length={doc.length} chars")
+        _push_status(ctx.deps, f"Document loaded: {doc_filename} ({doc.length:,} chars)")
     except Exception as e:
         log.error(f"literature_analyse failed to load document: error={str(e)[:200]}")
         return json.dumps({"answer": "", "source": str(doc.url), "error": [f"Failed to load document: {str(e)}"]})
@@ -1511,7 +1521,8 @@ async def literature_analyse(ctx: RunContext[Deps], doc: TextResource, question:
         f"Analyze the provided TextResource to determine whether it contains an answer to the question below.\n\n"
         f"**Question:** {question}\n\n"
     )
-    
+
+    _push_status(ctx.deps, f"Extracting relevant passages: {doc_filename}")
     try:
         r = await asyncio.wait_for(
             doc_agent.run(

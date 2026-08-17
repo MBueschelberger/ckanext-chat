@@ -75,9 +75,17 @@ The `/chat/v1/chat/completions` endpoint (SSE streaming mode) emits inline statu
 
 ```
 [status]Literature search: "PFAS alternatives"[/status]
-[status]Vector search: 2 queries, limit=15[/status]
-[status]Vector search complete: 18 hits[/status]
-[status]Analyzing: iwm_bericht_v1204_2023.md[/status]
+[status]Generating embeddings for search queries[/status]
+[status]Searching vector database[/status]
+[status]Analyzing vector search results: 18 hits[/status]
+[status]CKAN: package_search[/status]
+[status]Validating query parameters for package_search[/status]
+[status]Fetching data from CKAN: package_search[/status]
+[status]Processing response from package_search[/status]
+[status]CKAN complete: 10/42 items (2.3s)[/status]
+[status]Loading document: iwm_bericht_v1204_2023.md[/status]
+[status]Document loaded: iwm_bericht_v1204_2023.md (124,500 chars)[/status]
+[status]Extracting relevant passages: iwm_bericht_v1204_2023.md[/status]
 [status]Analysis complete: iwm_bericht_v1204_2023.md (84.8s)[/status]
 ```
 
@@ -94,6 +102,7 @@ The `/chat/v1/chat/completions` endpoint (SSE streaming mode) emits inline statu
 - `literature_analyse` was changed from `@agent.tool_plain` to `@agent.tool` to access `ctx.deps`
 - `_run_agent_stream` uses `asyncio.create_task` for the agent worker; main loop exits when `output_queue` receives `None` sentinel or `task.done()` (safety fallback)
 - Status-emitting tools: `ckan_run`, `rag_search`, `literature_search`, `literature_analyse`
+- Intermediate status messages cover: parameter validation, embedding generation, vector DB search, data fetching (direct/MCP), response processing, document loading, passage extraction, and retries
 
 ## Conventions
 

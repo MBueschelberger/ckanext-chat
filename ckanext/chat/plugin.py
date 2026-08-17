@@ -44,6 +44,14 @@ class ChatPlugin(plugins.SingletonPlugin, DefaultTranslation):
         declaration.declare(group.api_key, "")
         declaration.declare(group.api_version, "2024-06-01")
         declaration.declare_int(group.embedding_timeout, 15)
+        declaration.declare(
+            group.agent_bypass_actions,
+            "organization_list,organization_show,group_list,group_show,tag_list,user_show,resource_show,package_show"
+        )
+        declaration.declare(
+            group.agent_required_suffixes,
+            "_create,_patch"
+        )
 
     # IBlueprint
 

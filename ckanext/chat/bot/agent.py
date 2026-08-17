@@ -848,6 +848,54 @@ async def _mcp_fetch_data(url: str, token: str, action: str, params: dict) -> Op
         return None
 
 
+def _bypass_ckan_agent(command: str) -> bool:
+    raw_suffixes = toolkit.config.get("ckanext.chat.agent_required_suffixes", "_create,_patch")
+    required_suffixes = tuple(s.strip() for s in raw_suffixes.split(",") if s.strip())
+    if any(command.endswith(s) for s in required_suffixes):
+        return False
+    raw_bypass = toolkit.config.get("ckanext.chat.agent_bypass_actions", "")
+    bypass_set = {a.strip() for a in raw_bypass.split(",") if a.strip()}
+    return command in bypass_set
+
+
+async def _ckan_fetch_data(deps, action: str, params: dict):
+    """Execute a CKAN action via MCP (if available) or direct toolkit call."""
+    response = None
+    fetch_method = "direct"
+
+    if deps.mcp_url and deps.mcp_token:
+        response = await _mcp_fetch_data(
+            deps.mcp_url, deps.mcp_token, action, params,
+        )
+        if response is not None:
+            fetch_method = "mcp"
+
+    if response is None:
+        user = CKANmodel.User.get(user_reference=deps.user_id)
+        context = {
+            "user": user.name,
+            "auth_user_obj": user,
+            "model": CKANmodel,
+            "session": CKANmodel.Session,
+            "ignore_auth": False,
+        }
+        if action in ("resource_create", "resource_patch") and deps.uploaded_file:
+            import io
+            from werkzeug.datastructures import FileStorage
+            uf = deps.uploaded_file
+            params["upload"] = FileStorage(
+                stream=io.BytesIO(uf.data),
+                filename=uf.filename,
+                content_type=uf.content_type,
+            )
+            if not params.get("url"):
+                params["url"] = uf.filename
+            log.info(f"Injected uploaded file '{uf.filename}' into {action}")
+        response = toolkit.get_action(action)(context, params)
+
+    return response, fetch_method
+
+
 @agent.tool
 @research_agent.tool
 async def ckan_run(ctx: RunContext[Deps], command: str, parameters: dict={}) -> str:
@@ -876,6 +924,49 @@ async def ckan_run(ctx: RunContext[Deps], command: str, parameters: dict={}) -> 
     t0 = _time.monotonic()
     start_time = datetime.now(timezone.utc)
     log.info(f"ckan_run starting: action='{command}', params={json.dumps(parameters)[:100]}")
+
+    if _bypass_ckan_agent(command):
+        log.info(f"ckan_run bypassing ckan_agent for '{command}'")
+        try:
+            merged_params = merge_with_smart_defaults(command, parameters)
+            _push_status(ctx.deps, f"Fetching data from CKAN: {command}")
+
+            t_fetch_start = _time.monotonic()
+            response, fetch_method = await _ckan_fetch_data(ctx.deps, command, merged_params)
+            t_fetch_end = _time.monotonic()
+
+            _push_status(ctx.deps, f"Processing response from {command}")
+            truncated = smart_truncate_response(response)
+
+            result_dict = {
+                'status': 'success',
+                'action_name': command,
+                'parameters': parameters,
+                'result': truncated['data'],
+                '_truncated': truncated['truncated'],
+                '_truncation_method': truncated['truncation_method'],
+                '_total_items': truncated['total_items'],
+                '_showing_items': truncated['showing_items'],
+                '_estimated_tokens': truncated['estimated_tokens'],
+            }
+
+            t_total = _time.monotonic()
+            log.info(f"ckan_run complete (fast): action='{command}', "
+                    f"method={fetch_method}, "
+                    f"fetch={t_fetch_end - t_fetch_start:.1f}s, total={t_total - t0:.1f}s, "
+                    f"items={truncated['showing_items']}/{truncated['total_items']}")
+            _push_status(ctx.deps, f"CKAN complete: {truncated['showing_items']}/{truncated['total_items']} items ({t_total - t0:.1f}s)")
+
+            return json.dumps(result_dict)
+
+        except KeyError as e:
+            log.warning(f"ckan_run fast path KeyError: action='{command}', error={e}")
+            return json.dumps({"status": "fail", "action_name": command, "result": f"Action '{command}' not found: {e}", "comment": "Check action name"})
+        except Exception as e:
+            log.error(f"ckan_run fast path error: action='{command}', error_type={type(e).__name__}, error={str(e)[:200]}")
+            return json.dumps({"status": "fail", "action_name": command, "result": f"{type(e).__name__}: {str(e)}", "comment": "Action failed"})
+
+    # Agent path: use ckan_agent for parameter optimization
     _push_status(ctx.deps, f"Validating query parameters for {command}")
 
     try:
@@ -911,43 +1002,8 @@ async def ckan_run(ctx: RunContext[Deps], command: str, parameters: dict={}) -> 
                 merged_params = merge_with_smart_defaults(corrected_action, corrected_params)
                 _push_status(ctx.deps, f"Fetching data from CKAN: {corrected_action}")
 
-                response = None
-                fetch_method = "direct"
-
                 t_fetch_start = _time.monotonic()
-                # Try MCP first if available
-                if ctx.deps.mcp_url and ctx.deps.mcp_token:
-                    _push_status(ctx.deps, f"Connecting via MCP: {corrected_action}")
-                    response = await _mcp_fetch_data(
-                        ctx.deps.mcp_url, ctx.deps.mcp_token,
-                        corrected_action, merged_params,
-                    )
-                    if response is not None:
-                        fetch_method = "mcp"
-
-                # Fallback to direct toolkit call
-                if response is None:
-                    user = CKANmodel.User.get(user_reference=ctx.deps.user_id)
-                    context = {
-                        "user": user.name,
-                        "auth_user_obj": user,
-                        "model": CKANmodel,
-                        "session": CKANmodel.Session,
-                        "ignore_auth": False,
-                    }
-                    if corrected_action in ("resource_create", "resource_patch") and ctx.deps.uploaded_file:
-                        import io
-                        from werkzeug.datastructures import FileStorage
-                        uf = ctx.deps.uploaded_file
-                        merged_params["upload"] = FileStorage(
-                            stream=io.BytesIO(uf.data),
-                            filename=uf.filename,
-                            content_type=uf.content_type,
-                        )
-                        if not merged_params.get("url"):
-                            merged_params["url"] = uf.filename
-                        log.info(f"Injected uploaded file '{uf.filename}' into {corrected_action}")
-                    response = toolkit.get_action(corrected_action)(context, merged_params)
+                response, fetch_method = await _ckan_fetch_data(ctx.deps, corrected_action, merged_params)
                 t_fetch_end = _time.monotonic()
 
                 _push_status(ctx.deps, f"Processing response from {corrected_action}")

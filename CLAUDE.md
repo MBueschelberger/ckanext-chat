@@ -151,13 +151,31 @@ Actions in `ckan_run` can bypass the `ckan_agent` LLM sub-agent and execute dire
 Controlled by two `ckan.ini` config keys:
 
 - `ckanext.chat.agent_bypass_actions` — comma-separated list of actions that skip the `ckan_agent` and take the fast path.
-  Default: `organization_list,organization_show,group_list,group_show,tag_list,user_show,resource_show,package_show`
+  Default: `organization_list,organization_show,group_list,group_show,tag_list,user_show,resource_show,package_show,package_search,package_list`
 - `ckanext.chat.agent_required_suffixes` — comma-separated suffixes that always go through the `ckan_agent`, regardless of the bypass list.
   Default: `_create,_patch`
 
 The decision logic lives in `_bypass_ckan_agent(command)` in `bot/agent.py`. The data fetching (MCP with direct toolkit fallback, file upload injection) is shared between both paths via `_ckan_fetch_data()`.
 
-Actions not in the bypass list and not matching a required suffix also go through the `ckan_agent` (e.g. `package_search`, `package_list`).
+Actions not in the bypass list and not matching a required suffix go through the `ckan_agent`.
+
+### Why `package_search` / `package_list` are bypassed
+
+The `ckan_agent` sub-agent costs ~34s per call (2 LLM roundtrips + structured output) but adds no value for read-only search:
+
+- The `front_agent` prompt already specifies correct parameters (`include_private: True`, `q`, `fq`)
+- `merge_with_smart_defaults` fills remaining defaults from CKAN's function signature/docstring
+- The `ckan_agent`'s test-run executes the CKAN action but discards the data (returns only metrics), then `ckan_run` re-executes it — the action runs twice
+- On 0 results, the `ckan_agent` does not adjust the query — it returns `status=success`
+- Errors from CKAN are readable by the `front_agent`, which can retry with corrected parameters (~0.05s per attempt vs ~34s)
+
+The `ckan_agent` remains valuable for `_create`/`_patch` actions where parameter validation before writes prevents data corruption.
+
+## Timeout & Retry Strategy
+
+- `literature_search`: timeout 90s, **no retry on timeout** (retrying a slow LLM compounds delay without improving results; other error types still retry up to `MAX_RETRIES_LITERATURE_SEARCH`)
+- `literature_analyse`: timeout 180s (large documents like 50k+ char markdown need more processing time for the `doc_agent`)
+- `ckan_run`: timeout 90s (unchanged)
 
 ## Conventions
 

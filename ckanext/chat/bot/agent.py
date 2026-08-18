@@ -50,8 +50,8 @@ class AgentConfig:
     """Centralized configuration for agent timeouts, limits, and retries"""
     # Timeout settings (in seconds)
     CKAN_RUN_TIMEOUT: int = 90
-    LITERATURE_SEARCH_TIMEOUT: int = 60
-    LITERATURE_ANALYSE_TIMEOUT: int = 120
+    LITERATURE_SEARCH_TIMEOUT: int = 90
+    LITERATURE_ANALYSE_TIMEOUT: int = 180
     
     # Token limits
     MAX_TOKENS_RAG_MODEL: int = 16384
@@ -1606,10 +1606,7 @@ async def literature_search(
         except asyncio.TimeoutError:
             duration_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
             log.warning(f"literature_search timeout on attempt {attempt+1}/{config.MAX_RETRIES_LITERATURE_SEARCH}, duration_ms={duration_ms:.0f}")
-            if attempt == config.MAX_RETRIES_LITERATURE_SEARCH - 1:
-                log.error(f"literature_search all retries timed out after {duration_ms:.0f}ms")
-                return json.dumps({"answer": "", "error": [f"Literature search timed out after {config.MAX_RETRIES_LITERATURE_SEARCH} attempts ({duration_ms/1000:.0f}s)"]})
-            continue
+            return json.dumps({"answer": "", "error": [f"Literature search timed out after {duration_ms/1000:.0f}s"]})
             
         except UsageLimitExceeded as e:
             log.error(f"literature_search usage limit exceeded on attempt {attempt+1}: {e}")

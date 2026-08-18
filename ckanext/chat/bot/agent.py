@@ -223,6 +223,30 @@ def _push_status(deps, message: str):
         except Exception:
             pass
 
+
+def _format_params_short(parameters: dict, max_len: int = 80) -> str:
+    """Format parameters compactly for status messages and logs."""
+    if not parameters:
+        return ""
+    priority_keys = ['q', 'fq', 'id', 'name']
+    parts = []
+    for key in priority_keys:
+        if key in parameters:
+            val = str(parameters[key])
+            if len(val) > 60:
+                val = val[:57] + "..."
+            parts.append(f"{key}={val}")
+    if not parts:
+        key, val = next(iter(parameters.items()))
+        val = str(val)
+        if len(val) > 60:
+            val = val[:57] + "..."
+        parts.append(f"{key}={val}")
+    result = ", ".join(parts)
+    if len(result) > max_len:
+        result = result[:max_len - 3] + "..."
+    return result
+
 @dataclass
 class StringSlice:
     start: int
@@ -956,18 +980,19 @@ async def ckan_run(ctx: RunContext[Deps], command: str, parameters: dict={}) -> 
     # Normalize parameters to handle JSON boolean/null conversions
     parameters = normalize_parameters(parameters)
 
-    _push_status(ctx.deps, f"CKAN: {command}")
+    params_short = _format_params_short(parameters)
+    _push_status(ctx.deps, f"CKAN: {command}" + (f" ({params_short})" if params_short else ""))
 
     import time as _time
     t0 = _time.monotonic()
     start_time = datetime.now(timezone.utc)
-    log.info(f"ckan_run starting: action='{command}', params={json.dumps(parameters)[:100]}")
+    log.info(f"ckan_run starting: action='{command}', params={json.dumps(parameters, ensure_ascii=False)[:200]}")
 
     if _bypass_ckan_agent(command):
         log.info(f"ckan_run bypassing ckan_agent for '{command}'")
         try:
             merged_params = merge_with_smart_defaults(command, parameters)
-            _push_status(ctx.deps, f"Fetching data from CKAN: {command}")
+            _push_status(ctx.deps, f"Fetching data from CKAN: {command}" + (f" ({params_short})" if params_short else ""))
 
             t_fetch_start = _time.monotonic()
             response, fetch_method = await _ckan_fetch_data(ctx.deps, command, merged_params)
@@ -1005,7 +1030,7 @@ async def ckan_run(ctx: RunContext[Deps], command: str, parameters: dict={}) -> 
             return json.dumps({"status": "fail", "action_name": command, "result": f"{type(e).__name__}: {str(e)}", "comment": "Action failed"})
 
     # Agent path: use ckan_agent for parameter optimization
-    _push_status(ctx.deps, f"Validating query parameters for {command}")
+    _push_status(ctx.deps, f"Validating query parameters for {command}" + (f" ({params_short})" if params_short else ""))
 
     try:
         r = await asyncio.wait_for(
@@ -1038,7 +1063,8 @@ async def ckan_run(ctx: RunContext[Deps], command: str, parameters: dict={}) -> 
                 corrected_action = ckan_result.action_name or command
                 corrected_params = ckan_result.parameters or parameters
                 merged_params = merge_with_smart_defaults(corrected_action, corrected_params)
-                _push_status(ctx.deps, f"Fetching data from CKAN: {corrected_action}")
+                corrected_params_short = _format_params_short(corrected_params)
+                _push_status(ctx.deps, f"Fetching data from CKAN: {corrected_action}" + (f" ({corrected_params_short})" if corrected_params_short else ""))
 
                 t_fetch_start = _time.monotonic()
                 response, fetch_method = await _ckan_fetch_data(ctx.deps, corrected_action, merged_params)

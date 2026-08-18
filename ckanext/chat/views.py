@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 from distutils.util import strtobool
 from typing import Any
 
@@ -243,17 +244,27 @@ async def _stream_with_status(prompt, history, user_id, research=False,
 
     task = asyncio.create_task(_worker())
 
+    _KEEPALIVE_INTERVAL = 15
+    last_yield_time = time.monotonic()
     running = True
     while running:
+        yielded = False
         try:
             status = await asyncio.wait_for(status_queue.get(), timeout=0.2)
             if status is None:
                 running = False
             else:
                 yield ('status', status)
+                yielded = True
         except asyncio.TimeoutError:
             if task.done():
                 running = False
+
+        if yielded:
+            last_yield_time = time.monotonic()
+        elif time.monotonic() - last_yield_time >= _KEEPALIVE_INTERVAL:
+            last_yield_time = time.monotonic()
+            yield ('keepalive', None)
 
     while not status_queue.empty():
         try:
@@ -292,7 +303,9 @@ def ask_stream():
                 except StopAsyncIteration:
                     break
 
-                if event_type == 'status':
+                if event_type == 'keepalive':
+                    yield ": keepalive\n\n"
+                elif event_type == 'status':
                     yield f"event: status\ndata: {json.dumps({'message': value})}\n\n"
                 elif event_type == 'result':
                     messages = value.new_messages()

@@ -17,6 +17,9 @@ api_blueprint = Blueprint("chat_api", __name__)
 
 log = logger.bind(module=__name__)
 
+_SSE_KEEPALIVE = "\x00keepalive"
+_KEEPALIVE_INTERVAL = 15
+
 
 @api_blueprint.before_request
 def _capture_app():
@@ -137,6 +140,7 @@ async def _run_agent_stream(prompt: str, history_parts: list, user_id: str, rese
     output_queue = asyncio.Queue()
 
     t0 = time.monotonic()
+    last_yield_time = t0
     first_chunk = True
     chunk_count = 0
 
@@ -166,8 +170,10 @@ async def _run_agent_stream(prompt: str, history_parts: list, user_id: str, rese
 
     running = True
     while running:
+        yielded = False
         for status in _drain_status():
             yield f"[status]{status}[/status]\n"
+            yielded = True
 
         try:
             chunk = await asyncio.wait_for(output_queue.get(), timeout=0.2)
@@ -179,9 +185,16 @@ async def _run_agent_stream(prompt: str, history_parts: list, user_id: str, rese
                     log.info(f"stream first-chunk after {time.monotonic() - t0:.1f}s")
                     first_chunk = False
                 yield chunk
+                yielded = True
         except asyncio.TimeoutError:
             if task.done():
                 running = False
+
+        if yielded:
+            last_yield_time = time.monotonic()
+        elif time.monotonic() - last_yield_time >= _KEEPALIVE_INTERVAL:
+            last_yield_time = time.monotonic()
+            yield _SSE_KEEPALIVE
 
     for status in _drain_status():
         yield f"[status]{status}[/status]\n"
@@ -271,6 +284,10 @@ def _handle_stream(prompt, history_parts, user, research, completion_id, created
                         chunk_text = loop.run_until_complete(ait.__anext__())
                     except StopAsyncIteration:
                         break
+
+                    if chunk_text == _SSE_KEEPALIVE:
+                        yield ": keepalive\n\n"
+                        continue
 
                     chunk = {
                         "id": completion_id,

@@ -142,7 +142,8 @@ def ask():
 
     user_input = request.form.get("text")
     history = request.form.get("history", "")
-    research = request.form.get("research", False)
+    _raw = request.form.get("research", "")
+    research = _raw is True or (isinstance(_raw, str) and _raw.lower() in ("true", "1", "research"))
     uploaded_file = _extract_upload()
     debug = bool(strtobool(os.environ.get("DEBUG", "false")))
 
@@ -287,7 +288,8 @@ def ask_stream():
 
     user_input = request.form.get("text")
     history = request.form.get("history", "")
-    research = request.form.get("research", False)
+    _raw = request.form.get("research", "")
+    research = _raw is True or (isinstance(_raw, str) and _raw.lower() in ("true", "1", "research"))
     uploaded_file = _extract_upload()
 
     def generate():

@@ -547,8 +547,11 @@ front_agent_prompt = (
 
     "RESPONSE FORMAT:\n"
     "- Clear, direct answer synthesizing all tool results\n"
-    "- Citations: [Author Year](url) — no numbered refs\n"
-    "- For CKAN results: include dataset/resource URLs when available\n\n"
+    "- Citations: [Author Year](dataset_url) — no numbered refs\n"
+    "- For CKAN results: include dataset URLs when available\n"
+    "- URL RULE: Always truncate resource/download URLs to the dataset URL.\n"
+    "  Example: .../dataset/9fee1eac-.../resource/73f3aa3f-.../download/file.md → .../dataset/9fee1eac-...\n"
+    "  Cut everything after /dataset/<dataset_id>. This lets users access all resources including PDFs.\n\n"
 
     "ERROR HANDLING:\n"
     "- Tool fails → interpret error, modify params, retry ONCE\n"
@@ -558,7 +561,7 @@ front_agent_prompt = (
     "IMPORTANT:\n"
     "- Keep information queries fast — max ~3-5 tool calls\n"
     "- Quality over quantity\n"
-    "- Never change data from tools, especially URLs\n"
+    "- Never change data from tools, except truncating resource URLs to dataset URLs as described above\n"
 )
 
 research_agent_prompt = (
@@ -634,17 +637,19 @@ research_agent_prompt = (
     "- By organization: fq='owner_org:ORG_ID', include_private=True\n\n"
 
     "CITATION FORMAT:\n"
-    "- Inline: [Author Year](highlight_url)\n"
+    "- Inline: [Author Year](dataset_url)\n"
     "- NO numbered references [1] or [^1^]\n"
     "- Every claim must cite source\n"
-    "- Use /highlight/<start>/<end> URLs from literature_analyse\n\n"
+    "- URL RULE: Always truncate resource/download URLs to the dataset URL.\n"
+    "  Example: .../dataset/9fee1eac-.../resource/73f3aa3f-.../download/file.md → .../dataset/9fee1eac-...\n"
+    "  Cut everything after /dataset/<dataset_id>. This lets users access all resources including PDFs.\n\n"
 
     "QUALITY STANDARDS:\n"
     "- 5+ distinct sources minimum\n"
     "- Cross-verify quantitative data\n"
     "- Note contradictions explicitly\n"
     "- Evidence-based only, no assumptions\n"
-    "- Never modify returned URLs\n\n"
+    "- Never modify returned URLs, except truncating resource URLs to dataset URLs as described above\n\n"
 
     "ERROR HANDLING:\n"
     "- Tool fails → interpret error, modify params, retry ONCE\n"
@@ -1600,10 +1605,10 @@ async def literature_search(
             
         except asyncio.TimeoutError:
             duration_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
-            log.warning(f"literature_search timeout on attempt {attempt+1}/3, duration_ms={duration_ms:.0f}")
-            if attempt == 2:  # Last attempt
+            log.warning(f"literature_search timeout on attempt {attempt+1}/{config.MAX_RETRIES_LITERATURE_SEARCH}, duration_ms={duration_ms:.0f}")
+            if attempt == config.MAX_RETRIES_LITERATURE_SEARCH - 1:
                 log.error(f"literature_search all retries timed out after {duration_ms:.0f}ms")
-                raise RuntimeError("All literature_search retries timed out")
+                return json.dumps({"answer": "", "error": [f"Literature search timed out after {config.MAX_RETRIES_LITERATURE_SEARCH} attempts ({duration_ms/1000:.0f}s)"]})
             continue
             
         except UsageLimitExceeded as e:
@@ -1612,24 +1617,23 @@ async def literature_search(
             
         except ModelHTTPError as e:
             log.error(f"literature_search API error on attempt {attempt+1}: status={e.status_code if hasattr(e, 'status_code') else 'unknown'}")
-            if attempt == 2:
+            if attempt == config.MAX_RETRIES_LITERATURE_SEARCH - 1:
                 return json.dumps({"answer": "", "error": [f"API error: {str(e)}"]})
             continue
             
         except UnexpectedModelBehavior as e:
             log.error(f"literature_search model behavior error on attempt {attempt+1}: {str(e)[:200]}")
-            if attempt == 2:
+            if attempt == config.MAX_RETRIES_LITERATURE_SEARCH - 1:
                 return json.dumps({"answer": "", "error": [f"Model output validation failed: {str(e)}"]})
             continue
             
         except Exception as e:
             log.error(f"literature_search unexpected error on attempt {attempt+1}: error_type={type(e).__name__}, error={str(e)[:200]}")
-            if attempt == 2:
-                raise RuntimeError(f"All literature_search retries failed: {type(e).__name__}: {str(e)}")
+            if attempt == config.MAX_RETRIES_LITERATURE_SEARCH - 1:
+                return json.dumps({"answer": "", "error": [f"Literature search failed: {type(e).__name__}: {str(e)[:200]}"]})
             continue
-    
-    # Should not reach here, but just in case
-    raise RuntimeError("All literature_search retries exhausted")
+
+    return json.dumps({"answer": "", "error": ["All literature_search retries exhausted"]})
 
 @agent.tool
 @research_agent.tool

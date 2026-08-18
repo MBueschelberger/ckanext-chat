@@ -178,7 +178,7 @@ async def _agent_worker(prompt: str, history: str, user_id: str,
     from loguru import logger as _logger
     from ckanext.chat.bot.agent import (
         Deps, agent, research_agent,
-        mcp_available, get_user_token, config,
+        mcp_available, get_user_token, config, _push_status,
     )
     from ckanext.chat.bot.utils import init_dynamic_models, dynamic_models_initialized
 
@@ -209,6 +209,9 @@ async def _agent_worker(prompt: str, history: str, user_id: str,
         log.info("Using ckan_agent fallback path")
 
     active_agent = research_agent if research else agent
+    if research:
+        log.info("Switching from front_agent to research_agent")
+        _push_status(deps, "Switching to research agent (deep research mode)")
     limits = (
         UsageLimits(request_limit=config.REQUEST_LIMIT_RESEARCH_AGENT, total_tokens_limit=config.MAX_TOKENS_RESEARCH_AGENT)
         if research else

@@ -114,6 +114,8 @@ def _setup_agent_run(user_id: str, history_parts: list, research: bool):
             msg_history = None
 
     active_agent = research_agent if research else agent
+    if research:
+        log.info("Switching from front_agent to research_agent")
     limits = (
         UsageLimits(request_limit=config.REQUEST_LIMIT_RESEARCH_AGENT, total_tokens_limit=config.MAX_TOKENS_RESEARCH_AGENT)
         if research else
@@ -137,6 +139,8 @@ async def _run_agent_stream(prompt: str, history_parts: list, user_id: str, rese
 
     status_queue = asyncio.Queue()
     deps.status_queue = status_queue
+    if research:
+        status_queue.put_nowait("Switching to research agent (deep research mode)")
     output_queue = asyncio.Queue()
 
     t0 = time.monotonic()
@@ -321,13 +325,32 @@ def _handle_stream(prompt, history_parts, user, research, completion_id, created
 
         except Exception as e:
             log.error(f"chat_completions stream error: {type(e).__name__}: {str(e)[:200]}")
+            error_msg = f"Stream error: {type(e).__name__}: {str(e)}"
             error_chunk = {
-                "error": {
-                    "message": f"Stream error: {type(e).__name__}: {str(e)}",
-                    "type": "server_error",
-                }
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_hint,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": f"\n\n**Fehler:** {error_msg}"},
+                    "finish_reason": None,
+                }],
             }
             yield f"data: {json.dumps(error_chunk)}\n\n"
+            final_chunk = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_hint,
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop",
+                }],
+            }
+            yield f"data: {json.dumps(final_chunk)}\n\n"
+            yield "data: [DONE]\n\n"
 
     return Response(
         stream_with_context(generate()),

@@ -32,8 +32,8 @@ ckanext/chat/
 
 ## Agent Architecture
 
-- `front_agent` — main coordinator, delegates to tools (max 3 tool calls)
-- `research_agent` — deep research mode (max 10 tool calls, uses think_model)
+- `front_agent` — quick coordinator, delegates to tools (max ~5 tool calls, quick search only)
+- `research_agent` — deep research mode (7-phase workflow, max ~40 tool calls, uses think_model)
 - `ckan_agent` — validates/optimizes CKAN action calls → `CKANResult`
 - `rag_agent` — vector search via Milvus → `LitSearchResult`
 - `doc_agent` — document analysis with fuzzy text extraction → `AnalyseResult`

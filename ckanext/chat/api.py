@@ -115,6 +115,7 @@ def _setup_agent_run(user_id: str, history_parts: list, research: bool):
 
     active_agent = research_agent if research else agent
     if research:
+        deps.orchestrator = "Research agent"
         log.info("Switching from front_agent to research_agent")
     limits = (
         UsageLimits(request_limit=config.REQUEST_LIMIT_RESEARCH_AGENT, total_tokens_limit=config.MAX_TOKENS_RESEARCH_AGENT)
@@ -140,7 +141,7 @@ async def _run_agent_stream(prompt: str, history_parts: list, user_id: str, rese
     status_queue = asyncio.Queue()
     deps.status_queue = status_queue
     if research:
-        status_queue.put_nowait("Switching to research agent (deep research mode)")
+        status_queue.put_nowait("Research agent ── deep research mode")
     output_queue = asyncio.Queue()
 
     t0 = time.monotonic()

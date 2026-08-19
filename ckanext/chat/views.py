@@ -210,8 +210,9 @@ async def _agent_worker(prompt: str, history: str, user_id: str,
 
     active_agent = research_agent if research else agent
     if research:
+        deps.orchestrator = "Research agent"
         log.info("Switching from front_agent to research_agent")
-        _push_status(deps, "Switching to research agent (deep research mode)")
+        _push_status(deps, "deep research mode")
     limits = (
         UsageLimits(request_limit=config.REQUEST_LIMIT_RESEARCH_AGENT, total_tokens_limit=config.MAX_TOKENS_RESEARCH_AGENT)
         if research else

@@ -30,15 +30,25 @@ ckanext/chat/
 └── tests/             # test_plugin.py (scaffold), test_chat_roundtrip.py (integration)
 ```
 
-## Agent Architecture
+## Agent Architecture (2-Level Model)
 
-- `front_agent` — quick coordinator, delegates to tools (max ~5 tool calls, quick search only)
-- `research_agent` — deep research mode (7-phase workflow, max ~40 tool calls, uses think_model)
-- `ckan_agent` — validates/optimizes CKAN action calls → `CKANResult`
-- `rag_agent` — vector search via Milvus → `LitSearchResult`
+```
+front_agent / research_agent  (Orchestrator)
+  ├── ckan_explore(task)       → ckan_agent (autonomous multi-step CKAN exploration)
+  │     └── ckan_action()      (generic: any CKAN action via merge_with_smart_defaults)
+  ├── ckan_run(action, params) → direct bypass (merge_with_smart_defaults, all actions incl. _create/_patch)
+  ├── literature_search(q)     → rag_agent (budget-controlled vector search via Milvus)
+  │     └── rag_search()       (Milvus vector search)
+  └── literature_analyse(doc)  → doc_agent (document analysis, only from orchestrator)
+```
+
+- `front_agent` — quick coordinator, delegates to tools (max ~3-4 tool calls, quick search only)
+- `research_agent` — deep research mode (5-phase workflow, max ~25 tool calls, uses think_model)
+- `ckan_agent` — autonomous CKAN explorer with generic `ckan_action` tool → `CKANExploreResult`
+- `rag_agent` — vector search via Milvus, budget-controlled (max_searches param) → `LitSearchResult`
 - `doc_agent` — document analysis with fuzzy text extraction → `AnalyseResult`
 
-When `ckanext-mcp` is loaded, CKAN data access goes through MCP JSON-RPC instead of direct `toolkit.get_action()`.
+When `ckanext-mcp` is loaded, CKAN data access in `ckan_run` goes through MCP JSON-RPC instead of direct `toolkit.get_action()`.
 
 ## Configuration
 
@@ -144,32 +154,11 @@ The pipe function `iwm_rag_streaming.py` connects Open WebUI to the CKAN chat en
 
 `file_handler = True` on the Pipe class prevents Open WebUI's default RAG processing. Files are read from Open WebUI storage via `Files.get_file_by_id()` + `Storage.get_file()` and forwarded as multipart upload.
 
-## CKAN Agent Bypass (Fast Path)
+## CKAN Action Execution
 
-Actions in `ckan_run` can bypass the `ckan_agent` LLM sub-agent and execute directly via `merge_with_smart_defaults` + `toolkit.get_action()`. This avoids ~30s LLM processing time and prevents parameter hallucination for simple actions.
+`ckan_run` executes ALL CKAN actions directly via `merge_with_smart_defaults` + `_ckan_fetch_data()` (no LLM sub-agent). This applies to all actions including `_create` and `_patch`.
 
-Controlled by two `ckan.ini` config keys:
-
-- `ckanext.chat.agent_bypass_actions` — comma-separated list of actions that skip the `ckan_agent` and take the fast path.
-  Default: `organization_list,organization_show,group_list,group_show,tag_list,user_show,resource_show,package_show,package_search,package_list`
-- `ckanext.chat.agent_required_suffixes` — comma-separated suffixes that always go through the `ckan_agent`, regardless of the bypass list.
-  Default: `_create,_patch`
-
-The decision logic lives in `_bypass_ckan_agent(command)` in `bot/agent.py`. The data fetching (MCP with direct toolkit fallback, file upload injection) is shared between both paths via `_ckan_fetch_data()`.
-
-Actions not in the bypass list and not matching a required suffix go through the `ckan_agent`.
-
-### Why `package_search` / `package_list` are bypassed
-
-The `ckan_agent` sub-agent costs ~34s per call (2 LLM roundtrips + structured output) but adds no value for read-only search:
-
-- The `front_agent` prompt already specifies correct parameters (`include_private: True`, `q`, `fq`)
-- `merge_with_smart_defaults` fills remaining defaults from CKAN's function signature/docstring
-- The `ckan_agent`'s test-run executes the CKAN action but discards the data (returns only metrics), then `ckan_run` re-executes it — the action runs twice
-- On 0 results, the `ckan_agent` does not adjust the query — it returns `status=success`
-- Errors from CKAN are readable by the `front_agent`, which can retry with corrected parameters (~0.05s per attempt vs ~34s)
-
-The `ckan_agent` remains valuable for `_create`/`_patch` actions where parameter validation before writes prevents data corruption.
+`ckan_explore` delegates open-ended dataset discovery to the autonomous `ckan_agent`, which uses a generic `ckan_action` tool to call any CKAN action. The orchestrator gives a task description and a search budget (`max_searches`).
 
 ## Timeout & Retry Strategy
 

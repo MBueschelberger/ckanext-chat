@@ -214,12 +214,19 @@ class Deps:
     http_session: aiohttp.ClientSession = field(default_factory=get_http_session)
     status_queue: Optional[asyncio.Queue] = None
     uploaded_file: Optional[UploadedFile] = None
+    orchestrator: str = "Front agent"
 
 
 def _push_status(deps, message: str):
     if deps.status_queue is not None:
         try:
-            deps.status_queue.put_nowait(message)
+            prefix = deps.orchestrator if hasattr(deps, 'orchestrator') else "Agent"
+            if message.startswith("──"):
+                padding = " " * len(prefix)
+                full = f"{padding} {message}"
+            else:
+                full = f"{prefix} ── {message}"
+            deps.status_queue.put_nowait(full)
         except Exception:
             pass
 
@@ -353,16 +360,27 @@ class AnalyseResult(BaseModel):
     text_slices: Optional[list[TextSlice]] = None
     error: Optional[List[str]] = None
 
-class CKANResult(BaseModel):
-    """Result from CKAN agent execution"""
-    status: Literal['success', 'fail']
-    action_name: str = ""
-    parameters: Optional[Dict[str,Any]] = {}
-    result: str  # The actual result from the CKAN action, or error message
-    comment: Optional[str] = None  # Additional suggestions or explanations
-    parameters_auto_added: Optional[Dict[str,Any]] = None  # Parameters automatically filled by smart defaults
-    metrics: Optional[Dict[str, int]] = None  # Response metrics (size, tokens, item count)
-    action_suggestion: Optional[str] = None  # If wrong command was used, suggest the correct one
+class DatasetSummary(BaseModel):
+    id: str
+    title: str
+    name: str
+    notes: Optional[str] = None
+    organization: Optional[str] = None
+    tags: Optional[List[str]] = None
+    extras: Optional[Dict[str, str]] = None
+    resources: Optional[List[Dict[str, Any]]] = None
+    relevance: Optional[str] = None
+
+class QueryAttempt(BaseModel):
+    action: str
+    params: Dict[str, Any]
+    result_count: int
+
+class CKANExploreResult(BaseModel):
+    summary: str
+    datasets_found: List[DatasetSummary]
+    queries_tried: List[QueryAttempt]
+    suggestions: Optional[str] = None
 
 # --------------------- Updated RAG Agent Prompt ---------------------
 rag_prompt = (
@@ -399,10 +417,10 @@ rag_prompt = (
     "- Include similarity score if available\n\n"
     
     "IMPORTANT:\n"
-    "- NEVER call rag_search more than 2 times\n"
+    "- Respect the max rag_search call limit given in your task (default: 2)\n"
     "- Quality over quantity - 3-5 highly relevant sources better than 10 mediocre ones\n"
     "- Always include metrics (similarity scores, source count)\n"
-    "- If second search still yields few results, return what you have with explanation\n"
+    "- If searches yield few results, return what you have with explanation\n"
 )
 
 # --------------------- Updated Document Agent Prompt ---------------------
@@ -508,41 +526,39 @@ front_agent_prompt = (
     "  - Show: resource name and format\n\n"
 
     "QUICK SEARCH (for information/knowledge queries):\n"
-    "When the user asks a question that seeks information or knowledge, execute these two steps:\n\n"
+    "When the user asks a question that seeks information or knowledge, execute these two steps IN PARALLEL:\n\n"
 
     "Step 1 — LITERATURE SEARCH:\n"
     "- Call literature_search with the user's question rephrased for semantic matching\n"
     "- Note all returned citations and sources\n\n"
 
-    "Step 2 — PACKAGE SEARCH:\n"
-    "- Derive 2-4 keywords from the user's question\n"
-    "- Call ckan_run('package_search', {'q': '<keywords>', 'include_private': True})\n"
-    "- Review the returned datasets and their metadata\n"
+    "Step 2 — CKAN EXPLORE:\n"
+    "- Call ckan_explore with a task description derived from the user's question\n"
+    "- The ckan_agent will autonomously search datasets, browse groups and tags\n"
     "- If a highly relevant dataset has PDF or Markdown resources, optionally call literature_analyse on the single best one\n\n"
 
     "After both steps, synthesize findings into a clear answer.\n"
-    "Do NOT perform group discovery or tag discovery — keep it fast (max ~3-5 tool calls).\n\n"
+    "Keep it fast — max ~3-4 tool calls total.\n\n"
 
     "EXCEPTION — QUICK SEARCH does NOT apply to:\n"
     "- Create/update/upload/patch operations → use DOCUMENT UPLOAD WORKFLOW or direct ckan_run\n"
     "- Requests to show a specific known dataset/resource → use ckan_run('package_show'/'resource_show') directly\n"
     "- Pure administrative queries (list orgs, show user) → use ckan_run directly\n\n"
 
-    "CKAN OPERATIONS:\n"
-    "Use ckan_run for ALL CKAN operations. It handles validation and MCP integration automatically.\n"
+    "CKAN TOOLS:\n"
+    "- ckan_explore(task): For open-ended dataset discovery — delegates to the autonomous ckan_agent\n"
+    "- ckan_run(action, params): For direct single CKAN actions (show, create, patch, list orgs, etc.)\n"
     "You CAN create organizations, datasets, resources, and update/patch them.\n"
     "Only delete and purge operations are blocked.\n\n"
 
-    "CKAN QUERY RULES:\n"
+    "CKAN QUERY RULES (for ckan_run):\n"
     "- Use package_search (not package_list) for listing/searching datasets\n"
     "- ALWAYS include 'include_private': True for package_search\n"
-    "- All datasets: q='*:*', include_private=True\n"
-    "- By organization: fq='owner_org:ORG_ID', include_private=True\n"
     "- For specific dataset: package_show with id=DATASET_ID_OR_NAME\n"
     "- For specific resource: resource_show with id=RESOURCE_ID\n"
     "- NEVER execute delete or purge operations\n\n"
 
-    "literature_search: rephrase user query for semantic matching. Max 2 attempts.\n"
+    "literature_search: rephrase user query for semantic matching.\n"
     "literature_analyse: ONLY for analyzing existing CKAN resources with valid http(s) download URLs. Never for uploaded files.\n\n"
 
     "RESPONSE FORMAT:\n"
@@ -568,7 +584,7 @@ research_agent_prompt = (
     "You conduct deep research by systematically exploring ALL available data sources — literature, CKAN packages, groups, and tags — then synthesize findings.\n"
     "Answer in the same language as the user.\n\n"
 
-    "RESEARCH PROCESS (7 Phases):\n\n"
+    "RESEARCH PROCESS (5 Phases):\n\n"
 
     "Phase 1: ANALYZE (no tools)\n"
     "- Break down the question into 2-3 key aspects\n"
@@ -576,41 +592,28 @@ research_agent_prompt = (
     "- Identify core concepts and technical terms\n"
     "- Plan search strategy across all data sources\n\n"
 
-    "Phase 2: LITERATURE SEARCH (Milvus vector DB — 2-3 searches max)\n"
+    "Phase 2: LITERATURE SEARCH (Milvus vector DB)\n"
     "- Call literature_search with rephrased query for each key aspect/hypothesis\n"
     "- ALWAYS rephrase the user question for better semantic matching\n"
-    "- If first search insufficient, broaden query and retry ONCE\n"
+    "- Use max_searches=4 to allow the rag_agent more search iterations\n"
     "- Target: 5-7 distinct high-quality sources\n"
     "- Maximum 3 literature_search calls\n\n"
 
-    "Phase 3: PACKAGE SEARCH (keyword-based metadata search)\n"
-    "- Derive 2-4 keywords from the user's question\n"
-    "- Call ckan_run('package_search', {'q': '<keywords>', 'include_private': True})\n"
-    "- Review the returned datasets and their metadata\n"
-    "- For the top 1-3 most relevant datasets, examine their resources:\n"
-    "  - Prefer PDF or Markdown resources; skip if neither exists\n"
-    "  - Call literature_analyse(doc=<resource_url>, question=<user_question>) to read the content\n\n"
+    "Phase 3: CKAN EXPLORATION (autonomous dataset discovery)\n"
+    "- Call ckan_explore with a task derived from the user's question and max_searches=10\n"
+    "- The ckan_agent will autonomously search packages, browse groups, tags, and curate results\n"
+    "- Review the returned datasets and their resources\n"
+    "- For the top 1-3 most relevant datasets with PDF or Markdown resources,\n"
+    "  call literature_analyse to read the content\n\n"
 
-    "Phase 4: GROUP DISCOVERY\n"
-    "- Call ckan_run('group_list', {'all_fields': True}) to list all groups\n"
-    "- Identify 1-3 groups most likely to contain relevant datasets for the user's query\n"
-    "- For each relevant group, call ckan_run('package_search', {'fq': 'groups:<group_name>', 'include_private': True})\n"
-    "- For the most relevant datasets found, examine resources (prefer PDF/Markdown) via literature_analyse\n\n"
-
-    "Phase 5: TAG DISCOVERY\n"
-    "- Call ckan_run('tag_list', {'all_fields': True}) to list all tags\n"
-    "- Identify 3-5 tags most relevant to the user's query\n"
-    "- For each relevant tag, call ckan_run('package_search', {'fq': 'tags:<tag_name>', 'include_private': True})\n"
-    "- For the most relevant datasets found, examine resources (prefer PDF/Markdown) via literature_analyse\n\n"
-
-    "Phase 6: DEEP DOCUMENT ANALYSIS (3-5 analyses max)\n"
-    "- Select the top 3-5 most relevant sources found across ALL previous phases\n"
+    "Phase 4: DEEP DOCUMENT ANALYSIS (3-5 analyses max)\n"
+    "- Select the top 3-5 most relevant sources found across Phases 2-3\n"
     "- Call literature_analyse on each to extract precise passages with highlight URLs\n"
     "- Cross-verify quantitative claims across sources\n"
-    "- Skip documents already analyzed in Phases 3-5\n"
-    "- Maximum 5 literature_analyse calls total (including those in Phases 3-5)\n\n"
+    "- Skip documents already analyzed in Phase 3\n"
+    "- Maximum 5 literature_analyse calls total\n\n"
 
-    "Phase 7: SYNTHESIZE & REPORT (no tools)\n"
+    "Phase 5: SYNTHESIZE & REPORT (no tools)\n"
     "- Validate/refute initial hypotheses\n"
     "- Identify consensus vs contradictions\n"
     "- Note confidence level for each finding\n"
@@ -619,22 +622,17 @@ research_agent_prompt = (
     "2. Key Findings (2-4 subsections)\n"
     "   2.1 [Topic]: Finding + [Evidence](url)\n"
     "   2.2 [Topic]: Finding + [Evidence](url)\n"
-    "3. Evidence Summary (list all sources with origin: Literatur/Paketsuche/Gruppe/Tag)\n"
+    "3. Evidence Summary (list all sources with origin: Literatur/CKAN-Exploration)\n"
     "4. Next Steps (2-3 suggestions)\n\n"
 
     "Deduplicate — the same dataset may appear in multiple phases; mention it once with all relevant context.\n\n"
 
     "TOOL USAGE BUDGET:\n"
-    "- literature_search: max 3 calls\n"
+    "- literature_search: max 3 calls (use max_searches=4 for deeper search)\n"
+    "- ckan_explore: typically 1 call with max_searches=10\n"
     "- literature_analyse: max 5 calls total across all phases\n"
-    "- ckan_run: as needed for package_search, group_list, tag_list (typically 5-10 calls)\n"
-    "- Total tool calls: aim for 15-25, hard ceiling at 40\n\n"
-
-    "CKAN QUERY RULES:\n"
-    "- Use package_search (not package_list) for listing/searching datasets\n"
-    "- ALWAYS include 'include_private': True for package_search\n"
-    "- All datasets: q='*:*', include_private=True\n"
-    "- By organization: fq='owner_org:ORG_ID', include_private=True\n\n"
+    "- ckan_run: for direct single-action calls (package_show, resource_show, etc.)\n"
+    "- Total tool calls: aim for 8-15, hard ceiling at 25\n\n"
 
     "CITATION FORMAT:\n"
     "- Inline: [Author Year](dataset_url)\n"
@@ -657,7 +655,7 @@ research_agent_prompt = (
     "- If a phase yields no results, proceed to the next phase\n\n"
 
     "IMPORTANT:\n"
-    "- ALL 7 phases are mandatory — do not skip group or tag discovery\n"
+    "- ALL 5 phases are mandatory\n"
     "- Think strategically before each tool call\n"
     "- Quality over quantity\n"
     "- Complete research even if some sources unavailable\n"
@@ -665,94 +663,49 @@ research_agent_prompt = (
 # --------------------- System Prompt & Agent ---------------------
 
 ckan_agent_prompt = (
-    "You are an intelligent CKAN action optimizer that corrects, completes, and executes queries efficiently.\n\n"
-    
-    "YOUR ROLE:\n"
-    "1. Receive action + parameters from front_agent\n"
-    "2. Optimize the action (correct if suboptimal)\n"
-    "3. Complete missing parameters (add defaults)\n"
-    "4. Execute via run_action ONCE\n"
-    "5. Suggest pagination if response is large\n\n"
-    
-    "ACTION OPTIMIZATION RULES:\n"
-    "Suboptimal Actions → Better Alternatives:\n"
-    "- 'package_list' → 'package_search' (richer metadata, supports private datasets)\n"
-    "- 'current_package_list_with_resources' → 'package_search' (more flexible, better filtering)\n"
-    
-    "Why redirect:\n"
-    "- package_search: Shows full metadata, supports private datasets, allows filtering\n"
-    "- package_list: Only shows names, no metadata, limited usefulness\n\n"
-    
-    "PARAMETER AUTO-COMPLETION:\n"
-    "For 'package_search' (most common), ALWAYS ensure these parameters:\n"
-    "- 'q': '*:*' (if missing or empty - means \"all datasets\")\n"
-    "- 'include_private': True (CRITICAL - shows both public and private datasets)\n"
-    "- 'rows': 10 (pagination - reasonable default)\n"
-    "- 'start': 0 (pagination - first page)\n"
-    
-    "For other actions (resource_show, organization_show, *_create, *_patch, etc.):\n"
-    "- Pass action and parameters through as-is — do NOT redirect them\n"
-    "- Trust merge_with_smart_defaults() to add required parameters\n"
-    "- resource_show needs 'id', organization_show needs 'id', etc.\n\n"
-    
-    "EXECUTION PROCESS:\n"
-    "1. Analyze received action and CHANGE IT if needed:\n"
-    "   \n"
-    "   IF action == 'package_list' OR action == 'current_package_list_with_resources':\n"
-    "       action_to_use = 'package_search'  # CHANGE the action name\n"
-    "       parameters_to_use = {'q': '*:*', 'include_private': True, 'rows': 10, 'start': 0}\n"
-    "   \n"
-    "   ELIF action == 'package_search':\n"
-    "       action_to_use = 'package_search'  # Keep the action\n"
-    "       parameters_to_use = complete parameters (ensure q, include_private, rows, start)\n"
-    "   \n"
-    "   ELSE:\n"
-    "       action_to_use = original action  # Keep as-is\n"
-    "       parameters_to_use = original parameters\n"
-    
-    "2. Complete parameters for package_search:\n"
-    "   - If 'q' missing or empty: set to '*:*'\n"
-    "   - If 'include_private' missing: set to True\n"
-    "   - If 'rows' missing: set to 10\n"
-    "   - If 'start' missing: set to 0\n"
-    
-    "3. Call run_action with the CORRECTED action name + COMPLETED parameters:\n"
-    "   run_action(action_to_use, parameters_to_use)\n"
-    "   \n"
-    "   CRITICAL: Use action_to_use (NOT the original action!)\n"
-    
-    "4. Check response:\n"
-    "   - If success=True and items_returned > 50:\n"
-    "     Add comment: 'Large result ({count} items). Consider pagination: rows=10, start=0/10/20...'\n"
-  "   - If success=False:\n"
-    "     Copy error to result\n"
-    
-    "5. Return CKANResult with status, action_name, parameters, result, comment\n\n"
-    
-    "EXAMPLES:\n"
+    "You are an autonomous CKAN data explorer. You receive a research task and independently "
+    "search CKAN using multiple strategies to find relevant datasets.\n\n"
 
-    "Example 1 - Action Correction:\n"
-    "Input: action='package_list', parameters={}\n"
-    "Think: 'package_list is suboptimal, redirecting to package_search'\n"
-    "Execute: run_action('package_search', {'q': '*:*', 'include_private': True, 'rows': 10, 'start': 0})\n"
-    "Return: status='success', action_name='package_search', comment='Redirected from package_list for richer data'\n"
+    "AVAILABLE TOOLS:\n"
+    "- ckan_action(action_name, parameters): Execute any CKAN action — the primary tool\n"
+    "- ckan_action_names(): Discover all available CKAN actions\n"
+    "- ckan_action_details(action): Get parameter docs for a specific action\n\n"
 
-    "Example 2 - Parameter Completion:\n"
-    "Input: action='package_search', parameters={'q': 'climate'}\n"
-    "Think: 'Missing include_private and pagination'\n"
-    "Execute: run_action('package_search', {'q': 'climate', 'include_private': True, 'rows': 10, 'start': 0})\n"
-    "Return: status='success', action_name='package_search', parameters_auto_added={'include_private': True, 'rows': 10, 'start': 0}\n"
+    "COMMON ACTIONS:\n"
+    "- package_search: {q: 'keywords', fq: 'groups:name', include_private: True, rows: 10}\n"
+    "- group_list: {all_fields: True} — lists all groups with descriptions\n"
+    "- tag_list: {all_fields: True} — lists all tags\n"
+    "- package_show: {id: 'dataset-id-or-name'} — full dataset details\n"
+    "- organization_list: {all_fields: True} — lists all organizations\n"
+    "For unknown actions, use ckan_action_details() to discover parameters.\n\n"
 
-    "Example 3 - Large Result:\n"
-    "Execute: run_action returns items_returned=127\n"
-    "Return: status='success', comment='Large result (127 items). Consider pagination: rows=10, start=0/10/20...'\n\n"
-    
-    "CRITICAL RULES:\n"
-    "- Call run_action EXACTLY ONCE (after optimization)\n"
-    "- ALWAYS add 'include_private': True for package_search\n"
-    "- ALWAYS redirect package_list → package_search\n"
-    "- Log what you changed for debugging\n"
-    "- Be helpful - explain corrections in comment field\n"
+    "SEARCH STRATEGY:\n"
+    "1. Start with package_search using the most specific terms from the task\n"
+    "2. If few or no results: broaden keywords, try synonyms, translate DE↔EN\n"
+    "3. Use group_list to discover relevant thematic groups, then search by group (fq='groups:name')\n"
+    "4. Use tag_list to discover relevant tags, then search by tag (fq='tags:name')\n"
+    "5. For the most promising datasets, use package_show to get full metadata and resource list\n"
+    "6. Deduplicate results across searches\n\n"
+
+    "QUERY RULES:\n"
+    "- package_search uses Solr syntax: q for full-text, fq for field filters\n"
+    "- Combine filters: fq='groups:water AND tags:quality'\n"
+    "- Use '*:*' for q when filtering only by fq\n"
+    "- include_private: True is auto-added by smart defaults\n\n"
+
+    "OUTPUT:\n"
+    "- Write a concise summary answering the task\n"
+    "- List all found datasets with title, id, relevance explanation\n"
+    "- Include tags and extras metadata for each dataset\n"
+    "- Include resource list (name, format, url) for each dataset\n"
+    "- Report which queries you tried and how many results each returned\n"
+    "- If results are sparse, suggest what else could be tried\n\n"
+
+    "EFFICIENCY:\n"
+    "- Stay within the given search budget (max tool calls)\n"
+    "- Prioritize quality over quantity — 5 relevant datasets beat 20 irrelevant ones\n"
+    "- Stop searching once you have enough relevant results\n"
+    "- Do NOT read document contents — just find and describe datasets\n"
 )
 
 agent = Agent(
@@ -771,9 +724,9 @@ research_agent= Agent(
 ckan_agent = Agent(
     model=model,
     deps_type=Deps,
-    output_type=CKANResult,
+    output_type=CKANExploreResult,
     instructions="".join(ckan_agent_prompt),
-    retries=5,
+    retries=3,
 )
 
 
@@ -915,15 +868,6 @@ async def _mcp_fetch_data(url: str, token: str, action: str, params: dict) -> Op
         return None
 
 
-def _bypass_ckan_agent(command: str) -> bool:
-    raw_suffixes = toolkit.config.get("ckanext.chat.agent_required_suffixes", "_create,_patch")
-    required_suffixes = tuple(s.strip() for s in raw_suffixes.split(",") if s.strip())
-    if any(command.endswith(s) for s in required_suffixes):
-        return False
-    raw_bypass = toolkit.config.get("ckanext.chat.agent_bypass_actions", "")
-    bypass_set = {a.strip() for a in raw_bypass.split(",") if a.strip()}
-    return command in bypass_set
-
 
 async def _ckan_fetch_data(deps, action: str, params: dict):
     """Execute a CKAN action via MCP (if available) or direct toolkit call."""
@@ -986,146 +930,105 @@ async def ckan_run(ctx: RunContext[Deps], command: str, parameters: dict={}) -> 
     parameters = normalize_parameters(parameters)
 
     params_short = _format_params_short(parameters)
-    _push_status(ctx.deps, f"CKAN: {command}" + (f" ({params_short})" if params_short else ""))
+    _push_status(ctx.deps, f"Direct CKAN query: {command}" + (f" ({params_short})" if params_short else ""))
 
     import time as _time
     t0 = _time.monotonic()
     start_time = datetime.now(timezone.utc)
     log.info(f"ckan_run starting: action='{command}', params={json.dumps(parameters, ensure_ascii=False)[:200]}")
 
-    if _bypass_ckan_agent(command):
-        log.info(f"ckan_run bypassing ckan_agent for '{command}'")
-        try:
-            merged_params = merge_with_smart_defaults(command, parameters)
-            _push_status(ctx.deps, f"Fetching data from CKAN: {command}" + (f" ({params_short})" if params_short else ""))
+    try:
+        merged_params = merge_with_smart_defaults(command, parameters)
+        _push_status(ctx.deps, f"Direct CKAN query: fetching {command}" + (f" ({params_short})" if params_short else ""))
 
-            t_fetch_start = _time.monotonic()
-            response, fetch_method = await _ckan_fetch_data(ctx.deps, command, merged_params)
-            t_fetch_end = _time.monotonic()
+        t_fetch_start = _time.monotonic()
+        response, fetch_method = await _ckan_fetch_data(ctx.deps, command, merged_params)
+        t_fetch_end = _time.monotonic()
 
-            _push_status(ctx.deps, f"Processing response from {command}")
-            truncated = smart_truncate_response(response)
+        _push_status(ctx.deps, f"Direct CKAN query: processing response")
+        truncated = smart_truncate_response(response)
 
-            result_dict = {
-                'status': 'success',
-                'action_name': command,
-                'parameters': parameters,
-                'result': truncated['data'],
-                '_truncated': truncated['truncated'],
-                '_truncation_method': truncated['truncation_method'],
-                '_total_items': truncated['total_items'],
-                '_showing_items': truncated['showing_items'],
-                '_estimated_tokens': truncated['estimated_tokens'],
-            }
+        result_dict = {
+            'status': 'success',
+            'action_name': command,
+            'parameters': parameters,
+            'result': truncated['data'],
+            '_truncated': truncated['truncated'],
+            '_truncation_method': truncated['truncation_method'],
+            '_total_items': truncated['total_items'],
+            '_showing_items': truncated['showing_items'],
+            '_estimated_tokens': truncated['estimated_tokens'],
+        }
 
-            t_total = _time.monotonic()
-            log.info(f"ckan_run complete (fast): action='{command}', "
-                    f"method={fetch_method}, "
-                    f"fetch={t_fetch_end - t_fetch_start:.1f}s, total={t_total - t0:.1f}s, "
-                    f"items={truncated['showing_items']}/{truncated['total_items']}")
-            _push_status(ctx.deps, f"CKAN complete: {truncated['showing_items']}/{truncated['total_items']} items ({t_total - t0:.1f}s)")
+        t_total = _time.monotonic()
+        log.info(f"ckan_run complete: action='{command}', "
+                f"method={fetch_method}, "
+                f"fetch={t_fetch_end - t_fetch_start:.1f}s, total={t_total - t0:.1f}s, "
+                f"items={truncated['showing_items']}/{truncated['total_items']}")
+        _push_status(ctx.deps, f"Direct CKAN query complete: {truncated['showing_items']}/{truncated['total_items']} items ({t_total - t0:.1f}s)")
 
-            return json.dumps(result_dict)
+        return json.dumps(result_dict)
 
-        except KeyError as e:
-            log.warning(f"ckan_run fast path KeyError: action='{command}', error={e}")
-            return json.dumps({"status": "fail", "action_name": command, "result": f"Action '{command}' not found: {e}", "comment": "Check action name"})
-        except Exception as e:
-            log.error(f"ckan_run fast path error: action='{command}', error_type={type(e).__name__}, error={str(e)[:200]}")
-            return json.dumps({"status": "fail", "action_name": command, "result": f"{type(e).__name__}: {str(e)}", "comment": "Action failed"})
+    except KeyError as e:
+        log.warning(f"ckan_run KeyError: action='{command}', error={e}")
+        return json.dumps({"status": "fail", "action_name": command, "result": f"Action '{command}' not found: {e}", "comment": "Check action name"})
+    except Exception as e:
+        log.error(f"ckan_run error: action='{command}', error_type={type(e).__name__}, error={str(e)[:200]}")
+        return json.dumps({"status": "fail", "action_name": command, "result": f"{type(e).__name__}: {str(e)}", "comment": "Action failed"})
 
-    # Agent path: use ckan_agent for parameter optimization
-    _push_status(ctx.deps, f"Validating query parameters for {command}" + (f" ({params_short})" if params_short else ""))
+
+@agent.tool
+@research_agent.tool
+async def ckan_explore(ctx: RunContext[Deps], task: str, max_searches: int = 6) -> str:
+    """Delegate a CKAN research task to the autonomous ckan_agent.
+
+    Use this for open-ended dataset discovery and exploration. The ckan_agent will
+    autonomously search, browse groups/tags, and curate results.
+    For direct single-action calls (show, create, patch), use ckan_run instead.
+
+    Args:
+        ctx: Runtime context
+        task: Research task description (e.g. "Find datasets about brass corrosion in drinking water")
+        max_searches: Max number of CKAN actions the agent may perform (default 6)
+
+    Returns:
+        str: JSON with summary, found datasets, queries tried, and suggestions
+    """
+    import time as _time
+    t0 = _time.monotonic()
+    _push_status(ctx.deps, f"CKAN exploration: {task[:60]}...")
+    log.info(f"ckan_explore starting: task='{task[:100]}', max_searches={max_searches}")
 
     try:
         r = await asyncio.wait_for(
             ckan_agent.run(
-                f"Run the CKAN action: '{command}' with the parameters: {parameters}. "
-                "If the action fails, suggest the correct action and explain it using 'get_ckan_action_details'.",
+                f"{task}\n\nBudget: max {max_searches} tool calls.",
                 deps=ctx.deps,
                 usage_limits=UsageLimits(
-                    request_limit=config.REQUEST_LIMIT_CKAN_RUN,
-                    total_tokens_limit=config.MAX_TOKENS_CKAN_RUN
+                    request_limit=max_searches + 4,
+                    total_tokens_limit=config.MAX_TOKENS_CKAN_RUN,
                 ),
             ),
-            timeout=config.CKAN_RUN_TIMEOUT
+            timeout=config.CKAN_RUN_TIMEOUT,
         )
 
-        t_agent = _time.monotonic()
         usage = r.usage()
-        log.info(f"ckan_run agent done: action='{command}', "
-                f"agent_time={t_agent - t0:.1f}s, "
-                f"requests={usage.request_tokens}req/{usage.response_tokens}resp/{usage.total_tokens}total")
-        
-        # Log what ckan_agent returned
-        ckan_result = r.output
-        log.info(f"ckan_run agent result: status={ckan_result.status}, "
-                f"action={ckan_result.action_name}, "
-                f"result_preview={str(ckan_result.result)[:100]}")
-        
-        if ckan_result.status == 'success':
-            try:
-                corrected_action = ckan_result.action_name or command
-                corrected_params = ckan_result.parameters or parameters
-                merged_params = merge_with_smart_defaults(corrected_action, corrected_params)
-                corrected_params_short = _format_params_short(corrected_params)
-                _push_status(ctx.deps, f"Fetching data from CKAN: {corrected_action}" + (f" ({corrected_params_short})" if corrected_params_short else ""))
-
-                t_fetch_start = _time.monotonic()
-                response, fetch_method = await _ckan_fetch_data(ctx.deps, corrected_action, merged_params)
-                t_fetch_end = _time.monotonic()
-
-                _push_status(ctx.deps, f"Processing response from {corrected_action}")
-                truncated = smart_truncate_response(response)
-
-                result_dict = ckan_result.model_dump()
-                result_dict['result'] = truncated['data']
-                result_dict['_truncated'] = truncated['truncated']
-                result_dict['_truncation_method'] = truncated['truncation_method']
-                result_dict['_total_items'] = truncated['total_items']
-                result_dict['_showing_items'] = truncated['showing_items']
-                result_dict['_estimated_tokens'] = truncated['estimated_tokens']
-
-                t_total = _time.monotonic()
-                log.info(f"ckan_run complete: action='{command}', "
-                        f"method={fetch_method}, "
-                        f"agent={t_agent - t0:.1f}s, fetch={t_fetch_end - t_fetch_start:.1f}s, total={t_total - t0:.1f}s, "
-                        f"items={truncated['showing_items']}/{truncated['total_items']}")
-
-                _push_status(ctx.deps, f"CKAN complete: {truncated['showing_items']}/{truncated['total_items']} items ({t_total - t0:.1f}s)")
-
-                final_result = json.dumps(result_dict)
-                return final_result
-            except Exception as e:
-                log.error(f"ckan_run data fetch error: {str(e)[:200]}")
-                return r.output.model_dump_json()
-        
-        # If failed, log and return as-is
-        log.warning(f"ckan_run failed: status={ckan_result.status}, result={ckan_result.result[:200]}")
+        t_total = _time.monotonic() - t0
+        log.info(f"ckan_explore complete: {t_total:.1f}s, "
+                f"tokens=[req:{usage.request_tokens}, resp:{usage.response_tokens}]")
+        _push_status(ctx.deps, f"CKAN exploration complete ({t_total:.1f}s)")
         return r.output.model_dump_json()
-        
+
     except asyncio.TimeoutError:
-        duration_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
-        log.error(f"ckan_run timeout: action='{command}', duration_ms={duration_ms:.0f}, limit=90000ms")
-        return json.dumps({"status": "fail", "action_name": command, "result": "Timeout after 90 seconds", "comment": "Operation took too long"})
-        
+        log.error(f"ckan_explore timeout after {config.CKAN_RUN_TIMEOUT}s")
+        return json.dumps({"summary": "Search timed out", "datasets_found": [], "queries_tried": []})
     except UsageLimitExceeded as e:
-        log.error(f"ckan_run usage limit exceeded: action='{command}', limit={e}")
-        return json.dumps({"status": "fail", "action_name": command, "result": f"Token limit exceeded: {e}", "comment": "Query too complex"})
-        
-    except ModelHTTPError as e:
-        log.error(f"ckan_run API error: action='{command}', status={e.status_code if hasattr(e, 'status_code') else 'unknown'}")
-        return json.dumps({"status": "fail", "action_name": command, "result": f"API error: {str(e)}", "comment": "Service unavailable"})
-        
-    except UnexpectedModelBehavior as e:
-        log.error(f"ckan_run model behavior error: action='{command}', error={str(e)[:200]}")
-        return json.dumps({"status": "fail", "action_name": command, "result": f"Model output validation failed: {str(e)}", "comment": "Invalid response format"})
-        
+        log.error(f"ckan_explore usage limit: {e}")
+        return json.dumps({"summary": f"Token limit exceeded: {e}", "datasets_found": [], "queries_tried": []})
     except Exception as e:
-        duration_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
-        log.error(f"ckan_run unexpected error: action='{command}', error_type={type(e).__name__}, error={str(e)[:200]}, duration_ms={duration_ms:.0f}")
-        return json.dumps({"status": "fail", "action_name": command, "result": f"Unexpected error: {type(e).__name__}: {str(e)}", "comment": "Internal error"})
-    
+        log.error(f"ckan_explore error: {type(e).__name__}: {str(e)[:200]}")
+        return json.dumps({"summary": f"Error: {type(e).__name__}: {str(e)}", "datasets_found": [], "queries_tried": []})
+
 
 #@ckan_agent.tool_plain
 def ckan_url_patterns(endpoint: str = "") -> RouteModel:
@@ -1162,124 +1065,84 @@ def build_ckan_url(route: RouteModel, fill: Optional[Dict[str, Any]] = None) -> 
 
 @agent.tool_plain
 @research_agent.tool_plain
-@ckan_agent.tool_plain
 def get_ckan_action_names() -> Dict[str,str]:
-    """Lists all avalable CKAN actions by action name
+    """Lists all available CKAN actions by action name
 
     Returns:
-        List[str]: List of names of CKAN actions
+        Dict[str,str]: Dictionary of CKAN action names
     """
     return get_ckan_actions()
 
-# @agent.tool_plain
-# @research_agent.tool_plain
-@ckan_agent.tool_plain
-def get_ckan_action_details(action: str) -> FuncSignature:
-    """Returns the doc string of a CKAN action by action name
 
-    Returns:
-        FuncSignature: Doc string of the CKAN action
-    """
-    return get_ckan_action(action=action)
+# --------------------- ckan_agent Tools (autonomous explorer) ---------------------
 
-
-# @ckan_agent.tool_plain
-# def get_action_info(action_key: str) -> dict:
-#     """Get the doc string of an action
-
-#     Args:
-#         action_key (str): the str the acton is named after
-
-#     Returns:
-#         dict: a dictionary containing the doc string and the arguments definitions needed to run the action
-#     """
-#     from ckan.logic.action.get import help_show
-
-#     func_model = FuncSignature(doc=help_show({}, {"name": action_key}))
-#     return func_model.model_dump()
-
-
-
-
-#@agent.tool
-@rag_agent.tool
-@ckan_agent.tool
-def run_action(ctx: RunContext[Deps], action_name: str, parameters: Dict) -> Any:
-    """Run CKAN actions with smart parameter filling and metrics.
-    
-    Returns ONLY metrics for ckan_agent validation (no data sent to LLM).
-    Actual data fetching is done separately by ckan_run().
-
-    Args:
-        ctx (RunContext[Deps]): Instance of Agent dependencys at runtime
-        action_name (str): Name of the action to run
-        parameters (Dict): Dict of Parameters to be passed to the action
-
-    Returns:
-        Dict: Validation result with metrics only (no actual data)
-    """
-    if is_action_blocked(action_name):
-        return {
-            'success': False,
-            'error': f"Action '{action_name}' is blocked. Destructive actions (_delete, _purge) are not allowed.",
-            'error_type': 'ActionBlocked',
-            'parameters_attempted': parameters
-        }
-
-    # Track what parameters were auto-added
-    merged_parameters = merge_with_smart_defaults(action_name, parameters)
-    params_added = {k: v for k, v in merged_parameters.items() if k not in parameters}
-    
-    user = CKANmodel.User.get(user_reference=ctx.deps.user_id)
-    context = {
+def _ckan_context(user_id: str) -> dict:
+    user = CKANmodel.User.get(user_reference=user_id)
+    return {
         "user": user.name,
         "auth_user_obj": user,
         "model": CKANmodel,
         "session": CKANmodel.Session,
         "ignore_auth": False,
     }
-    
-    try:
-        import time as _time
-        t_action = _time.monotonic()
-        response = toolkit.get_action(action_name)(context, merged_parameters)
-        log.info(f"run_action executed: action='{action_name}', time={_time.monotonic() - t_action:.3f}s")
 
-        json_str = json.dumps(response)
-        response_size_bytes = len(json_str)
-        estimated_tokens = response_size_bytes // 4
-        
-        # Count items in response
-        items_count = 1
-        if isinstance(response, list):
-            items_count = len(response)
-        elif isinstance(response, dict):
-            if 'results' in response and isinstance(response['results'], list):
-                items_count = len(response['results'])
-            elif 'count' in response:
-                items_count = response['count']
-        
-        # Return ONLY metrics (no data)
-        return {
-            'success': True,
-            'action_name': action_name,
-            'parameters_used': merged_parameters,
-            'parameters_auto_added': params_added if params_added else None,
-            'metrics': {
-                'response_size_bytes': response_size_bytes,
-                'estimated_tokens': estimated_tokens,
-                'items_returned': items_count
-            }
-        }
-        
+
+@ckan_agent.tool_plain
+def ckan_action_names() -> Dict[str, str]:
+    """List all available CKAN action names for discovery.
+
+    Returns:
+        Dict[str, str]: Action names and their descriptions
+    """
+    return get_ckan_actions()
+
+
+@ckan_agent.tool_plain
+def ckan_action_details(action: str) -> FuncSignature:
+    """Get the parameters and docstring of a specific CKAN action.
+
+    Args:
+        action: CKAN action name (e.g. 'package_search', 'group_list')
+
+    Returns:
+        FuncSignature: Function signature with docs and parameter info
+    """
+    return get_ckan_action(action=action)
+
+
+@ckan_agent.tool
+def ckan_action(ctx: RunContext[Deps], action_name: str, parameters: Dict[str, Any] = {}) -> dict:
+    """Execute any CKAN action and return the actual data (truncated for large responses).
+
+    This is the primary tool — use it for package_search, group_list, tag_list, package_show,
+    organization_list, and any other CKAN action. Parameters are auto-completed via smart defaults.
+
+    Args:
+        ctx: Runtime context
+        action_name: CKAN action name (e.g. 'package_search', 'group_list')
+        parameters: Action parameters (e.g. {'q': 'water', 'fq': 'groups:environment'})
+
+    Returns:
+        dict: Action result data (truncated if large)
+    """
+    if is_action_blocked(action_name):
+        return {'error': f"Action '{action_name}' is blocked."}
+
+    parameters = normalize_parameters(parameters)
+    merged = merge_with_smart_defaults(action_name, parameters)
+
+    params_short = _format_params_short(parameters)
+    _push_status(ctx.deps, f"── CKAN agent: {action_name}" + (f" ({params_short})" if params_short else ""))
+
+    context = _ckan_context(ctx.deps.user_id)
+    try:
+        response = toolkit.get_action(action_name)(context, merged)
+        truncated = smart_truncate_response(response)
+        log.info(f"ckan_action: {action_name}, items={truncated['total_items']}")
+        return truncated['data']
     except Exception as e:
-        # Return error with details
-        return {
-            'success': False,
-            'error': str(e),
-            'error_type': type(e).__name__,
-            'parameters_attempted': merged_parameters
-        }
+        log.warning(f"ckan_action error: {action_name}, {type(e).__name__}: {str(e)[:200]}")
+        return {'error': f"{type(e).__name__}: {str(e)}"}
 
 def extract_resource_uuid(input_string: str) -> str:
     # Regulärer Ausdruck für UUID zwischen 'resource/' und '/download'
@@ -1521,9 +1384,9 @@ async def rag_search(
     if not ctx.deps.milvus_client or not ctx.deps.embeddings:
         return "The Milvus Client was not setup properly, no rag_search supported in the moment."
     else:
-        _push_status(ctx.deps, f"Vector search: {len(search_query)} queries, limit={limit}")
+        _push_status(ctx.deps, f"── RAG agent: vector search ({len(search_query)} queries, limit={limit})")
         log.info(f"rag_search starting: queries={len(search_query)} limit={limit}")
-        _push_status(ctx.deps, "Generating embeddings for search queries")
+        _push_status(ctx.deps, "── RAG agent: generating embeddings")
         query_vectors = await get_embedding(
             search_query,
             model=ctx.deps.embedding_model,
@@ -1531,7 +1394,7 @@ async def rag_search(
             vector_dim=ctx.deps.vector_dim,
         )
         log.info(f"rag_search embedding done, starting milvus search")
-        _push_status(ctx.deps, "Searching vector database")
+        _push_status(ctx.deps, "── RAG agent: searching vector database")
         hits = []
         seen_ids = set()
         while len(hits) < limit:
@@ -1558,7 +1421,7 @@ async def rag_search(
                 break
             log.info(f"rag_search milvus: {len(hits)}/{limit} unique hits")
         hits = hits[:limit]
-        _push_status(ctx.deps, f"Analyzing vector search results: {len(hits)} hits")
+        _push_status(ctx.deps, f"── RAG agent: {len(hits)} hits found")
         log.info(f"rag_search completed: {len(hits)} hits")
         return hits
         
@@ -1570,23 +1433,35 @@ async def rag_search(
 @agent.tool
 @research_agent.tool
 async def literature_search(
-    ctx: RunContext[Deps], search_question: str, num_results: int = 5
+    ctx: RunContext[Deps], search_question: str, num_results: int = 5, max_searches: int = 2
 ) -> list[str]:
+    """Search literature via vector database (Milvus).
+
+    Args:
+        ctx: Runtime context
+        search_question: Question rephrased for semantic matching
+        num_results: Number of source documents to return (default 5)
+        max_searches: Max number of rag_search calls the agent may perform (default 2, research_agent can use up to 4)
+
+    Returns:
+        str: JSON with answer, citations, and search metadata
+    """
     start_time = datetime.now(timezone.utc)
-    _push_status(ctx.deps, f"Literature search: \"{search_question}\"")
-    log.info(f"literature_search starting: query='{search_question}...', num_results={num_results}")
+    _push_status(ctx.deps, f"Literature search: \"{search_question[:50]}\"")
+    log.info(f"literature_search starting: query='{search_question}...', num_results={num_results}, max_searches={max_searches}")
 
     for attempt in range(config.MAX_RETRIES_LITERATURE_SEARCH):
         try:
             if attempt > 0:
-                _push_status(ctx.deps, f"Retrying literature search (attempt {attempt+1})")
+                _push_status(ctx.deps, f"Literature search: retry (attempt {attempt+1})")
             log.debug(f"literature_search attempt {attempt+1}/{config.MAX_RETRIES_LITERATURE_SEARCH}")
             r = await asyncio.wait_for(
                 rag_agent.run(
-                    f"Search for documents using this question:{search_question}. You must return {num_results} results",
+                    f"Search for documents using this question: {search_question}. "
+                    f"Return {num_results} results. You may call rag_search up to {max_searches} times.",
                     deps=ctx.deps,
                     usage_limits=UsageLimits(
-                        request_limit=config.REQUEST_LIMIT_LITERATURE_SEARCH,
+                        request_limit=max_searches + 4,
                         total_tokens_limit=config.MAX_TOKENS_LITERATURE_SEARCH
                     ),
                 ),
@@ -1596,7 +1471,7 @@ async def literature_search(
             # Track usage metrics
             usage = r.usage()
             duration_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
-            _push_status(ctx.deps, f"Literature search complete ({duration_ms/1000:.1f}s)")
+            _push_status(ctx.deps, f"Literature search complete ({duration_ms/1000:.1f}s, {len(r.output.results or [])} sources)")
             log.info(f"literature_search completed: attempt={attempt+1}, "
                     f"tokens=[request:{usage.request_tokens}, response:{usage.response_tokens}, total:{usage.total_tokens}], "
                     f"duration_ms={duration_ms:.0f}")
@@ -1652,15 +1527,15 @@ async def literature_analyse(ctx: RunContext[Deps], doc: TextResource, question:
         ssl_verify = toolkit.config.get("ckanext.chat.ssl_verify", True)
 
     doc_filename = str(doc.url).rsplit('/', 1)[-1] if doc.url else "unknown"
-    _push_status(ctx.deps, f"Analyzing: {doc_filename}")
+    _push_status(ctx.deps, f"Document analysis: {doc_filename}")
     start_time = datetime.now(timezone.utc)
     log.info(f"literature_analyse starting: doc_url='{doc.url}', question='{question[:100]}...'")
 
-    _push_status(ctx.deps, f"Loading document: {doc_filename}")
+    _push_status(ctx.deps, f"── Doc agent: loading {doc_filename}")
     try:
         doc=await get_resource_file_contents(resource_url=str(doc.url),ssl_verify=ssl_verify)
         log.debug(f"literature_analyse loaded document: length={doc.length} chars")
-        _push_status(ctx.deps, f"Document loaded: {doc_filename} ({doc.length:,} chars)")
+        _push_status(ctx.deps, f"── Doc agent: loaded {doc_filename} ({doc.length:,} chars)")
     except Exception as e:
         log.error(f"literature_analyse failed to load document: error={str(e)[:200]}")
         return json.dumps({"answer": "", "source": str(doc.url), "error": [f"Failed to load document: {str(e)}"]})
@@ -1670,7 +1545,7 @@ async def literature_analyse(ctx: RunContext[Deps], doc: TextResource, question:
         f"**Question:** {question}\n\n"
     )
 
-    _push_status(ctx.deps, f"Extracting relevant passages: {doc_filename}")
+    _push_status(ctx.deps, f"── Doc agent: extracting relevant passages from {doc_filename}")
     try:
         r = await asyncio.wait_for(
             doc_agent.run(
@@ -1687,7 +1562,7 @@ async def literature_analyse(ctx: RunContext[Deps], doc: TextResource, question:
         # Track usage metrics
         usage = r.usage()
         duration_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
-        _push_status(ctx.deps, f"Analysis complete: {doc_filename} ({duration_ms/1000:.1f}s)")
+        _push_status(ctx.deps, f"Document analysis complete: {doc_filename} ({duration_ms/1000:.1f}s)")
         log.info(f"literature_analyse completed: "
                 f"tokens=[request:{usage.request_tokens}, response:{usage.response_tokens}, total:{usage.total_tokens}], "
                 f"duration_ms={duration_ms:.0f}")
@@ -1696,7 +1571,7 @@ async def literature_analyse(ctx: RunContext[Deps], doc: TextResource, question:
 
     except asyncio.TimeoutError:
         duration_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
-        _push_status(ctx.deps, f"Analysis timeout: {doc_filename}")
+        _push_status(ctx.deps, f"Document analysis timeout: {doc_filename}")
         log.error(f"literature_analyse timeout after {duration_ms:.0f}ms, limit=120000ms")
         return json.dumps({"answer": "", "source": str(doc.url), "error": ["Analysis timeout after 120 seconds"]})
         

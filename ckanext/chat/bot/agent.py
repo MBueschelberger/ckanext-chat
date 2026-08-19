@@ -526,19 +526,25 @@ front_agent_prompt = (
     "  - Show: resource name and format\n\n"
 
     "QUICK SEARCH (for information/knowledge queries):\n"
-    "When the user asks a question that seeks information or knowledge, execute these two steps IN PARALLEL:\n\n"
+    "When the user asks a question that seeks information or knowledge, execute these steps:\n\n"
 
-    "Step 1 — LITERATURE SEARCH:\n"
+    "Step 1 — GATHER (run in parallel):\n"
     "- Call literature_search with the user's question rephrased for semantic matching\n"
-    "- Note all returned citations and sources\n\n"
+    "- Call ckan_explore with a task description derived from the user's question\n\n"
 
-    "Step 2 — CKAN EXPLORE:\n"
-    "- Call ckan_explore with a task description derived from the user's question\n"
-    "- The ckan_agent will autonomously search datasets, browse groups and tags\n"
-    "- If a highly relevant dataset has PDF or Markdown resources, optionally call literature_analyse on the single best one\n\n"
+    "Step 2 — VERIFY (critical — avoid false claims):\n"
+    "- Literature search uses vector similarity, so results may be thematically related but NOT directly about the topic.\n"
+    "- Carefully check each result's title, summary, and metadata — does it EXPLICITLY mention the topic?\n"
+    "- Classify each result as 'directly relevant' or 'thematically related' and report this distinction to the user.\n"
+    "- If the relevance of 1-2 key sources is uncertain and they have PDF/Markdown resources,\n"
+    "  call literature_analyse on them to verify their actual content before claiming relevance.\n"
+    "- Do NOT assume a document covers a specific topic just because it was returned by vector search.\n\n"
 
-    "After both steps, synthesize findings into a clear answer.\n"
-    "Keep it fast — max ~3-4 tool calls total.\n\n"
+    "Step 3 — SYNTHESIZE:\n"
+    "- Clearly separate confirmed results from uncertain/thematic matches in your answer.\n"
+    "- Only state what is supported by the actual data returned from tools.\n\n"
+
+    "Keep it fast — max ~5-6 tool calls total.\n\n"
 
     "EXCEPTION — QUICK SEARCH does NOT apply to:\n"
     "- Create/update/upload/patch operations → use DOCUMENT UPLOAD WORKFLOW or direct ckan_run\n"
@@ -575,7 +581,8 @@ front_agent_prompt = (
     "- Never fabricate data or URLs\n\n"
 
     "IMPORTANT:\n"
-    "- Keep information queries fast — max ~3-5 tool calls\n"
+    "- Keep information queries fast — max ~5-6 tool calls\n"
+    "- Accuracy over speed — never claim a document covers a topic without evidence from its title, summary, or content\n"
     "- Quality over quantity\n"
     "- Never change data from tools, except truncating resource URLs to dataset URLs as described above\n"
 )
@@ -614,16 +621,16 @@ research_agent_prompt = (
     "- Maximum 5 literature_analyse calls total\n\n"
 
     "Phase 5: SYNTHESIZE & REPORT (no tools)\n"
-    "- Validate/refute initial hypotheses\n"
-    "- Identify consensus vs contradictions\n"
-    "- Note confidence level for each finding\n"
+    "- Phases 1-4 are your INTERNAL reasoning — do NOT output them to the user.\n"
+    "- The user sees ONLY Phase 5 output — write it as a direct, concise answer.\n"
+    "- Filter ruthlessly: only mention sources that are DIRECTLY relevant to the question.\n"
+    "- Do NOT list or discuss irrelevant sources — simply omit them.\n"
+    "- If no relevant sources were found, say so briefly and suggest next steps.\n"
     "Format:\n"
-    "1. Executive Summary (2-3 sentences)\n"
-    "2. Key Findings (2-4 subsections)\n"
-    "   2.1 [Topic]: Finding + [Evidence](url)\n"
-    "   2.2 [Topic]: Finding + [Evidence](url)\n"
-    "3. Evidence Summary (list all sources with origin: Literatur/CKAN-Exploration)\n"
-    "4. Next Steps (2-3 suggestions)\n\n"
+    "- Start with a direct answer (2-3 sentences)\n"
+    "- List only relevant sources with brief description and dataset URL\n"
+    "- If useful, add 1-2 suggestions for further steps\n"
+    "- Keep the total response similar in length to a front_agent answer (short paragraph + source list)\n\n"
 
     "Deduplicate — the same dataset may appear in multiple phases; mention it once with all relevant context.\n\n"
 
@@ -655,7 +662,10 @@ research_agent_prompt = (
     "- If a phase yields no results, proceed to the next phase\n\n"
 
     "IMPORTANT:\n"
-    "- ALL 5 phases are mandatory\n"
+    "- ALL 5 phases are mandatory as internal reasoning steps\n"
+    "- Only Phase 5 output is shown to the user — keep it concise and direct\n"
+    "- Accuracy over thoroughness — never claim a document covers a topic without evidence from its actual content\n"
+    "- Vector search returns semantically similar results that may NOT be directly relevant — verify before citing\n"
     "- Think strategically before each tool call\n"
     "- Quality over quantity\n"
     "- Complete research even if some sources unavailable\n"

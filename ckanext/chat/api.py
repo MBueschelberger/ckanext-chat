@@ -150,14 +150,30 @@ async def _run_agent_stream(prompt: str, history_parts: list, user_id: str, rese
 
     async def _agent_worker():
         try:
-            async with active_agent.run_stream(
-                user_prompt=prompt,
-                message_history=msg_history,
-                deps=deps,
-                usage_limits=limits,
-            ) as stream:
-                async for chunk in stream.stream_text(delta=True):
-                    await output_queue.put(chunk)
+            if research:
+                # Research agent does many multi-turn tool calls; run_stream()
+                # + stream_text() ends prematurely after the first model
+                # response text. Use run() (like /chat/ask/stream) instead.
+                result = await active_agent.run(
+                    user_prompt=prompt,
+                    message_history=msg_history,
+                    deps=deps,
+                    usage_limits=limits,
+                )
+                text = result.output if hasattr(result, "output") else str(result)
+                await output_queue.put(text)
+            else:
+                async with active_agent.run_stream(
+                    user_prompt=prompt,
+                    message_history=msg_history,
+                    deps=deps,
+                    usage_limits=limits,
+                ) as stream:
+                    async for chunk in stream.stream_text(delta=True):
+                        await output_queue.put(chunk)
+        except Exception as e:
+            log.error(f"agent_worker error: {type(e).__name__}: {str(e)[:500]}")
+            await output_queue.put(f"\n\n**Fehler:** {type(e).__name__}: {str(e)}")
         finally:
             await output_queue.put(None)
 

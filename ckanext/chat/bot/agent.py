@@ -538,6 +538,9 @@ front_agent_prompt = (
     "- Classify each result as 'directly relevant' or 'thematically related' and report this distinction to the user.\n"
     "- If the relevance of 1-2 key sources is uncertain and they have PDF/Markdown resources,\n"
     "  call literature_analyse on them to verify their actual content before claiming relevance.\n"
+    "- PARALLEL EXECUTION: When you need to analyse multiple documents, call ALL literature_analyse\n"
+    "  invocations in a SINGLE tool-call turn so they run concurrently. Do NOT wait for one analysis\n"
+    "  to finish before starting the next — batch them together.\n"
     "- Do NOT assume a document covers a specific topic just because it was returned by vector search.\n\n"
 
     "Step 3 — SYNTHESIZE:\n"
@@ -1582,8 +1585,8 @@ async def literature_analyse(ctx: RunContext[Deps], doc: TextResource, question:
     except asyncio.TimeoutError:
         duration_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
         _push_status(ctx.deps, f"Document analysis timeout: {doc_filename}")
-        log.error(f"literature_analyse timeout after {duration_ms:.0f}ms, limit=120000ms")
-        return json.dumps({"answer": "", "source": str(doc.url), "error": ["Analysis timeout after 120 seconds"]})
+        log.error(f"literature_analyse timeout after {duration_ms:.0f}ms, limit={config.LITERATURE_ANALYSE_TIMEOUT}s")
+        return json.dumps({"answer": "", "source": str(doc.url), "error": [f"Analysis timeout after {config.LITERATURE_ANALYSE_TIMEOUT} seconds"]})
         
     except UsageLimitExceeded as e:
         log.error(f"literature_analyse usage limit exceeded: {e}")

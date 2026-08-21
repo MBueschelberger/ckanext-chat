@@ -403,7 +403,7 @@ rag_prompt = (
     "Step 3: Analyze results using chunk texts\n"
     "- Each RagHit.texts contains the actual text content of matched chunks from that source\n"
     "- READ these texts to write an informed summary for each source\n"
-    "- Create one LitResult per RagHit (they are already grouped by source)\n"
+    "- Create one LitResult per RagHit — return ALL sources, do NOT filter by relevance\n"
     "- Write the summary based on the actual chunk content, not just the title\n"
     "- Fill string_slices with start/end from RagHit.entity\n\n"
 
@@ -420,8 +420,8 @@ rag_prompt = (
     "- Include similarity score if available\n\n"
 
     "IMPORTANT:\n"
-    "- Respect the max rag_search call limit given in your task (default: 2)\n"
-    "- Quality over quantity - 3-5 highly relevant sources better than 10 mediocre ones\n"
+    "- Respect the max rag_search call limit given in your task (default: 1)\n"
+    "- Return ALL sources from rag_search — the calling agent decides relevance\n"
     "- Always include metrics (similarity scores, source count)\n"
     "- If searches yield few results, return what you have with explanation\n"
 )

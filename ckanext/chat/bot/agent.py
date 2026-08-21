@@ -1402,7 +1402,7 @@ async def _fetch_chunks_json(chunks_url: str, deps) -> Optional[List[str]]:
         async with aiohttp.ClientSession() as session:
             async with session.get(chunks_url, headers=headers, ssl=deps.ssl_verify) as resp:
                 resp.raise_for_status()
-                raw = await resp.json()
+                raw = await resp.json(content_type=None)
 
         if isinstance(raw, dict):
             return raw.get("chunks", [])

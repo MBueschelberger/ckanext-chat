@@ -326,7 +326,7 @@ class VectorMeta(BaseModel):
     # chunks: Optional[HttpUrl] = None
     dataset_id: Optional[str] = None
     # dataset_url: Optional[HttpUrl] = None
-    # groups: Optional[list[str]] = None
+    groups: Optional[List[str]] = None
     # private: Optional[str] = None
     resource_id: Optional[str] = None
     source: Optional[HttpUrl] = None
@@ -396,6 +396,7 @@ rag_prompt = (
 
     "Step 2: Execute rag_search ONCE\n"
     "- Use limit parameter to control result count (default: 5 sources)\n"
+    "- If your task specifies groups=['...'], pass the groups parameter to rag_search to restrict results to those CKAN groups\n"
     "- rag_search returns RagHit objects ALREADY GROUPED BY SOURCE DOCUMENT\n"
     "- Each RagHit contains: distance (best similarity), entity (metadata), texts (list of matched chunk texts)\n"
     "- Distance is cosine similarity: 1.0 = identical, 0.0 = unrelated. Higher = more relevant.\n\n"
@@ -566,7 +567,8 @@ front_agent_prompt = (
     "- For specific resource: resource_show with id=RESOURCE_ID\n"
     "- NEVER execute delete or purge operations\n\n"
 
-    "literature_search: rephrase user query for semantic matching.\n"
+    "literature_search: rephrase user query for semantic matching. Use groups=['group_name'] to restrict results to specific CKAN groups.\n"
+    "  When the user asks to search within a specific group, first call ckan_run('group_list', {all_fields: True}) to find the correct group name, then pass it via groups=['name'].\n"
     "literature_analyse: ONLY for analyzing existing CKAN resources with valid http(s) download URLs. Never for uploaded files.\n\n"
 
     "RESPONSE FORMAT:\n"
@@ -604,6 +606,8 @@ research_agent_prompt = (
     "Phase 2: LITERATURE SEARCH (Milvus vector DB)\n"
     "- Call literature_search with rephrased query for each key aspect/hypothesis\n"
     "- ALWAYS rephrase the user question for better semantic matching\n"
+    "- Use groups=['group_name'] to restrict results to specific CKAN groups when the user asks about a specific topic area\n"
+    "- When restricting by group, first call ckan_run('group_list', {all_fields: True}) to find the correct group name\n"
     "- Use max_searches=4 to allow the rag_agent more search iterations\n"
     "- Target: 5-7 distinct high-quality sources\n"
     "- Maximum 3 literature_search calls\n\n"
@@ -1387,30 +1391,18 @@ async def get_embedding(chunks: List[str], model: str, api_url, vector_dim: int)
 
 
 async def _fetch_chunks_json(chunks_url: str, deps) -> Optional[List[str]]:
-    """Fetch a .chunks JSON file from CKAN and return the list of chunk strings."""
+    """Fetch a .chunks JSON file from CKAN via HTTP. Auth is enforced by CKAN's download endpoint."""
     if not chunks_url:
         return None
     ssl_verify = toolkit.config.get("ckanext.chat.ssl_verify", True)
-    ckan_url = toolkit.config.get("ckan.site_url", "")
     try:
-        raw = None
-        resource_id = extract_resource_uuid(chunks_url)
-        if ckan_url and ckan_url in chunks_url and resource_id:
-            storage_path = toolkit.config.get("ckan.storage_path", "/var/lib/ckan/default")
-            file_path = os.path.join(
-                storage_path, "resources",
-                resource_id[:3], resource_id[3:6], resource_id[6:],
-            )
-            async with aiofiles.open(file_path, "r") as f:
-                raw = json.loads(await f.read())
-        else:
-            headers = {}
-            if deps.mcp_token:
-                headers["Authorization"] = deps.mcp_token
-            async with aiohttp.ClientSession() as session:
-                async with session.get(chunks_url, headers=headers, ssl=ssl_verify) as resp:
-                    resp.raise_for_status()
-                    raw = await resp.json()
+        headers = {}
+        if deps.mcp_token:
+            headers["Authorization"] = deps.mcp_token
+        async with aiohttp.ClientSession() as session:
+            async with session.get(chunks_url, headers=headers, ssl=ssl_verify) as resp:
+                resp.raise_for_status()
+                raw = await resp.json()
 
         if isinstance(raw, dict):
             return raw.get("chunks", [])
@@ -1472,7 +1464,8 @@ def _group_hits_by_source(hits: list, chunk_texts: dict) -> List[RagHit]:
 
 @rag_agent.tool
 async def rag_search(
-    ctx: RunContext[Deps], search_query: List[str], limit: int = 3, max_per_source: int = 3
+    ctx: RunContext[Deps], search_query: List[str], limit: int = 3, max_per_source: int = 3,
+    groups: Optional[List[str]] = None,
 ) -> List[RagHit]:
     """Vector rag search using Milvus vector store. Returns one RagHit per source document with chunk texts.
 
@@ -1481,6 +1474,7 @@ async def rag_search(
         search_query (List[str]): A list of strings for which to do the vector search with.
         limit (int, optional): Limit for amount of source documents to be returned. Defaults to 3.
         max_per_source (int, optional): Max chunks per source document. Defaults to 3.
+        groups (List[str], optional): Restrict results to documents belonging to these CKAN groups (by group name). Defaults to None (no restriction).
 
     Returns:
         List[RagHit]: List of RagHit instances grouped by source document, each with texts from matched chunks.
@@ -1489,8 +1483,9 @@ async def rag_search(
         return "The Milvus Client was not setup properly, no rag_search supported in the moment."
 
     queries_preview = " | ".join(search_query)
-    _push_status(ctx.deps, f"── RAG agent: vector search ({len(search_query)} queries, limit={limit}): {queries_preview}")
-    log.info(f"rag_search starting: queries={len(search_query)} limit={limit} max_per_source={max_per_source}")
+    groups_info = f", groups={groups}" if groups else ""
+    _push_status(ctx.deps, f"── RAG agent: vector search ({len(search_query)} queries, limit={limit}{groups_info}): {queries_preview}")
+    log.info(f"rag_search starting: queries={len(search_query)} limit={limit} max_per_source={max_per_source} groups={groups}")
     log.info(f"rag_search queries: {search_query}")
     _push_status(ctx.deps, "── RAG agent: generating embeddings")
     query_vectors = await get_embedding(
@@ -1506,98 +1501,139 @@ async def rag_search(
     raw_hits = []
     seen_ids = set()
     source_counts = {}
-    target_chunks = limit * max_per_source
-
-    while len(raw_hits) < target_chunks:
-        filter_ids = list(seen_ids)
-        search_res = ctx.deps.milvus_client.search(
-            collection_name=ctx.deps.collection_name,
-            data=query_vectors,
-            search_params={"metric_type": "COSINE", "params": {"level": 1}},
-            limit=target_chunks,
-            filter_params={"ids": filter_ids} if filter_ids else None,
-            filter="id not in {ids}" if filter_ids else None,
-            output_fields=output_fields,
-            consistency_level="Bounded",
-        )
-        new_hits = 0
-        for result_per_vector in search_res:
-            for item in result_per_vector:
-                item_id = item.get("id") if hasattr(item, "get") else item["id"]
-                if item_id in seen_ids:
-                    continue
-                seen_ids.add(item_id)
-
-                entity = item.get("entity", {}) if hasattr(item, "get") else item.get("entity", {})
-                if not isinstance(entity, dict):
-                    entity = {}
-
-                source = str(entity.get("source", "unknown") or "unknown")
-                count = source_counts.get(source, 0)
-                if count >= max_per_source:
-                    continue
-
-                source_counts[source] = count + 1
-                hit = {
-                    "id": item_id,
-                    "distance": item.get("distance", 0) if hasattr(item, "get") else item.get("distance", 0),
-                    "entity": entity,
-                    "source": source,
-                    "chunks_url": str(entity.get("chunks", "") or ""),
-                    "chunk_id": entity.get("chunk_id"),
-                }
-                raw_hits.append(hit)
-                new_hits += 1
-
-        if new_hits == 0:
-            break
-        log.info(f"rag_search milvus: {len(raw_hits)} chunks from {len(source_counts)} sources")
-
-    log.info(f"rag_search: {len(raw_hits)} chunks from {len(source_counts)} sources, fetching chunk texts")
-    _push_status(ctx.deps, f"── RAG agent: loading chunk texts ({len(source_counts)} sources)")
-
-    unique_chunks_urls = set(h.get("chunks_url", "") for h in raw_hits if h.get("chunks_url"))
-    log.debug(f"rag_search: {len(unique_chunks_urls)} unique chunks URLs to fetch")
     chunk_texts = {}
-    for url in unique_chunks_urls:
-        try:
-            chunks_list = await _fetch_chunks_json(url, ctx.deps)
-            if chunks_list:
-                chunk_texts[url] = chunks_list
-                log.debug(f"rag_search: fetched {len(chunks_list)} chunks from {url}")
-            else:
-                log.debug(f"rag_search: empty/null chunks from {url}")
-        except Exception as e:
-            log.warning(f"rag_search: skipping chunks from {url}: {e}")
+    denied_datasets = set()
+    accessible_hits = []
+    target_chunks = limit * max_per_source
+    round_num = 0
 
-    try:
-        grouped_hits = _group_hits_by_source(raw_hits, chunk_texts)
-    except Exception as e:
-        log.error(f"rag_search: grouping failed, returning ungrouped hits: {e}")
-        grouped_hits = [
-            RagHit(
-                id=h.get("id", 0),
-                distance=h.get("distance", 0),
-                entity=VectorMeta(**(h.get("entity", {}) if isinstance(h.get("entity"), dict) else {})),
+    while True:
+        round_num += 1
+
+        # --- Milvus search phase ---
+        batch_hits = []
+        while len(batch_hits) < target_chunks:
+            filter_parts = []
+            filter_params = {}
+            filter_ids = list(seen_ids)
+            if filter_ids:
+                filter_parts.append("id not in {ids}")
+                filter_params["ids"] = filter_ids
+            if groups:
+                filter_parts.append("array_contains_any(groups, {group_filter})")
+                filter_params["group_filter"] = groups
+            filter_expr = " and ".join(filter_parts) if filter_parts else None
+            search_res = ctx.deps.milvus_client.search(
+                collection_name=ctx.deps.collection_name,
+                data=query_vectors,
+                search_params={"metric_type": "COSINE", "params": {"level": 1}},
+                limit=target_chunks,
+                filter_params=filter_params if filter_params else None,
+                filter=filter_expr,
+                output_fields=output_fields,
+                consistency_level="Bounded",
             )
-            for h in raw_hits[:limit]
-        ]
-    grouped_hits = grouped_hits[:limit]
+            new_hits = 0
+            for result_per_vector in search_res:
+                for item in result_per_vector:
+                    item_id = item.get("id") if hasattr(item, "get") else item["id"]
+                    if item_id in seen_ids:
+                        continue
+                    seen_ids.add(item_id)
 
-    for h in grouped_hits:
-        n_texts = len(h.texts) if h.texts else 0
-        preview = h.texts[0][:150] if h.texts else "NO TEXT"
+                    entity = item.get("entity", {}) if hasattr(item, "get") else item.get("entity", {})
+                    if not isinstance(entity, dict):
+                        entity = {}
+
+                    dataset_id = entity.get("dataset_id", "")
+                    if dataset_id in denied_datasets:
+                        continue
+
+                    source = str(entity.get("source", "unknown") or "unknown")
+                    count = source_counts.get(source, 0)
+                    if count >= max_per_source:
+                        continue
+
+                    source_counts[source] = count + 1
+                    hit = {
+                        "id": item_id,
+                        "distance": item.get("distance", 0) if hasattr(item, "get") else item.get("distance", 0),
+                        "entity": entity,
+                        "source": source,
+                        "dataset_id": dataset_id,
+                        "chunks_url": str(entity.get("chunks", "") or ""),
+                        "chunk_id": entity.get("chunk_id"),
+                    }
+                    raw_hits.append(hit)
+                    batch_hits.append(hit)
+                    new_hits += 1
+
+            if new_hits == 0:
+                break
+            log.info(f"rag_search milvus round {round_num}: {len(raw_hits)} chunks from {len(source_counts)} sources")
+
+        if not batch_hits:
+            log.info(f"rag_search: milvus exhausted after round {round_num}")
+            break
+
+        # --- Chunk fetch phase (only new URLs from non-denied datasets) ---
+        new_urls = set(h.get("chunks_url", "") for h in batch_hits if h.get("chunks_url")) - set(chunk_texts.keys())
+        _push_status(ctx.deps, f"── RAG agent: loading chunk texts ({len(new_urls)} sources, round {round_num})")
+        prev_denied = len(denied_datasets)
+        for url in new_urls:
+            dataset_id = next((h.get("dataset_id", "") for h in batch_hits if h.get("chunks_url") == url), "")
+            if dataset_id in denied_datasets:
+                continue
+            try:
+                chunks_list = await _fetch_chunks_json(url, ctx.deps)
+                if chunks_list:
+                    chunk_texts[url] = chunks_list
+                    log.debug(f"rag_search: fetched {len(chunks_list)} chunks from {url}")
+                else:
+                    log.debug(f"rag_search: empty/null chunks from {url}")
+                    if dataset_id:
+                        denied_datasets.add(dataset_id)
+                        log.info(f"rag_search: dataset {dataset_id} marked as denied (empty chunks)")
+            except Exception as e:
+                log.warning(f"rag_search: access denied or fetch failed for {url}: {e}")
+                if dataset_id:
+                    denied_datasets.add(dataset_id)
+                    log.info(f"rag_search: dataset {dataset_id} marked as denied")
+
+        # --- Remove raw_hits from denied datasets, then group and check ---
+        raw_hits = [h for h in raw_hits if h.get("dataset_id", "") not in denied_datasets]
+        try:
+            grouped_hits = _group_hits_by_source(raw_hits, chunk_texts)
+        except Exception as e:
+            log.error(f"rag_search: grouping failed: {e}")
+            grouped_hits = []
+
+        accessible_hits = [h for h in grouped_hits if h.texts][:limit]
+        new_denials = len(denied_datasets) - prev_denied
+
+        if len(accessible_hits) >= limit:
+            break
+        if new_denials == 0:
+            break
+        log.info(f"rag_search: {len(accessible_hits)}/{limit} accessible, "
+                 f"{new_denials} datasets denied, reloading")
+
+    if denied_datasets:
+        log.info(f"rag_search: {len(denied_datasets)} datasets filtered (access denied)")
+
+    for h in accessible_hits:
+        n_texts = len(h.texts)
+        preview = h.texts[0][:150]
         log.debug(f"rag_search result: source={h.entity.source}, title={h.entity.title}, "
                    f"distance={h.distance:.3f}, chunks={n_texts}, preview={preview!r}")
 
-    texts_loaded = sum(1 for h in grouped_hits if h.texts)
-    src_titles = [" ".join(str(h.entity.title or h.entity.source or "?").split()) for h in grouped_hits[:5]]
+    src_titles = [" ".join(str(h.entity.title or h.entity.source or "?").split()) for h in accessible_hits[:5]]
     src_info = " → " + ", ".join(src_titles) if src_titles else ""
-    if len(grouped_hits) > 5:
-        src_info += f" (+{len(grouped_hits) - 5} more)"
-    _push_status(ctx.deps, f"── RAG agent: {len(grouped_hits)} sources found ({texts_loaded} with text){src_info}")
-    log.info(f"rag_search completed: {len(grouped_hits)} source hits, {texts_loaded} with chunk texts")
-    return grouped_hits
+    if len(accessible_hits) > 5:
+        src_info += f" (+{len(accessible_hits) - 5} more)"
+    _push_status(ctx.deps, f"── RAG agent: {len(accessible_hits)} sources found{src_info}")
+    log.info(f"rag_search completed: {len(accessible_hits)} accessible hits after {round_num} rounds")
+    return accessible_hits
         
 
 
@@ -1607,7 +1643,8 @@ async def rag_search(
 @agent.tool
 @research_agent.tool
 async def literature_search(
-    ctx: RunContext[Deps], search_question: str, num_results: int = 5, max_searches: int = 1
+    ctx: RunContext[Deps], search_question: str, num_results: int = 5, max_searches: int = 1,
+    groups: Optional[List[str]] = None,
 ) -> list[str]:
     """Search literature via vector database (Milvus).
 
@@ -1616,23 +1653,30 @@ async def literature_search(
         search_question: Question rephrased for semantic matching
         num_results: Number of source documents to return (default 5)
         max_searches: Max number of rag_search calls the agent may perform (default 1, research_agent uses up to 4)
+        groups: Restrict results to documents in these CKAN groups (by group name). Defaults to None (no restriction).
 
     Returns:
         str: JSON with answer, citations, and search metadata
     """
     start_time = datetime.now(timezone.utc)
-    _push_status(ctx.deps, f"Literature search: \"{search_question}\"")
-    log.info(f"literature_search starting: query='{search_question}...', num_results={num_results}, max_searches={max_searches}")
+    groups_info = f", groups={groups}" if groups else ""
+    _push_status(ctx.deps, f"Literature search: \"{search_question}\"{groups_info}")
+    log.info(f"literature_search starting: query='{search_question}...', num_results={num_results}, max_searches={max_searches}, groups={groups}")
 
     for attempt in range(config.MAX_RETRIES_LITERATURE_SEARCH):
         try:
             if attempt > 0:
                 _push_status(ctx.deps, f"Literature search: retry (attempt {attempt+1})")
             log.debug(f"literature_search attempt {attempt+1}/{config.MAX_RETRIES_LITERATURE_SEARCH}")
+            groups_instruction = (
+                f" IMPORTANT: Restrict all rag_search calls to these CKAN groups by passing groups={groups}."
+                if groups else ""
+            )
             r = await asyncio.wait_for(
                 rag_agent.run(
                     f"Search for documents using this question: {search_question}. "
-                    f"Return {num_results} results. You may call rag_search up to {max_searches} times.",
+                    f"Return {num_results} results. You may call rag_search up to {max_searches} times."
+                    f"{groups_instruction}",
                     deps=ctx.deps,
                     usage_limits=UsageLimits(
                         request_limit=max_searches + 4,

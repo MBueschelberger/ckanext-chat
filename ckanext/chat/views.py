@@ -191,17 +191,18 @@ async def _agent_worker(prompt: str, history: str, user_id: str,
     deps = Deps(user_id=user_id, status_queue=status_queue, uploaded_file=uploaded_file)
     msg_history = _validate_history(history)
 
-    if mcp_available():
+    token = get_user_token(user_id)
+    if token:
+        deps.mcp_token = token
+    else:
+        log.warning("Token creation failed — RAG chunk loading and MCP will be unavailable")
+
+    if mcp_available() and deps.mcp_token:
         host = toolkit.config.get("ckan.devserver.host", "localhost")
         port = toolkit.config.get("ckan.devserver.port", "5000")
         mcp_url = f"http://{host}:{port}/mcp"
-        token = get_user_token(user_id)
-        if token:
-            deps.mcp_token = token
-            deps.mcp_url = mcp_url
-            log.info(f"MCP path enabled, url={mcp_url}")
-        else:
-            log.warning("MCP available but token creation failed, falling back to ckan_agent")
+        deps.mcp_url = mcp_url
+        log.info(f"MCP path enabled, url={mcp_url}")
 
     if deps.mcp_url:
         log.info("Using MCP execution path (JSON-RPC)")

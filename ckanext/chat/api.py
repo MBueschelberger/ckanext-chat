@@ -97,14 +97,15 @@ def _setup_agent_run(user_id: str, history_parts: list, research: bool):
 
     deps = Deps(user_id=user_id)
 
-    if mcp_available():
+    token = get_user_token(user_id)
+    if token:
+        deps.mcp_token = token
+
+    if mcp_available() and deps.mcp_token:
         host = toolkit.config.get("ckan.devserver.host", "localhost")
         port = toolkit.config.get("ckan.devserver.port", "5000")
         mcp_url = f"http://{host}:{port}/mcp"
-        token = get_user_token(user_id)
-        if token:
-            deps.mcp_token = token
-            deps.mcp_url = mcp_url
+        deps.mcp_url = mcp_url
 
     msg_history = None
     if history_parts:

@@ -338,6 +338,7 @@ class RagHit(BaseModel):
     id: int
     distance: Optional[float] = None
     entity: VectorMeta
+    texts: Optional[List[str]] = None
 
 
 class LitResult(BaseModel):
@@ -386,37 +387,38 @@ class CKANExploreResult(BaseModel):
 # --------------------- Updated RAG Agent Prompt ---------------------
 rag_prompt = (
     "You perform literature retrieval using vector search and return high-quality scientific citations.\n\n"
-    
+
     "PROCESS:\n"
     "Step 1: Formulate search query\n"
     "- Rephrase the user's question for better semantic matching\n"
     "- Extract key concepts and technical terms\n"
     "- Create 1-2 focused search queries\n\n"
-    
+
     "Step 2: Execute rag_search ONCE\n"
     "- Use limit parameter to control result count (default: 5 sources)\n"
-    "- rag_search returns RagHit objects with distance metrics\n"
+    "- rag_search returns RagHit objects ALREADY GROUPED BY SOURCE DOCUMENT\n"
+    "- Each RagHit contains: distance (best similarity), entity (metadata), texts (list of matched chunk texts)\n"
     "- Distance is cosine similarity: 1.0 = identical, 0.0 = unrelated. Higher = more relevant.\n\n"
-    
-    "Step 3: Aggregate and rank results\n"
-    "- Group RagHit objects by 'source' field\n"
-    "- Calculate average similarity per source\n"
-    "- Rank sources by: similarity + diversity\n"
-    "- Create one LitResult per unique source\n"
+
+    "Step 3: Analyze results using chunk texts\n"
+    "- Each RagHit.texts contains the actual text content of matched chunks from that source\n"
+    "- READ these texts to write an informed summary for each source\n"
+    "- Create one LitResult per RagHit (they are already grouped by source)\n"
+    "- Write the summary based on the actual chunk content, not just the title\n"
     "- Fill string_slices with start/end from RagHit.entity\n\n"
-    
+
     "Step 4: Quality check\n"
     "- Count distinct sources found\n"
     "- If < N distinct sources AND search was restrictive:\n"
     "  * Broaden the query (remove filters, add synonyms)\n"
     "  * Retry search ONCE with modified query\n"
     "- Maximum 2 search attempts total\n\n"
-    
+
     "Step 5: Format citations\n"
     "- Each source: [Author/Title](source_url)\n"
-    "- Add relevance summary (2-3 sentences)\n"
+    "- Add relevance summary (2-3 sentences) based on the chunk texts\n"
     "- Include similarity score if available\n\n"
-    
+
     "IMPORTANT:\n"
     "- Respect the max rag_search call limit given in your task (default: 2)\n"
     "- Quality over quantity - 3-5 highly relevant sources better than 10 mediocre ones\n"
@@ -1381,63 +1383,172 @@ async def get_embedding(chunks: List[str], model: str, api_url, vector_dim: int)
         raise RuntimeError(f"Embedding service error {response.status_code}: {response.text}")
 
 
+async def _fetch_chunks_json(chunks_url: str, deps) -> Optional[List[str]]:
+    """Fetch a .chunks JSON file from CKAN and return the list of chunk strings."""
+    if not chunks_url:
+        return None
+    ssl_verify = toolkit.config.get("ckanext.chat.ssl_verify", True)
+    ckan_url = toolkit.config.get("ckan.site_url", "")
+    try:
+        resource_id = extract_resource_uuid(chunks_url)
+        if ckan_url and ckan_url in chunks_url and resource_id:
+            storage_path = toolkit.config.get("ckan.storage_path", "/var/lib/ckan/default")
+            file_path = os.path.join(
+                storage_path, "resources",
+                resource_id[:3], resource_id[3:6], resource_id[6:],
+            )
+            async with aiofiles.open(file_path, "r") as f:
+                return json.loads(await f.read())
+        else:
+            headers = {}
+            if deps.mcp_token:
+                headers["Authorization"] = deps.mcp_token
+            async with aiohttp.ClientSession() as session:
+                async with session.get(chunks_url, headers=headers, ssl=ssl_verify) as resp:
+                    resp.raise_for_status()
+                    return await resp.json()
+    except Exception as e:
+        log.warning(f"_fetch_chunks_json failed for {chunks_url}: {e}")
+        return None
+
+
+def _group_hits_by_source(hits: list, chunk_texts: dict) -> List[RagHit]:
+    """Group chunk-level hits by source document. Returns one RagHit per source."""
+    source_groups = {}
+    for hit_data in hits:
+        source = str(hit_data["source"]) if hit_data.get("source") else "unknown"
+        if source not in source_groups:
+            source_groups[source] = {
+                "best_hit": hit_data,
+                "best_distance": hit_data.get("distance", 0),
+                "chunk_ids": [],
+            }
+        group = source_groups[source]
+        if (hit_data.get("distance") or 0) > group["best_distance"]:
+            group["best_hit"] = hit_data
+            group["best_distance"] = hit_data.get("distance", 0)
+        chunk_id = hit_data.get("chunk_id")
+        if chunk_id is not None:
+            group["chunk_ids"].append(chunk_id)
+
+    result = []
+    for source, group in source_groups.items():
+        best = group["best_hit"]
+        entity_fields = {k: best.get(k) for k in VectorMeta.__fields__.keys() if k in best}
+        if "entity" in best and isinstance(best["entity"], dict):
+            entity_fields = best["entity"]
+        elif "entity" in best and isinstance(best["entity"], VectorMeta):
+            entity_fields = best["entity"].model_dump()
+
+        texts = []
+        chunks_url = best.get("chunks_url", "")
+        if chunks_url and chunks_url in chunk_texts:
+            chunks_list = chunk_texts[chunks_url]
+            for cid in sorted(set(group["chunk_ids"])):
+                if 0 <= cid < len(chunks_list):
+                    texts.append(chunks_list[cid])
+
+        rag_hit = RagHit(
+            id=best.get("id", 0),
+            distance=group["best_distance"],
+            entity=VectorMeta(**entity_fields) if isinstance(entity_fields, dict) else entity_fields,
+            texts=texts if texts else None,
+        )
+        result.append(rag_hit)
+
+    result.sort(key=lambda h: h.distance or 0, reverse=True)
+    return result
+
+
 @rag_agent.tool
 async def rag_search(
-    ctx: RunContext[Deps], search_query: List[str], limit: int = 3
+    ctx: RunContext[Deps], search_query: List[str], limit: int = 3, max_per_source: int = 3
 ) -> List[RagHit]:
-    """Vector rag serach using Milvus vector store
+    """Vector rag search using Milvus vector store. Returns one RagHit per source document with chunk texts.
 
     Args:
-        ctx (RunContext[Deps]): Instance of Agent dependencys at runtime, passed in by agent framework by default
-        search_query (List[str]): A list of strings or which to do the vector search with.
-        limit (int, optional): Limit for amount of Hits to be returned for the serach. Defaults to 3.
+        ctx (RunContext[Deps]): Instance of Agent dependencies at runtime, passed in by agent framework by default
+        search_query (List[str]): A list of strings for which to do the vector search with.
+        limit (int, optional): Limit for amount of source documents to be returned. Defaults to 3.
+        max_per_source (int, optional): Max chunks per source document. Defaults to 3.
 
     Returns:
-        List[RagHit]: List of RagHit instances as a result of rag search. the object provided a distance attribute with the metrics of similarity and an entity attribute containing the meta data of the vector entity in store.
+        List[RagHit]: List of RagHit instances grouped by source document, each with texts from matched chunks.
     """
     if not ctx.deps.milvus_client or not ctx.deps.embeddings:
         return "The Milvus Client was not setup properly, no rag_search supported in the moment."
-    else:
-        _push_status(ctx.deps, f"── RAG agent: vector search ({len(search_query)} queries, limit={limit})")
-        log.info(f"rag_search starting: queries={len(search_query)} limit={limit}")
-        _push_status(ctx.deps, "── RAG agent: generating embeddings")
-        query_vectors = await get_embedding(
-            search_query,
-            model=ctx.deps.embedding_model,
-            api_url=ctx.deps.embeddings,
-            vector_dim=ctx.deps.vector_dim,
+
+    _push_status(ctx.deps, f"── RAG agent: vector search ({len(search_query)} queries, limit={limit})")
+    log.info(f"rag_search starting: queries={len(search_query)} limit={limit} max_per_source={max_per_source}")
+    _push_status(ctx.deps, "── RAG agent: generating embeddings")
+    query_vectors = await get_embedding(
+        search_query,
+        model=ctx.deps.embedding_model,
+        api_url=ctx.deps.embeddings,
+        vector_dim=ctx.deps.vector_dim,
+    )
+    log.info(f"rag_search embedding done, starting milvus search")
+    _push_status(ctx.deps, "── RAG agent: searching vector database")
+
+    output_fields = list(VectorMeta.__fields__.keys()) + ["chunk_id", "chunks"]
+    raw_hits = []
+    seen_ids = set()
+    source_counts = {}
+    target_chunks = limit * max_per_source
+
+    while len(raw_hits) < target_chunks:
+        filter_ids = list(seen_ids)
+        search_res = ctx.deps.milvus_client.search(
+            collection_name=ctx.deps.collection_name,
+            data=query_vectors,
+            search_params={"metric_type": "COSINE", "params": {"level": 1}},
+            limit=target_chunks,
+            filter_params={"ids": filter_ids} if filter_ids else None,
+            filter="id not in {ids}" if filter_ids else None,
+            output_fields=output_fields,
+            consistency_level="Bounded",
         )
-        log.info(f"rag_search embedding done, starting milvus search")
-        _push_status(ctx.deps, "── RAG agent: searching vector database")
-        hits = []
-        seen_ids = set()
-        while len(hits) < limit:
-            filter_ids = list(seen_ids)
-            search_res = ctx.deps.milvus_client.search(
-                collection_name=ctx.deps.collection_name,
-                data=query_vectors,
-                search_params={"metric_type": "COSINE", "params": {"level": 1}},
-                limit=limit,
-                filter_params={"ids": filter_ids} if filter_ids else None,
-                filter="id not in {ids}" if filter_ids else None,
-                output_fields=list(VectorMeta.__fields__.keys()),
-                consistency_level="Bounded",
-            )
-            new_hits = 0
-            for result_per_vector in search_res:
-                for item in result_per_vector:
-                    rag_hit = RagHit(**item)
-                    if rag_hit.id not in seen_ids:
-                        seen_ids.add(rag_hit.id)
-                        hits.append(rag_hit)
-                        new_hits += 1
-            if new_hits == 0:
-                break
-            log.info(f"rag_search milvus: {len(hits)}/{limit} unique hits")
-        hits = hits[:limit]
-        _push_status(ctx.deps, f"── RAG agent: {len(hits)} hits found")
-        log.info(f"rag_search completed: {len(hits)} hits")
-        return hits
+        new_hits = 0
+        for result_per_vector in search_res:
+            for item in result_per_vector:
+                item_id = item.get("id")
+                if item_id in seen_ids:
+                    continue
+                seen_ids.add(item_id)
+
+                source = str(item.get("entity", {}).get("source") or item.get("source", "unknown"))
+                count = source_counts.get(source, 0)
+                if count >= max_per_source:
+                    continue
+
+                source_counts[source] = count + 1
+                item["source"] = source
+                item["chunks_url"] = item.get("entity", {}).get("chunks") or item.get("chunks", "")
+                item["chunk_id"] = item.get("entity", {}).get("chunk_id") if isinstance(item.get("entity"), dict) else item.get("chunk_id")
+                raw_hits.append(item)
+                new_hits += 1
+
+        if new_hits == 0:
+            break
+        log.info(f"rag_search milvus: {len(raw_hits)} chunks from {len(source_counts)} sources")
+
+    log.info(f"rag_search: {len(raw_hits)} chunks from {len(source_counts)} sources, fetching chunk texts")
+    _push_status(ctx.deps, f"── RAG agent: loading chunk texts ({len(source_counts)} sources)")
+
+    unique_chunks_urls = set(h.get("chunks_url", "") for h in raw_hits if h.get("chunks_url"))
+    chunk_texts = {}
+    for url in unique_chunks_urls:
+        chunks_list = await _fetch_chunks_json(url, ctx.deps)
+        if chunks_list:
+            chunk_texts[url] = chunks_list
+
+    grouped_hits = _group_hits_by_source(raw_hits, chunk_texts)
+    grouped_hits = grouped_hits[:limit]
+
+    texts_loaded = sum(1 for h in grouped_hits if h.texts)
+    _push_status(ctx.deps, f"── RAG agent: {len(grouped_hits)} sources found ({texts_loaded} with text)")
+    log.info(f"rag_search completed: {len(grouped_hits)} source hits, {texts_loaded} with chunk texts")
+    return grouped_hits
         
 
 

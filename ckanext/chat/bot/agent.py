@@ -531,16 +531,14 @@ front_agent_prompt = (
     "QUICK SEARCH (for information/knowledge queries):\n"
     "When the user asks a question that seeks information or knowledge, execute these steps:\n\n"
 
-    "Step 1 — GATHER (run in parallel):\n"
-    "- Call literature_search with the user's question rephrased for semantic matching\n"
-    "- Call ckan_explore with a task description derived from the user's question\n\n"
+    "Step 1 — SEARCH:\n"
+    "- Call literature_search with the user's question rephrased for semantic matching\n\n"
 
     "Step 2 — VERIFY:\n"
     "- literature_search results include summaries based on actual document content (chunk texts), not just titles.\n"
     "- Read each summary carefully and check: does the content actually address the user's question?\n"
     "- If the summary clearly covers the topic → report as 'directly relevant' finding.\n"
     "- If the summary is about a related but different topic → report as 'thematically related'.\n"
-    "- Do NOT dismiss results just because CKAN search found 0 hits — literature_search searches different data.\n"
     "- Only call literature_analyse if you need deeper analysis beyond what the summary provides.\n"
     "- PARALLEL EXECUTION: When you need to analyse multiple documents, call ALL literature_analyse\n"
     "  invocations in a SINGLE tool-call turn so they run concurrently.\n\n"
@@ -549,7 +547,7 @@ front_agent_prompt = (
     "- Clearly separate confirmed results from uncertain/thematic matches in your answer.\n"
     "- Only state what is supported by the actual data returned from tools.\n\n"
 
-    "Keep it fast — max ~5-6 tool calls total.\n\n"
+    "Keep it fast — max ~3-4 tool calls total.\n\n"
 
     "EXCEPTION — QUICK SEARCH does NOT apply to:\n"
     "- Create/update/upload/patch operations → use DOCUMENT UPLOAD WORKFLOW or direct ckan_run\n"
@@ -557,7 +555,6 @@ front_agent_prompt = (
     "- Pure administrative queries (list orgs, show user) → use ckan_run directly\n\n"
 
     "CKAN TOOLS:\n"
-    "- ckan_explore(task): For open-ended dataset discovery — delegates to the autonomous ckan_agent\n"
     "- ckan_run(action, params): For direct single CKAN actions (show, create, patch, list orgs, etc.)\n"
     "You CAN create organizations, datasets, resources, and update/patch them.\n"
     "Only delete and purge operations are blocked.\n\n"
@@ -992,7 +989,6 @@ async def ckan_run(ctx: RunContext[Deps], command: str, parameters: dict={}) -> 
         return json.dumps({"status": "fail", "action_name": command, "result": f"{type(e).__name__}: {str(e)}", "comment": "Action failed"})
 
 
-@agent.tool
 @research_agent.tool
 async def ckan_explore(ctx: RunContext[Deps], task: str, max_searches: int = 6) -> str:
     """Delegate a CKAN research task to the autonomous ckan_agent.

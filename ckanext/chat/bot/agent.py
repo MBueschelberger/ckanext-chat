@@ -1607,7 +1607,7 @@ async def rag_search(
 @agent.tool
 @research_agent.tool
 async def literature_search(
-    ctx: RunContext[Deps], search_question: str, num_results: int = 5, max_searches: int = 2
+    ctx: RunContext[Deps], search_question: str, num_results: int = 5, max_searches: int = 1
 ) -> list[str]:
     """Search literature via vector database (Milvus).
 
@@ -1615,7 +1615,7 @@ async def literature_search(
         ctx: Runtime context
         search_question: Question rephrased for semantic matching
         num_results: Number of source documents to return (default 5)
-        max_searches: Max number of rag_search calls the agent may perform (default 2, research_agent can use up to 4)
+        max_searches: Max number of rag_search calls the agent may perform (default 1, research_agent uses up to 4)
 
     Returns:
         str: JSON with answer, citations, and search metadata

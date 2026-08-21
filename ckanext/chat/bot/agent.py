@@ -331,6 +331,7 @@ class VectorMeta(BaseModel):
     resource_id: Optional[str] = None
     source: Optional[HttpUrl] = None
     #view_url: Optional[list[HttpUrl]] = None
+    title: Optional[str] = None
 
 
 class RagHit(BaseModel):
@@ -395,7 +396,7 @@ rag_prompt = (
     "Step 2: Execute rag_search ONCE\n"
     "- Use limit parameter to control result count (default: 5 sources)\n"
     "- rag_search returns RagHit objects with distance metrics\n"
-    "- Closer distance = higher similarity (0.0 = perfect match)\n\n"
+    "- Distance is cosine similarity: 1.0 = identical, 0.0 = unrelated. Higher = more relevant.\n\n"
     
     "Step 3: Aggregate and rank results\n"
     "- Group RagHit objects by 'source' field\n"

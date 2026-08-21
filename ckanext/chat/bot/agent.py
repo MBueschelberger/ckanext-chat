@@ -1007,7 +1007,7 @@ async def ckan_explore(ctx: RunContext[Deps], task: str, max_searches: int = 6) 
     """
     import time as _time
     t0 = _time.monotonic()
-    _push_status(ctx.deps, f"CKAN exploration: {task[:60]}...")
+    _push_status(ctx.deps, f"CKAN exploration: {task}")
     log.info(f"ckan_explore starting: task='{task[:100]}', max_searches={max_searches}")
 
     try:
@@ -1031,7 +1031,7 @@ async def ckan_explore(ctx: RunContext[Deps], task: str, max_searches: int = 6) 
         ds_info = ""
         if r.output.datasets_found:
             site_url = (toolkit.config.get("ckan.site_url") or "").rstrip("/")
-            ds_links = [f"{' '.join(str(d.title or d.name).split())[:80]} ({site_url}/dataset/{d.name})" for d in r.output.datasets_found[:5]]
+            ds_links = [f"{' '.join(str(d.title or d.name).split())} ({site_url}/dataset/{d.name})" for d in r.output.datasets_found[:5]]
             ds_info = " → " + ", ".join(ds_links)
             if len(r.output.datasets_found) > 5:
                 ds_info += f" (+{len(r.output.datasets_found) - 5} more)"
@@ -1488,8 +1488,10 @@ async def rag_search(
     if not ctx.deps.milvus_client or not ctx.deps.embeddings:
         return "The Milvus Client was not setup properly, no rag_search supported in the moment."
 
-    _push_status(ctx.deps, f"── RAG agent: vector search ({len(search_query)} queries, limit={limit})")
+    queries_preview = " | ".join(search_query)
+    _push_status(ctx.deps, f"── RAG agent: vector search ({len(search_query)} queries, limit={limit}): {queries_preview}")
     log.info(f"rag_search starting: queries={len(search_query)} limit={limit} max_per_source={max_per_source}")
+    log.info(f"rag_search queries: {search_query}")
     _push_status(ctx.deps, "── RAG agent: generating embeddings")
     query_vectors = await get_embedding(
         search_query,
@@ -1589,7 +1591,7 @@ async def rag_search(
                    f"distance={h.distance:.3f}, chunks={n_texts}, preview={preview!r}")
 
     texts_loaded = sum(1 for h in grouped_hits if h.texts)
-    src_titles = [" ".join(str(h.entity.title or h.entity.source or "?").split())[:80] for h in grouped_hits[:5]]
+    src_titles = [" ".join(str(h.entity.title or h.entity.source or "?").split()) for h in grouped_hits[:5]]
     src_info = " → " + ", ".join(src_titles) if src_titles else ""
     if len(grouped_hits) > 5:
         src_info += f" (+{len(grouped_hits) - 5} more)"
@@ -1619,7 +1621,7 @@ async def literature_search(
         str: JSON with answer, citations, and search metadata
     """
     start_time = datetime.now(timezone.utc)
-    _push_status(ctx.deps, f"Literature search: \"{search_question[:50]}\"")
+    _push_status(ctx.deps, f"Literature search: \"{search_question}\"")
     log.info(f"literature_search starting: query='{search_question}...', num_results={num_results}, max_searches={max_searches}")
 
     for attempt in range(config.MAX_RETRIES_LITERATURE_SEARCH):
@@ -1644,7 +1646,7 @@ async def literature_search(
             usage = r.usage()
             duration_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
             results = r.output.results or []
-            src_titles = [" ".join(str(lr.title or lr.source or "?").split())[:80] for lr in results[:5]]
+            src_titles = [" ".join(str(lr.title or lr.source or "?").split()) for lr in results[:5]]
             src_info = " → " + ", ".join(src_titles) if src_titles else ""
             if len(results) > 5:
                 src_info += f" (+{len(results) - 5} more)"

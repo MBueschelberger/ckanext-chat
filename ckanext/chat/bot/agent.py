@@ -138,6 +138,7 @@ embedding_model = toolkit.config.get(
     "ckanext.chat.embedding_model", "text-embedding-3-small"
 )
 embedding_api = toolkit.config.get("ckanext.chat.embedding_api", "")
+ssl_verify = toolkit.asbool(toolkit.config.get("ckanext.chat.ssl_verify", True))
 
 vector_dim = None
 if milvus_url:
@@ -215,6 +216,7 @@ class Deps:
     status_queue: Optional[asyncio.Queue] = None
     uploaded_file: Optional[UploadedFile] = None
     orchestrator: str = "Front agent"
+    ssl_verify: bool = field(default_factory=lambda: ssl_verify)
 
 
 def _push_status(deps, message: str):
@@ -822,8 +824,7 @@ def normalize_parameters(params: dict) -> dict:
     return normalized
 
 
-async def _mcp_jsonrpc(url: str, token: str, method: str, params: dict = None) -> dict:
-    ssl_verify = toolkit.config.get("ckanext.chat.ssl_verify", True)
+async def _mcp_jsonrpc(url: str, token: str, method: str, params: dict = None, ssl_verify: bool = True) -> dict:
     async with aiohttp.ClientSession() as session:
         payload = {
             "jsonrpc": "2.0",
@@ -839,7 +840,7 @@ async def _mcp_jsonrpc(url: str, token: str, method: str, params: dict = None) -
             return data.get("result", {})
 
 
-async def _mcp_fetch_data(url: str, token: str, action: str, params: dict) -> Optional[dict]:
+async def _mcp_fetch_data(url: str, token: str, action: str, params: dict, ssl_verify: bool = True) -> Optional[dict]:
     """Fetch data via MCP JSON-RPC, mapping CKAN action to MCP tool+operation."""
     action_to_mcp = {
         "package_search": ("ckan_package", "search"),
@@ -870,7 +871,7 @@ async def _mcp_fetch_data(url: str, token: str, action: str, params: dict) -> Op
     tool_name, operation = mapping
     try:
         call_args = {**params, "operation": operation}
-        result = await _mcp_jsonrpc(url, token, "tools/call", {"name": tool_name, "arguments": call_args})
+        result = await _mcp_jsonrpc(url, token, "tools/call", {"name": tool_name, "arguments": call_args}, ssl_verify=ssl_verify)
         content = result.get("content", [])
         texts = [c.get("text", "") for c in content if c.get("type") == "text"]
         if texts:
@@ -893,6 +894,7 @@ async def _ckan_fetch_data(deps, action: str, params: dict):
     if deps.mcp_url and deps.mcp_token:
         response = await _mcp_fetch_data(
             deps.mcp_url, deps.mcp_token, action, params,
+            ssl_verify=deps.ssl_verify,
         )
         if response is not None:
             fetch_method = "mcp"
@@ -1209,9 +1211,8 @@ async def get_resource_file_contents(
             "Do not pass internal file IDs or UUIDs — only CKAN resource download URLs."
         )
 
-    # Read SSL verification from config if not explicitly provided
     if ssl_verify is None:
-        ssl_verify = toolkit.config.get("ckanext.chat.ssl_verify", True)
+        ssl_verify = toolkit.asbool(toolkit.config.get("ckanext.chat.ssl_verify", True))
 
     ckan_url = toolkit.config.get("ckan.site_url")
     try:
@@ -1370,7 +1371,7 @@ def exception_to_model_response(exc: Exception) -> ModelResponse:
     )
 
 
-async def get_embedding(chunks: List[str], model: str, api_url, vector_dim: int):
+async def get_embedding(chunks: List[str], model: str, api_url, vector_dim: int, ssl_verify: bool = True):
     if not isinstance(api_url, str):
         # must be OAI embeddings
         emb_r = await api_url.create(input=chunks, model=model, dimensions=vector_dim)
@@ -1380,7 +1381,7 @@ async def get_embedding(chunks: List[str], model: str, api_url, vector_dim: int)
     embedding_timeout = int(toolkit.config.get("ckanext.chat.embedding_timeout", 15))
     log.info(f"get_embedding requesting {api_url} model={model} chunks={len(chunks)} timeout={embedding_timeout}s")
     response = requests.post(
-        api_url, headers=headers, data=json.dumps(data), verify=False, timeout=embedding_timeout
+        api_url, headers=headers, data=json.dumps(data), verify=ssl_verify, timeout=embedding_timeout
     )
     log.info(f"get_embedding response status={response.status_code}")
 
@@ -1394,13 +1395,12 @@ async def _fetch_chunks_json(chunks_url: str, deps) -> Optional[List[str]]:
     """Fetch a .chunks JSON file from CKAN via HTTP. Auth is enforced by CKAN's download endpoint."""
     if not chunks_url:
         return None
-    ssl_verify = toolkit.config.get("ckanext.chat.ssl_verify", True)
     try:
         headers = {}
         if deps.mcp_token:
             headers["Authorization"] = deps.mcp_token
         async with aiohttp.ClientSession() as session:
-            async with session.get(chunks_url, headers=headers, ssl=ssl_verify) as resp:
+            async with session.get(chunks_url, headers=headers, ssl=deps.ssl_verify) as resp:
                 resp.raise_for_status()
                 raw = await resp.json()
 
@@ -1493,6 +1493,7 @@ async def rag_search(
         model=ctx.deps.embedding_model,
         api_url=ctx.deps.embeddings,
         vector_dim=ctx.deps.vector_dim,
+        ssl_verify=ctx.deps.ssl_verify,
     )
     log.info(f"rag_search embedding done, starting milvus search")
     _push_status(ctx.deps, "── RAG agent: searching vector database")
@@ -1742,14 +1743,13 @@ async def literature_analyse(ctx: RunContext[Deps], doc: TextResource, question:
         ctx: The runtime context with dependencies
         doc: TextResource with document URL
         question: Question to answer
-        ssl_verify: Whether to verify SSL certificates. Defaults to config value.
+        ssl_verify: Whether to verify SSL certificates. Defaults to deps value.
 
     Returns:
         JSON string with analysis results
     """
-    # Read SSL verification from config if not explicitly provided
     if ssl_verify is None:
-        ssl_verify = toolkit.config.get("ckanext.chat.ssl_verify", True)
+        ssl_verify = ctx.deps.ssl_verify
 
     doc_filename = str(doc.url).rsplit('/', 1)[-1] if doc.url else "unknown"
     _push_status(ctx.deps, f"Document analysis: {doc_filename}")

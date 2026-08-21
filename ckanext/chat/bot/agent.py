@@ -535,16 +535,15 @@ front_agent_prompt = (
     "- Call literature_search with the user's question rephrased for semantic matching\n"
     "- Call ckan_explore with a task description derived from the user's question\n\n"
 
-    "Step 2 — VERIFY (critical — avoid false claims):\n"
-    "- Literature search uses vector similarity, so results may be thematically related but NOT directly about the topic.\n"
-    "- Carefully check each result's title, summary, and metadata — does it EXPLICITLY mention the topic?\n"
-    "- Classify each result as 'directly relevant' or 'thematically related' and report this distinction to the user.\n"
-    "- If the relevance of 1-2 key sources is uncertain and they have PDF/Markdown resources,\n"
-    "  call literature_analyse on them to verify their actual content before claiming relevance.\n"
+    "Step 2 — VERIFY:\n"
+    "- literature_search results include summaries based on actual document content (chunk texts), not just titles.\n"
+    "- Read each summary carefully and check: does the content actually address the user's question?\n"
+    "- If the summary clearly covers the topic → report as 'directly relevant' finding.\n"
+    "- If the summary is about a related but different topic → report as 'thematically related'.\n"
+    "- Do NOT dismiss results just because CKAN search found 0 hits — literature_search searches different data.\n"
+    "- Only call literature_analyse if you need deeper analysis beyond what the summary provides.\n"
     "- PARALLEL EXECUTION: When you need to analyse multiple documents, call ALL literature_analyse\n"
-    "  invocations in a SINGLE tool-call turn so they run concurrently. Do NOT wait for one analysis\n"
-    "  to finish before starting the next — batch them together.\n"
-    "- Do NOT assume a document covers a specific topic just because it was returned by vector search.\n\n"
+    "  invocations in a SINGLE tool-call turn so they run concurrently.\n\n"
 
     "Step 3 — SYNTHESIZE:\n"
     "- Clearly separate confirmed results from uncertain/thematic matches in your answer.\n"
@@ -1560,12 +1559,16 @@ async def rag_search(
     _push_status(ctx.deps, f"── RAG agent: loading chunk texts ({len(source_counts)} sources)")
 
     unique_chunks_urls = set(h.get("chunks_url", "") for h in raw_hits if h.get("chunks_url"))
+    log.debug(f"rag_search: {len(unique_chunks_urls)} unique chunks URLs to fetch")
     chunk_texts = {}
     for url in unique_chunks_urls:
         try:
             chunks_list = await _fetch_chunks_json(url, ctx.deps)
             if chunks_list:
                 chunk_texts[url] = chunks_list
+                log.debug(f"rag_search: fetched {len(chunks_list)} chunks from {url}")
+            else:
+                log.debug(f"rag_search: empty/null chunks from {url}")
         except Exception as e:
             log.warning(f"rag_search: skipping chunks from {url}: {e}")
 
@@ -1582,6 +1585,12 @@ async def rag_search(
             for h in raw_hits[:limit]
         ]
     grouped_hits = grouped_hits[:limit]
+
+    for h in grouped_hits:
+        n_texts = len(h.texts) if h.texts else 0
+        preview = h.texts[0][:150] if h.texts else "NO TEXT"
+        log.debug(f"rag_search result: source={h.entity.source}, title={h.entity.title}, "
+                   f"distance={h.distance:.3f}, chunks={n_texts}, preview={preview!r}")
 
     texts_loaded = sum(1 for h in grouped_hits if h.texts)
     src_titles = [" ".join(str(h.entity.title or h.entity.source or "?").split())[:80] for h in grouped_hits[:5]]

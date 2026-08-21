@@ -38,7 +38,7 @@ front_agent / research_agent  (Orchestrator)
   │     └── ckan_action()      (generic: any CKAN action via merge_with_smart_defaults)
   ├── ckan_run(action, params) → direct bypass (merge_with_smart_defaults, all actions incl. _create/_patch)
   ├── literature_search(q)     → rag_agent (budget-controlled vector search via Milvus)
-  │     └── rag_search()       (Milvus vector search)
+  │     └── rag_search()       (Milvus vector search + chunk text loading)
   └── literature_analyse(doc)  → doc_agent (document analysis, only from orchestrator)
 ```
 
@@ -47,6 +47,21 @@ front_agent / research_agent  (Orchestrator)
 - `ckan_agent` — autonomous CKAN explorer with generic `ckan_action` tool → `CKANExploreResult`
 - `rag_agent` — vector search via Milvus, budget-controlled (max_searches param) → `LitSearchResult`
 - `doc_agent` — document analysis with fuzzy text extraction → `AnalyseResult`
+
+### RAG Search Pipeline (`rag_search`)
+
+`rag_search` returns `List[RagHit]` **grouped by source document** (not by chunk):
+
+1. Milvus vector search with `output_fields` including dynamic fields `chunk_id` and `chunks` (URL to `.chunks` JSON file)
+2. **Source diversity**: `max_per_source` parameter (default 3) caps chunks per document to ensure diverse results
+3. **Chunk text loading**: groups hits by `chunks` URL, fetches each unique `.chunks` file once (format: `{"chunks": ["text1", "text2", ...]}`), extracts texts by `chunk_id`
+4. **Grouping**: merges chunk-level hits into one `RagHit` per source with `texts: List[str]` containing all matched chunk texts
+
+Key models:
+- `VectorMeta` — Milvus entity metadata (id, start, end, source, title, dataset_id, resource_id)
+- `RagHit` — grouped result per source: `entity: VectorMeta`, `distance: float` (best), `texts: Optional[List[str]]` (chunk contents)
+
+Authentication: `Deps.mcp_token` (CKAN API token) is always created via `get_user_token()`, used both for MCP and for chunk file fetching. Set in `views.py` and `api.py` regardless of MCP availability.
 
 When `ckanext-mcp` is loaded, CKAN data access in `ckan_run` goes through MCP JSON-RPC instead of direct `toolkit.get_action()`.
 

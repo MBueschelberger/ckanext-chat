@@ -1036,7 +1036,7 @@ async def ckan_explore(ctx: RunContext[Deps], task: str, max_searches: int = 6) 
         ds_info = ""
         if r.output.datasets_found:
             site_url = (toolkit.config.get("ckan.site_url") or "").rstrip("/")
-            ds_links = [f"{d.title or d.name} ({site_url}/dataset/{d.name})" for d in r.output.datasets_found[:5]]
+            ds_links = [f"{' '.join(str(d.title or d.name).split())[:80]} ({site_url}/dataset/{d.name})" for d in r.output.datasets_found[:5]]
             ds_info = " → " + ", ".join(ds_links)
             if len(r.output.datasets_found) > 5:
                 ds_info += f" (+{len(r.output.datasets_found) - 5} more)"
@@ -1570,8 +1570,8 @@ async def rag_search(
     grouped_hits = grouped_hits[:limit]
 
     texts_loaded = sum(1 for h in grouped_hits if h.texts)
-    src_titles = [h.entity.title or h.entity.source or "?" for h in grouped_hits[:5]]
-    src_info = " → " + ", ".join(str(t) for t in src_titles) if src_titles else ""
+    src_titles = [" ".join(str(h.entity.title or h.entity.source or "?").split())[:80] for h in grouped_hits[:5]]
+    src_info = " → " + ", ".join(src_titles) if src_titles else ""
     if len(grouped_hits) > 5:
         src_info += f" (+{len(grouped_hits) - 5} more)"
     _push_status(ctx.deps, f"── RAG agent: {len(grouped_hits)} sources found ({texts_loaded} with text){src_info}")
@@ -1625,7 +1625,7 @@ async def literature_search(
             usage = r.usage()
             duration_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
             results = r.output.results or []
-            src_titles = [lr.title or str(lr.source or "?") for lr in results[:5]]
+            src_titles = [" ".join(str(lr.title or lr.source or "?").split())[:80] for lr in results[:5]]
             src_info = " → " + ", ".join(src_titles) if src_titles else ""
             if len(results) > 5:
                 src_info += f" (+{len(results) - 5} more)"

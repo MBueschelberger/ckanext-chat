@@ -1390,6 +1390,7 @@ async def _fetch_chunks_json(chunks_url: str, deps) -> Optional[List[str]]:
     ssl_verify = toolkit.config.get("ckanext.chat.ssl_verify", True)
     ckan_url = toolkit.config.get("ckan.site_url", "")
     try:
+        raw = None
         resource_id = extract_resource_uuid(chunks_url)
         if ckan_url and ckan_url in chunks_url and resource_id:
             storage_path = toolkit.config.get("ckan.storage_path", "/var/lib/ckan/default")
@@ -1398,7 +1399,7 @@ async def _fetch_chunks_json(chunks_url: str, deps) -> Optional[List[str]]:
                 resource_id[:3], resource_id[3:6], resource_id[6:],
             )
             async with aiofiles.open(file_path, "r") as f:
-                return json.loads(await f.read())
+                raw = json.loads(await f.read())
         else:
             headers = {}
             if deps.mcp_token:
@@ -1406,7 +1407,13 @@ async def _fetch_chunks_json(chunks_url: str, deps) -> Optional[List[str]]:
             async with aiohttp.ClientSession() as session:
                 async with session.get(chunks_url, headers=headers, ssl=ssl_verify) as resp:
                     resp.raise_for_status()
-                    return await resp.json()
+                    raw = await resp.json()
+
+        if isinstance(raw, dict):
+            return raw.get("chunks", [])
+        if isinstance(raw, list):
+            return raw
+        return None
     except Exception as e:
         log.warning(f"_fetch_chunks_json failed for {chunks_url}: {e}")
         return None
@@ -1511,21 +1518,30 @@ async def rag_search(
         new_hits = 0
         for result_per_vector in search_res:
             for item in result_per_vector:
-                item_id = item.get("id")
+                item_id = item.get("id") if hasattr(item, "get") else item["id"]
                 if item_id in seen_ids:
                     continue
                 seen_ids.add(item_id)
 
-                source = str(item.get("entity", {}).get("source") or item.get("source", "unknown"))
+                entity = item.get("entity", {}) if hasattr(item, "get") else item.get("entity", {})
+                if not isinstance(entity, dict):
+                    entity = {}
+
+                source = str(entity.get("source", "unknown") or "unknown")
                 count = source_counts.get(source, 0)
                 if count >= max_per_source:
                     continue
 
                 source_counts[source] = count + 1
-                item["source"] = source
-                item["chunks_url"] = item.get("entity", {}).get("chunks") or item.get("chunks", "")
-                item["chunk_id"] = item.get("entity", {}).get("chunk_id") if isinstance(item.get("entity"), dict) else item.get("chunk_id")
-                raw_hits.append(item)
+                hit = {
+                    "id": item_id,
+                    "distance": item.get("distance", 0) if hasattr(item, "get") else item.get("distance", 0),
+                    "entity": entity,
+                    "source": source,
+                    "chunks_url": str(entity.get("chunks", "") or ""),
+                    "chunk_id": entity.get("chunk_id"),
+                }
+                raw_hits.append(hit)
                 new_hits += 1
 
         if new_hits == 0:

@@ -1562,11 +1562,25 @@ async def rag_search(
     unique_chunks_urls = set(h.get("chunks_url", "") for h in raw_hits if h.get("chunks_url"))
     chunk_texts = {}
     for url in unique_chunks_urls:
-        chunks_list = await _fetch_chunks_json(url, ctx.deps)
-        if chunks_list:
-            chunk_texts[url] = chunks_list
+        try:
+            chunks_list = await _fetch_chunks_json(url, ctx.deps)
+            if chunks_list:
+                chunk_texts[url] = chunks_list
+        except Exception as e:
+            log.warning(f"rag_search: skipping chunks from {url}: {e}")
 
-    grouped_hits = _group_hits_by_source(raw_hits, chunk_texts)
+    try:
+        grouped_hits = _group_hits_by_source(raw_hits, chunk_texts)
+    except Exception as e:
+        log.error(f"rag_search: grouping failed, returning ungrouped hits: {e}")
+        grouped_hits = [
+            RagHit(
+                id=h.get("id", 0),
+                distance=h.get("distance", 0),
+                entity=VectorMeta(**(h.get("entity", {}) if isinstance(h.get("entity"), dict) else {})),
+            )
+            for h in raw_hits[:limit]
+        ]
     grouped_hits = grouped_hits[:limit]
 
     texts_loaded = sum(1 for h in grouped_hits if h.texts)

@@ -1656,8 +1656,10 @@ async def literature_search(
             log.info(f"literature_search completed: attempt={attempt+1}, "
                     f"tokens=[request:{usage.request_tokens}, response:{usage.response_tokens}, total:{usage.total_tokens}], "
                     f"duration_ms={duration_ms:.0f}")
+            output_json = r.output.model_dump_json()
+            log.debug(f"literature_search rag_agent output: {output_json[:2000]}")
 
-            return r.output.model_dump_json()
+            return output_json
             
         except asyncio.TimeoutError:
             duration_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000

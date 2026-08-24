@@ -51,11 +51,16 @@ breadcrumb_content %}
           <div class="d-flex gap-2">
             <!-- Jinja2 block for upload file, search and reason toggle buttons -->
             {% block action_buttons %}
-            <!-- <input type="file" id="fileInput" class="d-none">
-                <a class="btn btn-outline-secondary" aria-label="File" id="fileInput" onclick="$('#fileInput').click()">
-                  <input type="file" id="fileInput" class="d-none">
-                  <i class="fa fa-plus"></i>
-                </a> -->
+            <input type="file" id="fileInput" class="d-none">
+            <a class="btn btn-outline-secondary" aria-label="{% trans %}Attach file{% endtrans %}" id="fileButton"
+               data-bs-toggle="tooltip" data-bs-placement="top"
+               title="{% trans %}Attach a file to upload{% endtrans %}">
+              <i class="fa fa-paperclip"></i>
+            </a>
+            <span id="fileBadge" class="d-none badge bg-info d-flex align-items-center gap-1 py-2" style="display:none!important">
+              <span id="fileName"></span>
+              <i class="fa fa-xmark" id="fileRemove" role="button" style="cursor:pointer"></i>
+            </span>
             <a
               class="btn btn-outline-info"
               aria-label="Regenerate"

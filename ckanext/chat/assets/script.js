@@ -131,7 +131,8 @@ ckan.module("chat-module", function ($, _) {
 
     // Called automatically when the module is instantiated
     initialize: function () {
-      this.abortController = null;
+      this.pendingFile = null;
+      this.activeStream = null;
       this.bindUI();
       this.loadPreviousChats();
       this.loadChat();
@@ -166,8 +167,25 @@ ckan.module("chat-module", function ($, _) {
       });
       $("#researchToggle").on("click", function () {
         const checkbox = $(this).find('input[type="checkbox"]');
-        checkbox.prop("checked", !checkbox.prop("checked")); // Toggle den Zustand der Checkbox
-        $(this).toggleClass("active", checkbox.prop("checked")); // Aktiviere den aktiven Stil, wenn die Checkbox wahr ist
+        checkbox.prop("checked", !checkbox.prop("checked"));
+        $(this).toggleClass("active", checkbox.prop("checked"));
+      });
+      this.el.find("#fileButton").on("click", function () {
+        self.el.find("#fileInput").trigger("click");
+      });
+      this.el.find("#fileInput").on("change", function () {
+        var file = this.files[0];
+        if (file) {
+          self.pendingFile = file;
+          self.el.find("#fileName").text(file.name);
+          self.el.find("#fileBadge").css("display", "").removeClass("d-none").addClass("d-flex");
+        }
+      });
+      this.el.find("#fileRemove").on("click", function (e) {
+        e.stopPropagation();
+        self.pendingFile = null;
+        self.el.find("#fileInput").val("");
+        self.el.find("#fileBadge").removeClass("d-flex").addClass("d-none").css("display", "none");
       });
       // Since the sidebar is rendered outside the module container, bind using a global selector
       $("#chatList").on("click", "li", function () {
@@ -301,7 +319,21 @@ ckan.module("chat-module", function ($, _) {
               { left: '\\[', right: '\\]', display: true }
           ],
           throwOnError: false
-      });
+        });
+        var sendButton = this.el.find("#sendButton");
+        var abortButton = this.el.find("#abortButton");
+        if (this.activeStream && this.activeStream.chatLabel === chat.title) {
+          sendButton.addClass("d-none");
+          abortButton.removeClass("d-none");
+          messagesDiv.append(this.activeStream.statusEl);
+          this.activeStream.statusEl[0].scrollIntoView({ behavior: "smooth", block: "start" });
+        } else {
+          sendButton.removeClass("d-none");
+          abortButton.addClass("d-none");
+          sendButton.find(".spinner-border").addClass("d-none");
+          sendButton.find(".button-text").removeClass("d-none");
+          sendButton.find(".fa-paper-plane").removeClass("d-none");
+        }
       }
     },
 
@@ -533,9 +565,10 @@ ckan.module("chat-module", function ($, _) {
     },
 
     abortStream: function () {
-      if (this.abortController) {
-        this.abortController.abort();
-        this.abortController = null;
+      if (this.activeStream) {
+        this.activeStream.abortController.abort();
+        if (this.activeStream.statusEl) this.activeStream.statusEl.remove();
+        this.activeStream = null;
       }
     },
 
@@ -543,14 +576,19 @@ ckan.module("chat-module", function ($, _) {
     sendMessage: function () {
       var self = this;
       var text = this.el.find("#userInput").val();
+      var file = this.pendingFile;
+      this.pendingFile = null;
+      this.el.find("#fileInput").val("");
+      this.el.find("#fileBadge").removeClass("d-flex").addClass("d-none").css("display", "none");
       this.el.find("#userInput").val("");
       if (text.trim() !== "") {
+        var displayText = file ? text + "\n\n**Attachment:** " + file.name : text;
         const messageObject = {
           instructions: null,
           kind: "request",
           parts: [
             {
-              content: text,
+              content: displayText,
               part_kind: "user-prompt",
               timestamp: new Date().toUTCString(),
             },
@@ -585,7 +623,7 @@ ckan.module("chat-module", function ($, _) {
                 icon.removeClass("d-none");
                 sendButton.removeClass("d-none");
                 abortButton.addClass("d-none");
-              });
+              }, file);
             })
             .fail(function () {
               alert("An error occurred while processing your request.");
@@ -603,7 +641,7 @@ ckan.module("chat-module", function ($, _) {
             icon.removeClass("d-none");
             sendButton.removeClass("d-none");
             abortButton.addClass("d-none");
-          });
+          }, file);
         }
       }
     },
@@ -622,12 +660,18 @@ ckan.module("chat-module", function ($, _) {
     },
 
     // Send a request to the bot via SSE streaming and append its reply
-    sendBotMessage: function (text, label, callback) {
+    sendBotMessage: function (text, label, callback, file) {
       var history = this.getChatHistory(label);
       var research_check = $("#researchToggle")
         .find('input[type="checkbox"]')
         .prop("checked");
       var self = this;
+
+      if (self.activeStream) {
+        self.activeStream.abortController.abort();
+        if (self.activeStream.statusEl) self.activeStream.statusEl.remove();
+        self.activeStream = null;
+      }
 
       var chatbox = self.el.find("#chatbox");
       var statusEl = $(
@@ -644,19 +688,31 @@ ckan.module("chat-module", function ($, _) {
       chatbox.append(statusEl);
       statusEl[0].scrollIntoView({ behavior: "smooth", block: "start" });
 
-      self.abortController = new AbortController();
+      var abortController = new AbortController();
+      self.activeStream = { chatLabel: label, abortController: abortController, statusEl: statusEl };
 
-      var params = new URLSearchParams();
-      params.append("text", text);
-      params.append("history", JSON.stringify(history));
-      params.append("research", research_check);
+      var body, fetchHeaders;
+      if (file) {
+        body = new FormData();
+        body.append("text", text);
+        body.append("history", JSON.stringify(history));
+        body.append("research", research_check);
+        body.append("upload", file);
+        fetchHeaders = {};
+      } else {
+        body = new URLSearchParams();
+        body.append("text", text);
+        body.append("history", JSON.stringify(history));
+        body.append("research", research_check);
+        fetchHeaders = { "Content-Type": "application/x-www-form-urlencoded" };
+      }
 
       fetch("/chat/ask/stream", {
         method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: params,
+        headers: fetchHeaders,
+        body: body,
         credentials: "same-origin",
-        signal: self.abortController.signal,
+        signal: abortController.signal,
       })
         .then(function (response) {
           if (!response.ok) {
@@ -672,7 +728,9 @@ ckan.module("chat-module", function ($, _) {
               .then(function (result) {
                 if (result.done) {
                   statusEl.remove();
-                  self.abortController = null;
+                  if (self.activeStream && self.activeStream.abortController === abortController) {
+                    self.activeStream = null;
+                  }
                   if (callback) callback();
                   return;
                 }
@@ -717,9 +775,14 @@ ckan.module("chat-module", function ($, _) {
                   } else if (eventType === "done" && dataStr) {
                     try {
                       statusEl.remove();
+                      if (self.activeStream && self.activeStream.abortController === abortController) {
+                        self.activeStream = null;
+                      }
                       var data = JSON.parse(dataStr);
                       var chatindex = self.saveChat(data.response, label);
-                      self.loadChat(chatindex);
+                      if (self.currentChatLabel === label) {
+                        self.loadChat(chatindex);
+                      }
                     } catch (e) {
                       console.error("Response parse error:", e);
                     }
@@ -730,7 +793,9 @@ ckan.module("chat-module", function ($, _) {
               })
               .catch(function (err) {
                 statusEl.remove();
-                self.abortController = null;
+                if (self.activeStream && self.activeStream.abortController === abortController) {
+                  self.activeStream = null;
+                }
                 if (err.name === "AbortError") {
                   console.log("Stream aborted by user");
                 } else {
@@ -745,7 +810,9 @@ ckan.module("chat-module", function ($, _) {
         })
         .catch(function (err) {
           statusEl.remove();
-          self.abortController = null;
+          if (self.activeStream && self.activeStream.abortController === abortController) {
+            self.activeStream = null;
+          }
           if (err.name === "AbortError") {
             console.log("Stream aborted by user");
           } else {

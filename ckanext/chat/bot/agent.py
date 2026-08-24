@@ -217,6 +217,7 @@ class Deps:
     uploaded_file: Optional[UploadedFile] = None
     orchestrator: str = "Front agent"
     ssl_verify: bool = field(default_factory=lambda: ssl_verify)
+    seen_chunk_ids: set = field(default_factory=set)
 
 
 def _push_status(deps, message: str):
@@ -1500,7 +1501,7 @@ async def rag_search(
 
     output_fields = list(VectorMeta.__fields__.keys()) + ["chunk_id", "chunks"]
     raw_hits = []
-    seen_ids = set()
+    seen_ids = set(ctx.deps.seen_chunk_ids)
     source_counts = {}
     chunk_texts = {}
     denied_datasets = set()
@@ -1633,7 +1634,9 @@ async def rag_search(
     if len(accessible_hits) > 5:
         src_info += f" (+{len(accessible_hits) - 5} more)"
     _push_status(ctx.deps, f"── RAG agent: {len(accessible_hits)} sources found{src_info}")
-    log.info(f"rag_search completed: {len(accessible_hits)} accessible hits after {round_num} rounds")
+    ctx.deps.seen_chunk_ids.update(seen_ids)
+    log.info(f"rag_search completed: {len(accessible_hits)} accessible hits after {round_num} rounds, "
+             f"seen_chunk_ids total={len(ctx.deps.seen_chunk_ids)}")
     return accessible_hits
         
 

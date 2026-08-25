@@ -9,7 +9,9 @@ from typing import Any
 import ckan.lib.api_token as api_token
 import ckan.lib.base as base
 import ckan.lib.helpers as core_helpers
+import ckan.model as CKANmodel
 import ckan.plugins.toolkit as toolkit
+import requests as http_requests
 from ckan.common import _, current_user
 from flask import Blueprint, Response, current_app, jsonify, request, stream_with_context
 from flask.views import MethodView
@@ -76,8 +78,34 @@ MAX_MESSAGE_CONTENT_LENGTH = 50000
 VALID_MESSAGE_KINDS = {"request", "response"}
 
 
+def _try_keycloak_auth(access_token: str):
+    """Validate a Keycloak access_token via the userinfo endpoint. Returns CKAN user_id or None."""
+    userinfo_url = toolkit.config.get("ckanext.chat.sso_userinfo_url", "")
+    if not userinfo_url:
+        return None
+    try:
+        resp = http_requests.get(
+            userinfo_url,
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=5,
+        )
+        if resp.status_code != 200:
+            return None
+        userinfo = resp.json()
+        email = userinfo.get("email")
+        if not email:
+            return None
+        users = CKANmodel.User.by_email(email)
+        if users:
+            return users[0].id
+        return None
+    except Exception as e:
+        logger.warning(f"Keycloak auth failed: {e}")
+        return None
+
+
 def _authenticate_request():
-    """Authenticate via API token header or CKAN session. Returns (user_id, error_response)."""
+    """Authenticate via API token header, Keycloak token, or CKAN session. Returns (user_id, error_response)."""
     auth_header = request.headers.get("Authorization", "")
     if auth_header:
         token = auth_header.removeprefix("Bearer ").strip()
@@ -85,6 +113,9 @@ def _authenticate_request():
             user = api_token.get_user_from_token(token)
             if user:
                 return user.id, None
+            user_id = _try_keycloak_auth(token)
+            if user_id:
+                return user_id, None
         return None, (jsonify({"success": False, "msg": "Invalid API token"}), 401)
 
     tkuser = toolkit.current_user

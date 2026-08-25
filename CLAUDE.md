@@ -131,14 +131,24 @@ The `/chat/v1/chat/completions` endpoint (SSE streaming mode) emits inline statu
 
 ## Authentication
 
-Both `/chat/ask` and `/chat/ask/stream` support dual authentication:
+All endpoints support three authentication methods (checked in order):
 
-1. **API token**: `Authorization: Bearer <CKAN_API_TOKEN>` header (validated via `ckan.lib.api_token`)
-2. **CKAN session**: standard session cookie (existing browser login)
+1. **CKAN API token**: `Authorization: Bearer <CKAN_API_TOKEN>` header (validated via `ckan.lib.api_token`)
+2. **Keycloak SSO token**: `Authorization: Bearer <KEYCLOAK_ACCESS_TOKEN>` — validated server-to-server via Keycloak's userinfo endpoint, matched to CKAN user by email. Requires `ckanext.chat.sso_userinfo_url` in ckan.ini.
+3. **CKAN session**: standard session cookie (existing browser login, `/chat/ask` and `/chat/ask/stream` only)
 
-Token auth is checked first; session auth is the fallback. Implemented in `_authenticate_request()` in `views.py`.
+Implemented in `_authenticate_request()` (`views.py`) and `_authenticate()` (`api.py`). Keycloak validation logic is in `_try_keycloak_auth()` (`views.py`), shared by both.
 
-The `/chat/v1/chat/completions` endpoint (`api.py`) uses its own `_authenticate()` with token auth only.
+### SSO Configuration
+
+Set `ckanext.chat.sso_userinfo_url` in ckan.ini to the Keycloak userinfo endpoint to enable SSO token auth:
+```ini
+ckanext.chat.sso_userinfo_url = https://sso.example.com/realms/your_realm/protocol/openid-connect/userinfo
+```
+
+### Open WebUI SSO Integration
+
+When Open WebUI and CKAN share the same Keycloak realm, users need no manual CKAN API token. The pipe (`iwm_rag_streaming.py`) receives `__oauth_token__` from Open WebUI's OAuth session and forwards the Keycloak `access_token` as the Bearer token. CKAN validates it via the userinfo endpoint, resolves the CKAN user, and `get_user_token()` creates a temporary CKAN API token for MCP/chunk access as usual. Manual `CKAN_TOKEN` in UserValves takes precedence when set.
 
 ## File Upload (resource_create / resource_patch)
 

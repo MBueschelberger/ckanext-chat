@@ -9,6 +9,8 @@ from typing import Any
 import ckan.lib.api_token as api_token
 import ckan.plugins.toolkit as toolkit
 from flask import Blueprint, Response, jsonify, request, stream_with_context
+
+from ckanext.chat.views import _try_keycloak_auth
 from loguru import logger
 from pydantic_ai.messages import ModelMessagesTypeAdapter
 from pydantic_ai.usage import UsageLimits
@@ -39,10 +41,17 @@ def _authenticate():
         return None, _error_response("Invalid Authorization header", 401, "invalid_api_key")
 
     user = api_token.get_user_from_token(token)
-    if not user:
-        return None, _error_response("Invalid API token", 401, "invalid_api_key")
+    if user:
+        return user, None
 
-    return user, None
+    user_id = _try_keycloak_auth(token)
+    if user_id:
+        import ckan.model as CKANmodel
+        user = CKANmodel.User.get(user_id)
+        if user:
+            return user, None
+
+    return None, _error_response("Invalid API token", 401, "invalid_api_key")
 
 
 def _error_response(message: str, status: int = 400, error_type: str = "invalid_request_error", param: str = None):

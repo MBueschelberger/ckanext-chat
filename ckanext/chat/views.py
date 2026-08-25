@@ -95,9 +95,9 @@ def _try_keycloak_auth(access_token: str):
         email = userinfo.get("email")
         if not email:
             return None
-        users = CKANmodel.User.by_email(email)
-        if users:
-            return users[0].id
+        user = CKANmodel.User.by_email(email)
+        if user:
+            return user.id
         return None
     except Exception as e:
         logger.warning(f"Keycloak auth failed: {e}")

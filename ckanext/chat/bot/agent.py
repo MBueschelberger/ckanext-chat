@@ -499,6 +499,16 @@ front_agent_prompt = (
     "- Only ask ONE question if BOTH organization AND visibility are missing. Never ask more than one question total.\n"
     "- After execution, report what was done (dataset URL, resource URL, key metadata used).\n\n"
 
+    "CONVERSATION CONTEXT (CRITICAL — check BEFORE any search):\n"
+    "- Before calling literature_search or package_search, check if the user refers to a dataset, document, or resource "
+    "already mentioned in the conversation history (including YOUR previous answers).\n"
+    "- If a dataset URL contains a dataset ID (e.g. '.../dataset/536cc45f-...'), extract the ID and use "
+    "ckan_run('package_show', {'id': 'DATASET_ID'}) directly — do NOT search.\n"
+    "- If a resource download URL was mentioned, use literature_analyse or get_resource_file_contents directly.\n"
+    "- References like 'the second dataset', 'the one by Author X', 'that report about Y' refer to items from your "
+    "previous answers — resolve them from context, do not search.\n"
+    "- NEVER search broadly when you already have the specific ID or URL from the conversation.\n\n"
+
     "UPLOADED FILE HANDLING (CRITICAL):\n"
     "- When the user uploads a document, its text content is ALREADY in your context as document chunks.\n"
     "- Extract title, authors, description, and tags directly from these chunks — no tool calls needed for metadata extraction.\n"
@@ -535,6 +545,18 @@ front_agent_prompt = (
     "QUICK SEARCH (for information/knowledge queries):\n"
     "When the user asks a question that seeks information or knowledge, execute these steps:\n\n"
 
+    "Step 0 — CHECK CONVERSATION CONTEXT (MANDATORY before any search):\n"
+    "- Scan your previous messages for dataset URLs, dataset IDs, resource URLs, or document titles "
+    "that match what the user is asking about.\n"
+    "- The user may refer to previous results by author, title, year, position ('the second one'), "
+    "or paraphrase ('that report about X').\n"
+    "- If you find a match:\n"
+    "  * To summarize/analyze a known document → use ckan_run('package_show', {'id': DATASET_ID}) to get "
+    "resource URLs, then call literature_analyse on the relevant resource. Do NOT call literature_search.\n"
+    "  * To show details about a known dataset → use ckan_run('package_show', {'id': DATASET_ID}) directly.\n"
+    "  * Skip to Step 2 or 3 as appropriate.\n"
+    "- Only proceed to Step 1 if no matching dataset/resource was found in the conversation.\n\n"
+
     "Step 1 — SEARCH:\n"
     "- Call literature_search with the user's question rephrased for semantic matching\n\n"
 
@@ -556,6 +578,9 @@ front_agent_prompt = (
     "EXCEPTION — QUICK SEARCH does NOT apply to:\n"
     "- Create/update/upload/patch operations → use DOCUMENT UPLOAD WORKFLOW or direct ckan_run\n"
     "- Requests to show a specific known dataset/resource → use ckan_run('package_show'/'resource_show') directly\n"
+    "- Requests to summarize/analyze a document already mentioned in the conversation → use package_show + literature_analyse directly\n"
+    "- Follow-up questions about a previously mentioned dataset ('tell me more about...', 'summarize...', 'what about the material in...') "
+    "→ resolve from conversation context, use package_show + literature_analyse\n"
     "- Pure administrative queries (list orgs, show user) → use ckan_run directly\n\n"
 
     "CKAN TOOLS:\n"
@@ -598,12 +623,23 @@ research_agent_prompt = (
     "You conduct deep research by systematically exploring ALL available data sources — literature, CKAN packages, groups, and tags — then synthesize findings.\n"
     "Answer in the same language as the user.\n\n"
 
+    "CONVERSATION CONTEXT (CRITICAL — check BEFORE any search):\n"
+    "- Before searching, check if the user refers to a dataset, document, or resource "
+    "already mentioned in the conversation history (including YOUR previous answers).\n"
+    "- If a dataset URL contains a dataset ID (e.g. '.../dataset/536cc45f-...'), extract the ID and use "
+    "ckan_run('package_show', {'id': 'DATASET_ID'}) directly — do NOT search.\n"
+    "- If a resource download URL was mentioned, use literature_analyse or get_resource_file_contents directly.\n"
+    "- References like 'the second dataset', 'the one by Author X', 'that report about Y' refer to items from your "
+    "previous answers — resolve them from context, do not search.\n"
+    "- NEVER search broadly when you already have the specific ID or URL from the conversation.\n\n"
+
     "RESEARCH PROCESS (5 Phases):\n\n"
 
     "Phase 1: ANALYZE (no tools)\n"
     "- Break down the question into 2-3 key aspects\n"
     "- Formulate 1-2 testable hypotheses\n"
     "- Identify core concepts and technical terms\n"
+    "- Check conversation history for already-mentioned dataset IDs, URLs, or resources\n"
     "- Plan search strategy across all data sources\n\n"
 
     "Phase 2: LITERATURE SEARCH (Milvus vector DB)\n"
@@ -727,10 +763,18 @@ ckan_agent_prompt = (
     "- Do NOT read document contents — just find and describe datasets\n"
 )
 
+_custom_system_prompt = (toolkit.config.get("ckanext.chat.system_prompt", "") or "").strip()
+_front_agent_instructions = front_agent_prompt
+if _custom_system_prompt:
+    _front_agent_instructions += (
+        "DEPLOYMENT SPECIFIC INSTRUCTIONS:\n"
+        f"{_custom_system_prompt}\n\n"
+    )
+
 agent = Agent(
     model=model,
     deps_type=Deps,
-    instructions="".join(front_agent_prompt),
+    instructions="".join(_front_agent_instructions),
     retries=3,
 )
 

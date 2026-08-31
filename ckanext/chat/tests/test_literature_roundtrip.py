@@ -36,7 +36,6 @@ from test_chat_roundtrip import ChatRoundtripTest, _get_or_create_token
 TEST_PREFIX = "lit-roundtrip-test"
 UNIQUE_SUFFIX = uuid.uuid4().hex[:8]
 ORG_NAME = f"{TEST_PREFIX}-org-{UNIQUE_SUFFIX}"
-DATASET_NAME = f"{TEST_PREFIX}-ds-{UNIQUE_SUFFIX}"
 GROUP_NAME = f"{TEST_PREFIX}-grp-{UNIQUE_SUFFIX}"
 
 # ---------------------------------------------------------------------------
@@ -239,13 +238,16 @@ plant bereits eine Folgestudie mit der NordicBerry X2 für 2026.
 DOCUMENTS = [
     ("heidelbeer_ernte_suedschwarzwald_2024.md",
      "Feldstudie Heidelbeerernte Südschwarzwald 2024",
-     DOC_SUEDSCHWARZWALD),
+     DOC_SUEDSCHWARZWALD,
+     f"{TEST_PREFIX}-schwarzwald-{UNIQUE_SUFFIX}"),
     ("heidelbeer_ernte_suedschweden_2025.md",
      "Pilotprojekt Heidelbeerernte Südschweden 2025",
-     DOC_SUEDSCHWEDEN),
+     DOC_SUEDSCHWEDEN,
+     f"{TEST_PREFIX}-schweden-{UNIQUE_SUFFIX}"),
     ("heidelbeer_maschinentechnik_vergleich.md",
      "Technischer Vergleich Heidelbeer-Erntemaschinen",
-     DOC_VERGLEICH),
+     DOC_VERGLEICH,
+     f"{TEST_PREFIX}-vergleich-{UNIQUE_SUFFIX}"),
 ]
 
 
@@ -308,11 +310,11 @@ class LiteratureRoundtripTest(ChatRoundtripTest):
 
     # -- test steps ------------------------------------------------------------
 
-    def step_1_create_org_and_dataset(self):
-        """Ask the agent to create an organization and dataset."""
-        print("\n[Step 1] Create organization and dataset")
+    def step_1_create_org(self):
+        """Ask the agent to create an organization."""
+        print("\n[Step 1] Create organization")
 
-        reply = self._chat(
+        self._chat(
             f"Create a new CKAN organization with name '{ORG_NAME}' "
             f"and title 'Literature Roundtrip Test Org'. "
             f"Tell me the organization id when done."
@@ -322,27 +324,10 @@ class LiteratureRoundtripTest(ChatRoundtripTest):
         if not result.get("success"):
             self._check("org exists", False,
                         f"API error: {result.get('error', {}).get('message', 'unknown')}")
-            return None, None
+            return None
         org_id = result["result"]["id"]
         self._check("org exists", result["result"]["name"] == ORG_NAME)
-
-        reply = self._chat(
-            f"Create a dataset with name '{DATASET_NAME}', "
-            f"title 'Heidelbeer-Erntemaschinen Studien', "
-            f"notes 'Sammlung von Studien zur maschinellen Heidelbeerernte', "
-            f"in the organization with id '{org_id}'. "
-            f"Tell me the dataset id when done."
-        )
-
-        result = self._ckan_get("package_show", {"id": DATASET_NAME})
-        if not result.get("success"):
-            self._check("dataset exists", False,
-                        f"API error: {result.get('error', {}).get('message', 'unknown')}")
-            return org_id, None
-        pkg_id = result["result"]["id"]
-        self._check("dataset exists", result["result"]["name"] == DATASET_NAME)
-
-        return org_id, pkg_id
+        return org_id
 
     def step_1b_create_group(self):
         """Ask the agent to create a CKAN group."""
@@ -362,37 +347,51 @@ class LiteratureRoundtripTest(ChatRoundtripTest):
         self._check("group exists", result["result"]["name"] == GROUP_NAME)
         return True
 
-    def step_1c_assign_dataset_to_group(self, pkg_id):
-        """Ask the agent to add the dataset to the group."""
-        print("\n[Step 1c] Assign dataset to group")
+    def step_1c_create_datasets_in_group(self, org_id):
+        """Create one dataset per document, each assigned to the group."""
+        print("\n[Step 1c] Create datasets and assign to group")
 
-        self._chat(
-            f"Add the dataset '{DATASET_NAME}' to the group '{GROUP_NAME}'. "
-            f"Confirm when done."
-        )
+        pkg_ids = {}
+        for filename, title, content, ds_name in DOCUMENTS:
+            self._chat(
+                f"Create a dataset with name '{ds_name}', "
+                f"title '{title}', "
+                f"notes 'Test document for literature roundtrip', "
+                f"in the organization with id '{org_id}', "
+                f"and add it to the group '{GROUP_NAME}'. "
+                f"Tell me the dataset id when done."
+            )
+
+            result = self._ckan_get("package_show", {"id": ds_name})
+            if not result.get("success"):
+                self._check(f"dataset {ds_name} exists", False,
+                            f"API error: {result.get('error', {}).get('message', 'unknown')}")
+                return None
+            pkg_ids[ds_name] = result["result"]["id"]
+            self._check(f"dataset {ds_name} exists",
+                        result["result"]["name"] == ds_name)
 
         result = self._ckan_get("group_show",
                                 {"id": GROUP_NAME, "include_datasets": True})
-        if not result.get("success"):
-            self._check("dataset in group", False, "could not fetch group")
-            return False
+        if result.get("success"):
+            grp_pkg_names = [p["name"] if isinstance(p, dict) else p
+                             for p in result["result"].get("packages", [])]
+            expected_names = [ds_name for _, _, _, ds_name in DOCUMENTS]
+            assigned = all(n in grp_pkg_names for n in expected_names)
+            self._check("all datasets assigned to group", assigned,
+                        f"expected {expected_names}, got {grp_pkg_names}")
 
-        pkg_ids = [p["id"] if isinstance(p, dict) else p
-                   for p in result["result"].get("packages", [])]
-        pkg_names = [p["name"] if isinstance(p, dict) else p
-                     for p in result["result"].get("packages", [])]
-        ds_in_group = pkg_id in pkg_ids or DATASET_NAME in pkg_names
-        self._check("dataset assigned to group", ds_in_group,
-                    f"group packages: {pkg_names}")
-        return ds_in_group
+        return pkg_ids
 
-    def step_2_upload_documents(self, pkg_id):
-        """Upload 3 markdown documents via chat file-upload endpoint."""
-        print("\n[Step 2] Upload 3 markdown documents")
+    def step_2_upload_documents(self, pkg_ids):
+        """Upload each markdown document to its own dataset."""
+        print("\n[Step 2] Upload markdown documents (one per dataset)")
 
-        for filename, title, content in DOCUMENTS:
+        all_ok = True
+        for filename, title, content, ds_name in DOCUMENTS:
+            pid = pkg_ids[ds_name]
             self._chat_upload(
-                f"Upload the attached file as a new resource to dataset '{pkg_id}'. "
+                f"Upload the attached file as a new resource to dataset '{pid}'. "
                 f"Resource name: '{filename}', format: 'markdown', "
                 f"description: '{title}'. Tell me the resource id when done.",
                 file_bytes=content.encode("utf-8"),
@@ -400,56 +399,66 @@ class LiteratureRoundtripTest(ChatRoundtripTest):
                 content_type="text/markdown",
             )
 
-        result = self._ckan_get("package_show", {"id": pkg_id})
-        if result.get("success"):
-            resources = result["result"].get("resources", [])
-            md_count = sum(
-                1 for r in resources
-                if r.get("format", "").lower() in ("markdown", "md")
-            )
-            self._check("3 markdown resources uploaded", md_count >= 3,
-                        f"found {md_count} markdown resources out of {len(resources)} total")
-            return md_count >= 3
+            result = self._ckan_get("package_show", {"id": pid})
+            if result.get("success"):
+                resources = result["result"].get("resources", [])
+                md_count = sum(
+                    1 for r in resources
+                    if r.get("format", "").lower() in ("markdown", "md")
+                )
+                ok = md_count >= 1
+                self._check(f"resource uploaded to {ds_name}", ok,
+                            f"{md_count} markdown resources in {len(resources)} total")
+                if not ok:
+                    all_ok = False
+            else:
+                self._check(f"resource uploaded to {ds_name}", False,
+                            "could not fetch dataset")
+                all_ok = False
 
-        self._check("3 markdown resources uploaded", False, "could not fetch dataset")
-        return False
+        return all_ok
 
-    def step_3_wait_for_embeddings(self, pkg_id):
-        """Poll until aiembeddings has produced .chunks + .embedding resources."""
+    def step_3_wait_for_embeddings(self, pkg_ids):
+        """Poll until aiembeddings has produced .chunks + .embedding resources for all datasets."""
         print("\n[Step 3] Waiting for embedding pipeline...")
 
         max_attempts = 24
         poll_interval = 15
-        expected_total = 9  # 3 md + 3 chunks + 3 embeddings
+        expected_per_dataset = 3  # 1 md + 1 chunks + 1 embedding
 
         for attempt in range(1, max_attempts + 1):
-            result = self._ckan_get("package_show", {"id": pkg_id})
-            if result.get("success"):
-                resources = result["result"].get("resources", [])
-                total = len(resources)
-                if self.verbose:
-                    formats = {}
-                    for r in resources:
-                        fmt = r.get("format", "?").lower()
-                        formats[fmt] = formats.get(fmt, 0) + 1
-                    print(f"  Poll {attempt}/{max_attempts}: "
-                          f"{total} resources — {formats}")
+            all_ready = True
+            for ds_name, pid in pkg_ids.items():
+                result = self._ckan_get("package_show", {"id": pid})
+                if result.get("success"):
+                    total = len(result["result"].get("resources", []))
+                    if self.verbose:
+                        formats = {}
+                        for r in result["result"].get("resources", []):
+                            fmt = r.get("format", "?").lower()
+                            formats[fmt] = formats.get(fmt, 0) + 1
+                        print(f"  Poll {attempt}/{max_attempts} [{ds_name}]: "
+                              f"{total} resources — {formats}")
+                    if total < expected_per_dataset:
+                        all_ready = False
+                else:
+                    all_ready = False
 
-                if total >= expected_total:
-                    self._check("embedding pipeline complete", True,
-                                f"{total} resources")
-                    return True
+            if all_ready:
+                self._check("embedding pipeline complete", True,
+                            f"all {len(pkg_ids)} datasets ready")
+                return True
 
             time.sleep(poll_interval)
 
-        result = self._ckan_get("package_show", {"id": pkg_id})
-        total = 0
-        if result.get("success"):
-            total = len(result["result"].get("resources", []))
-        self._check("embedding pipeline complete", total >= expected_total,
-                    f"only {total}/{expected_total} resources after "
-                    f"{max_attempts * poll_interval}s")
-        return total >= expected_total
+        for ds_name, pid in pkg_ids.items():
+            result = self._ckan_get("package_show", {"id": pid})
+            total = len(result["result"].get("resources", [])) if result.get("success") else 0
+            self._check(f"embeddings for {ds_name}",
+                        total >= expected_per_dataset,
+                        f"{total}/{expected_per_dataset} resources")
+
+        return False
 
     def step_4_literature_search(self):
         """Search for the uploaded documents via literature_search."""
@@ -557,12 +566,13 @@ class LiteratureRoundtripTest(ChatRoundtripTest):
         """Remove test artifacts created by this run."""
         print("\n[Cleanup] Removing test artifacts...")
 
-        r = self._ckan_post("package_delete", {"id": DATASET_NAME})
-        if r.get("success"):
-            print(f"  Deleted dataset: {DATASET_NAME}")
-            self._ckan_post("dataset_purge", {"id": DATASET_NAME})
-        else:
-            print(f"  Dataset not found or already deleted: {DATASET_NAME}")
+        for _, _, _, ds_name in DOCUMENTS:
+            r = self._ckan_post("package_delete", {"id": ds_name})
+            if r.get("success"):
+                print(f"  Deleted dataset: {ds_name}")
+                self._ckan_post("dataset_purge", {"id": ds_name})
+            else:
+                print(f"  Dataset not found or already deleted: {ds_name}")
 
         r = self._ckan_post("group_delete", {"id": GROUP_NAME})
         if r.get("success"):
@@ -615,17 +625,18 @@ class LiteratureRoundtripTest(ChatRoundtripTest):
         print(f"{'=' * 60}")
         print("Literature Round-Trip Test")
         print(f"{'=' * 60}")
+        ds_names = [ds for _, _, _, ds in DOCUMENTS]
         print(f"  Endpoint:  {self.chat_url}")
         print(f"  Org:       {ORG_NAME}")
         print(f"  Group:     {GROUP_NAME}")
-        print(f"  Dataset:   {DATASET_NAME}")
+        print(f"  Datasets:  {', '.join(ds_names)}")
         print(f"  Documents: {len(DOCUMENTS)}")
         print(f"{'=' * 60}")
 
         try:
-            org_id, pkg_id = self.step_1_create_org_and_dataset()
-            if not org_id or not pkg_id:
-                print("\n  ABORT: org/dataset creation failed, cannot continue")
+            org_id = self.step_1_create_org()
+            if not org_id:
+                print("\n  ABORT: org creation failed, cannot continue")
                 return False
 
             group_ok = self.step_1b_create_group()
@@ -633,17 +644,17 @@ class LiteratureRoundtripTest(ChatRoundtripTest):
                 print("\n  ABORT: group creation failed, cannot continue")
                 return False
 
-            assigned = self.step_1c_assign_dataset_to_group(pkg_id)
-            if not assigned:
-                print("\n  ABORT: dataset-group assignment failed, cannot continue")
+            pkg_ids = self.step_1c_create_datasets_in_group(org_id)
+            if not pkg_ids:
+                print("\n  ABORT: dataset creation failed, cannot continue")
                 return False
 
-            uploaded = self.step_2_upload_documents(pkg_id)
+            uploaded = self.step_2_upload_documents(pkg_ids)
             if not uploaded:
                 print("\n  ABORT: document upload failed, cannot continue")
                 return False
 
-            embeddings_ready = self.step_3_wait_for_embeddings(pkg_id)
+            embeddings_ready = self.step_3_wait_for_embeddings(pkg_ids)
             if not embeddings_ready:
                 print("\n  ABORT: embedding pipeline did not finish, cannot continue")
                 return False

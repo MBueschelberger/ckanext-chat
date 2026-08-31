@@ -27,7 +27,7 @@ ckanext/chat/
 │   └── utils.py       # CKAN action helpers, URL routing, fuzzy search, response truncation
 ├── templates/         # Jinja2 templates
 ├── assets/            # JS/CSS
-└── tests/             # test_plugin.py (scaffold), test_chat_roundtrip.py (integration)
+└── tests/             # test_plugin.py (scaffold), test_chat_roundtrip.py, test_literature_roundtrip.py (integration)
 ```
 
 ## Agent Architecture (2-Level Model)
@@ -37,7 +37,7 @@ front_agent / research_agent  (Orchestrator)
   ├── ckan_explore(task)       → ckan_agent (autonomous multi-step CKAN exploration)
   │     └── ckan_action()      (generic: any CKAN action via merge_with_smart_defaults)
   ├── ckan_run(action, params) → direct bypass (merge_with_smart_defaults, all actions incl. _create/_patch)
-  ├── literature_search(q)     → rag_agent (budget-controlled vector search via Milvus)
+  ├── literature_search(q,groups) → rag_agent (budget-controlled vector search via Milvus, two-phase group filter)
   │     └── rag_search()       (Milvus vector search + chunk text loading)
   └── literature_analyse(doc)  → doc_agent (document analysis, only from orchestrator)
 ```
@@ -52,14 +52,25 @@ front_agent / research_agent  (Orchestrator)
 
 `rag_search` returns `List[RagHit]` **grouped by source document** (not by chunk):
 
-1. Milvus vector search with `output_fields` including dynamic fields `chunk_id` and `chunks` (URL to `.chunks` JSON file)
-2. **Source diversity**: `max_per_source` parameter (default 3) caps chunks per document to ensure diverse results
-3. **Chunk text loading**: groups hits by `chunks` URL, fetches each unique `.chunks` file once (format: `{"chunks": ["text1", "text2", ...]}`), extracts texts by `chunk_id`
-4. **Grouping**: merges chunk-level hits into one `RagHit` per source with `texts: List[str]` containing all matched chunk texts
+1. **Two-phase search**: if `groups` parameter is set, runs filtered (by CKAN group) + unfiltered Milvus search. Both phases always run — the group filter improves ranking but never causes false negatives. `seen_ids` prevents duplicate chunks across phases. Without `groups`, only the unfiltered phase runs.
+2. Milvus vector search with `output_fields` including dynamic fields `chunk_id` and `chunks` (URL to `.chunks` JSON file)
+3. **Source diversity**: `max_per_source` parameter (default 3) caps chunks per document to ensure diverse results
+4. **Chunk text loading**: groups hits by `chunks` URL, fetches each unique `.chunks` file once (format: `{"chunks": ["text1", "text2", ...]}`), extracts texts by `chunk_id`
+5. **Grouping**: merges chunk-level hits into one `RagHit` per source with `texts: List[str]` containing all matched chunk texts
+6. **Filter-priority ranking**: group-filtered sources rank first, then by cosine similarity within each tier (`filtered_sources` set tracked across phases)
 
 Key models:
-- `VectorMeta` — Milvus entity metadata (id, start, end, source, title, dataset_id, resource_id)
+- `VectorMeta` — Milvus entity metadata (id, start, end, source, title, dataset_id, resource_id, groups)
 - `RagHit` — grouped result per source: `entity: VectorMeta`, `distance: float` (best), `texts: Optional[List[str]]` (chunk contents)
+
+### Group-Aware Search Strategy
+
+The orchestrator agents (`front_agent`, `research_agent`) are instructed to:
+1. Call `group_list` before `literature_search` to discover available CKAN groups
+2. Pick the most relevant group for the query topic (or use the user-specified group)
+3. Pass `groups=['name']` to `literature_search` → `rag_agent` → `rag_search`
+
+The `rag_search` two-phase design ensures this never narrows results — it only boosts group-matching documents to the top. The RAG agent prompt enforces short, focused queries (3-8 words each, one concept per query) instead of keyword-stuffed long strings.
 
 Authentication: `Deps.mcp_token` (CKAN API token) is always created via `get_user_token()`, used both for MCP and for chunk file fetching. Set in `views.py` and `api.py` regardless of MCP availability.
 
@@ -89,6 +100,9 @@ pytest --ckan-ini=test.ini
 
 # Integration test (requires running CKAN instance)
 python ckanext/chat/tests/test_chat_roundtrip.py --url http://localhost:80 --token TOKEN --verbose
+
+# Literature round-trip test (RAG search + group filtering + document analysis)
+python ckanext/chat/tests/test_literature_roundtrip.py --url http://localhost:80 --token TOKEN --verbose
 
 # Lint (matches CI)
 flake8 . --count --select=E901,E999,F821,F822,F823 --show-source --statistics --exclude ckan

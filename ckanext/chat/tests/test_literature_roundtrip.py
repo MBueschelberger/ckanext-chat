@@ -37,6 +37,7 @@ TEST_PREFIX = "lit-roundtrip-test"
 UNIQUE_SUFFIX = uuid.uuid4().hex[:8]
 ORG_NAME = f"{TEST_PREFIX}-org-{UNIQUE_SUFFIX}"
 GROUP_NAME = f"{TEST_PREFIX}-grp-{UNIQUE_SUFFIX}"
+GROUP_TITLE = "Heidelbeerernte Studien"
 
 # ---------------------------------------------------------------------------
 # Dummy documents — blueberry harvesting machines in southern regions
@@ -512,7 +513,7 @@ class LiteratureRoundtripTest(ChatRoundtripTest):
         self._reset_history()
 
         reply = self._chat(
-            f"Suche in der Literatur in der Gruppe '{GROUP_NAME}' nach maschineller "
+            f"Suche in der Literatur in der Gruppe '{GROUP_TITLE}' nach maschineller "
             f"Heidelbeerernte. Welche Studien und Ergebnisse gibt es dazu?",
             timeout=300,
         )

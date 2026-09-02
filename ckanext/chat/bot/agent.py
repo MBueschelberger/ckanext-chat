@@ -1797,7 +1797,7 @@ async def find_relevant_groups(ctx: RunContext[Deps], query: str) -> str:
     reasoning = result.output.reasoning
     log.info(f"find_relevant_groups: query='{query[:80]}', selected={selected}, reasoning={reasoning[:120]}")
     selected_display = ", ".join(selected) if selected else "none"
-    _push_status(ctx.deps, f"Finding relevant groups: [{selected_display}] — {reasoning[:120]}")
+    _push_status(ctx.deps, f"Finding relevant groups: [{selected_display}] — {reasoning}")
     return json.dumps({"groups": selected, "reasoning": reasoning})
 
 

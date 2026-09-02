@@ -387,6 +387,10 @@ class CKANExploreResult(BaseModel):
     queries_tried: List[QueryAttempt]
     suggestions: Optional[str] = None
 
+class GroupSelectorResult(BaseModel):
+    groups: List[str]  # group name slugs
+    reasoning: str
+
 # --------------------- Updated RAG Agent Prompt ---------------------
 rag_prompt = (
     "You perform literature retrieval using vector search and return high-quality scientific citations.\n\n"
@@ -600,12 +604,11 @@ front_agent_prompt = (
     "- NEVER execute delete or purge operations\n\n"
 
     "literature_search: rephrase user query for semantic matching.\n"
-    "  GROUP-AWARE SEARCH (improves result quality by filtering thematically):\n"
-    "  - If the user explicitly mentions a CKAN group → call ckan_run('group_list', {all_fields: True}), match the group name, pass groups=['name']\n"
-    "  - If the user does NOT mention a group → call ckan_run('group_list', {all_fields: True}), pick the most relevant group based on the query topic, pass groups=['name']\n"
-    "  - The vector search runs BOTH filtered (by group) and unfiltered, merging results with group matches ranked first\n"
-    "  - This means passing a group never causes false negatives — it only improves ranking\n"
-    "  - If no groups exist or none seem relevant, omit the groups parameter\n"
+    "  GROUP-AWARE SEARCH: Before calling literature_search, call find_relevant_groups(query=<search topic>).\n"
+    "  - If the user explicitly names groups (by title or slug), pass that as the query so the sub-agent can resolve the correct slugs.\n"
+    "  - If the user names multiple groups, pass all returned slugs to literature_search.\n"
+    "  - If find_relevant_groups returns an empty list, call literature_search without the groups parameter.\n"
+    "  - Passing groups never causes false negatives — the search runs both filtered and unfiltered.\n"
     "literature_analyse: ONLY for analyzing existing CKAN resources with valid http(s) download URLs. Never for uploaded files.\n\n"
 
     "RESPONSE FORMAT:\n"
@@ -654,10 +657,10 @@ research_agent_prompt = (
     "Phase 2: LITERATURE SEARCH (Milvus vector DB)\n"
     "- Call literature_search with rephrased query for each key aspect/hypothesis\n"
     "- ALWAYS rephrase the user question for better semantic matching\n"
-    "- GROUP-AWARE SEARCH: Before the first literature_search, call ckan_run('group_list', {all_fields: True}) to discover available groups.\n"
-    "  Pick the most relevant group for each search query and pass groups=['name'].\n"
-    "  The vector search runs both filtered and unfiltered, so passing a group only improves ranking — no false negatives.\n"
-    "  If the user explicitly names a group, use that. If no groups exist or none fit, omit the parameter.\n"
+    "- GROUP-AWARE SEARCH: Before the first literature_search, call find_relevant_groups(query=<search topic>).\n"
+    "  Pass all returned group slugs to literature_search via groups=[...]. If the result is empty, omit the groups parameter.\n"
+    "  If the user explicitly names groups (by title or slug), include that in the query so the sub-agent resolves the correct slugs.\n"
+    "  Passing groups never causes false negatives — the search runs both filtered and unfiltered.\n"
     "- Use max_searches=4 to allow the rag_agent more search iterations\n"
     "- Target: 5-7 distinct high-quality sources\n"
     "- Maximum 3 literature_search calls\n\n"
@@ -818,6 +821,20 @@ doc_agent = Agent(
     output_type=AnalyseResult,
     instructions="".join(doc_prompt),
     retries=3,
+    model_settings=rag_model_settings,
+)
+
+group_selector_agent = Agent(
+    model=model,
+    output_type=GroupSelectorResult,
+    instructions=(
+        "You select CKAN groups that are most relevant to a given search topic. "
+        "Each group is listed with its name slug, title, and optional description. "
+        "Return 1-2 group name slugs (the 'name' field, not the title) that clearly match the topic. "
+        "Be conservative — only include groups that are genuinely relevant. "
+        "If only one group clearly fits, return just that one. "
+        "Return an empty list if no groups are clearly relevant."
+    ),
     model_settings=rag_model_settings,
 )
 
@@ -1722,6 +1739,66 @@ async def rag_search(
 
 
 
+
+
+@agent.tool
+async def find_relevant_groups(ctx: RunContext[Deps], query: str) -> str:
+    """Find CKAN groups most relevant to the given search topic.
+
+    Paginates group_list to retrieve all groups (name, title, description), then
+    uses a sub-agent to select the 1-2 best matching group name slugs.
+
+    Args:
+        ctx: Runtime context
+        query: The search topic or rephrased user question
+
+    Returns:
+        JSON with 'groups' (list of group name slugs) and 'reasoning'
+    """
+    _push_status(ctx.deps, "Finding relevant groups")
+    all_groups = []
+    limit = 25
+    offset = 0
+    while True:
+        try:
+            response, _ = await _ckan_fetch_data(ctx.deps, "group_list", {
+                "all_fields": True, "limit": limit, "offset": offset,
+            })
+        except Exception as e:
+            log.warning(f"find_relevant_groups: group_list failed at offset={offset}: {e}")
+            break
+        if not response or not isinstance(response, list):
+            break
+        for g in response:
+            if isinstance(g, dict):
+                all_groups.append({
+                    "name": g.get("name", ""),
+                    "title": g.get("title", ""),
+                    "description": (g.get("description") or "")[:200],
+                })
+        if len(response) < limit:
+            break
+        offset += limit
+
+    if not all_groups:
+        log.info("find_relevant_groups: no groups found")
+        _push_status(ctx.deps, "Finding relevant groups: no groups available")
+        return json.dumps({"groups": [], "reasoning": "No groups found"})
+
+    groups_text = "\n".join(
+        f"- name: {g['name']} | title: {g['title']}"
+        + (f" | {g['description']}" if g["description"] else "")
+        for g in all_groups
+    )
+    result = await group_selector_agent.run(
+        f"Search topic: {query}\n\nAvailable CKAN groups:\n{groups_text}"
+    )
+    selected = result.output.groups
+    reasoning = result.output.reasoning
+    log.info(f"find_relevant_groups: query='{query[:80]}', selected={selected}, reasoning={reasoning[:120]}")
+    selected_display = ", ".join(selected) if selected else "none"
+    _push_status(ctx.deps, f"Finding relevant groups: [{selected_display}] — {reasoning[:120]}")
+    return json.dumps({"groups": selected, "reasoning": reasoning})
 
 
 @agent.tool

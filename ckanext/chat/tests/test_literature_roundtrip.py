@@ -461,7 +461,11 @@ class LiteratureRoundtripTest(ChatRoundtripTest):
         return False
 
     def step_4_literature_search(self):
-        """Search for the uploaded documents via literature_search."""
+        """Search for the uploaded documents via literature_search.
+
+        Also checks that the agent used find_relevant_groups and selected
+        the test group automatically (group-aware search without explicit mention).
+        """
         print("\n[Step 4] Literature search via chat")
         self._reset_history()
 
@@ -471,6 +475,7 @@ class LiteratureRoundtripTest(ChatRoundtripTest):
             timeout=300,
         )
 
+        # Check content quality (clean reply)
         clean = re.sub(r"\[status\].*?\[/status\]", "", reply, flags=re.DOTALL).lower()
 
         found_heidelbeer = "heidelbeer" in clean
@@ -491,6 +496,14 @@ class LiteratureRoundtripTest(ChatRoundtripTest):
             found_machine or found_region,
             f"machine={'yes' if found_machine else 'no'}, "
             f"region={'yes' if found_region else 'no'}",
+        )
+
+        # Check that find_relevant_groups was called and picked the test group
+        found_group_selected = GROUP_NAME in reply
+        self._check(
+            "auto group selection used test group",
+            found_group_selected,
+            f"group '{GROUP_NAME}' {'found' if found_group_selected else 'not found'} in status output",
         )
 
     def step_4b_literature_search_with_group(self):

@@ -13,20 +13,21 @@ The chat UI renders responses with marked.js and highlight.js. All CKAN operatio
 ```
 User --> Chat UI (/chat)  --> front_agent / research_agent
                                   |
-              +-------------------+-------------------+
-              |                   |                   |
-         ckan_run /          literature_search   literature_analyse
-         mcp_call/mcp_tools       |                   |
-              |                rag_agent           doc_agent
-              v                   |                   |
-      CKAN actions or         Milvus vector       Document text
-      MCP JSON-RPC            store (RAG)         extraction
+              +-------------------+--------------------+-------------------+
+              |                   |                    |                   |
+         ckan_run /       find_relevant_groups   literature_search   literature_analyse
+         mcp_call/mcp_tools       |                    |                   |
+              |          group_selector_agent       rag_agent           doc_agent
+              v                   |                    |                   |
+      CKAN actions or     1-2 group slugs         Milvus vector       Document text
+      MCP JSON-RPC        (all groups paged)      store (RAG)         extraction
 ```
 
 **Agents:**
-- **front_agent** -- coordinates user requests, delegates to tools (max 3 tool calls)
-- **research_agent** -- deep multi-source research with literature search + analysis (max 10 tool calls)
-- **ckan_agent** -- validates and optimizes CKAN action calls (used as fallback when MCP unavailable)
+- **front_agent** -- coordinates user requests, delegates to tools (max ~5 tool calls)
+- **research_agent** -- deep multi-source research with literature search + analysis (max ~25 tool calls)
+- **ckan_agent** -- autonomous CKAN explorer for open-ended dataset discovery
+- **group_selector_agent** -- selects 1-2 relevant CKAN group slugs for a search topic; paginates `group_list` to cover all groups regardless of instance size
 - **rag_agent** -- vector search over Milvus for literature retrieval
 - **doc_agent** -- targeted document section extraction and analysis
 
@@ -239,7 +240,7 @@ Without these, the literature search agent relies on `package_search`.
 | `ckanext.chat.provider` | `azure` | `azure` or `openai` |
 | `ckanext.chat.base_url` | | Model provider endpoint URL |
 | `ckanext.chat.api_key` | | API key for the model provider |
-| `ckanext.chat.model_name` | `gpt-4o-mini` | Model for front_agent, ckan_agent, rag_agent, doc_agent |
+| `ckanext.chat.model_name` | `gpt-4o-mini` | Model for front_agent, ckan_agent, rag_agent, doc_agent, group_selector_agent |
 | `ckanext.chat.think_model_name` | | Model for research_agent (falls back to model_name) |
 | `ckanext.chat.api_version` | `2024-06-01` | Azure API version |
 | `ckanext.chat.milvus_url` | | Milvus vector store URL |

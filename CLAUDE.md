@@ -34,17 +34,19 @@ ckanext/chat/
 
 ```
 front_agent / research_agent  (Orchestrator)
-  ├── ckan_explore(task)       → ckan_agent (autonomous multi-step CKAN exploration)
-  │     └── ckan_action()      (generic: any CKAN action via merge_with_smart_defaults)
-  ├── ckan_run(action, params) → direct bypass (merge_with_smart_defaults, all actions incl. _create/_patch)
+  ├── ckan_explore(task)          → ckan_agent (autonomous multi-step CKAN exploration)
+  │     └── ckan_action()         (generic: any CKAN action via merge_with_smart_defaults)
+  ├── ckan_run(action, params)    → direct bypass (merge_with_smart_defaults, all actions incl. _create/_patch)
+  ├── find_relevant_groups(query) → group_selector_agent (paginates group_list, selects 1-2 relevant slugs)
   ├── literature_search(q,groups) → rag_agent (budget-controlled vector search via Milvus, two-phase group filter)
-  │     └── rag_search()       (Milvus vector search + chunk text loading)
-  └── literature_analyse(doc)  → doc_agent (document analysis, only from orchestrator)
+  │     └── rag_search()          (Milvus vector search + chunk text loading)
+  └── literature_analyse(doc)     → doc_agent (document analysis, only from orchestrator)
 ```
 
 - `front_agent` — quick coordinator, delegates to tools (max ~3-4 tool calls, quick search only)
 - `research_agent` — deep research mode (5-phase workflow, max ~25 tool calls, uses think_model)
 - `ckan_agent` — autonomous CKAN explorer with generic `ckan_action` tool → `CKANExploreResult`
+- `group_selector_agent` — selects 1-2 most relevant CKAN group slugs for a search topic → `GroupSelectorResult`
 - `rag_agent` — vector search via Milvus, budget-controlled (max_searches param) → `LitSearchResult`
 - `doc_agent` — document analysis with fuzzy text extraction → `AnalyseResult`
 
@@ -65,12 +67,16 @@ Key models:
 
 ### Group-Aware Search Strategy
 
-The orchestrator agents (`front_agent`, `research_agent`) are instructed to:
-1. Call `group_list` before `literature_search` to discover available CKAN groups
-2. Pick the most relevant group for the query topic (or use the user-specified group)
-3. Pass `groups=['name']` to `literature_search` → `rag_agent` → `rag_search`
+Before every `literature_search`, the orchestrator calls `find_relevant_groups(query)`:
 
-The `rag_search` two-phase design ensures this never narrows results — it only boosts group-matching documents to the top. The RAG agent prompt enforces short, focused queries (3-8 words each, one concept per query) instead of keyword-stuffed long strings.
+1. **Pagination**: calls `group_list all_fields=True` in pages of 25 until exhausted — retrieves all groups regardless of instance size
+2. **Field reduction**: extracts only `name`, `title`, `description[:200]` per group (keeps context small)
+3. **Sub-agent selection**: `group_selector_agent` picks 1-2 group slugs that clearly match the topic, or returns an empty list if none fit
+4. **Propagation**: selected slugs are passed as `groups=[...]` to `literature_search` → `rag_agent` → `rag_search`
+
+When the user explicitly names groups (by title or slug), the front agent passes that text as the query to `find_relevant_groups` so the sub-agent can resolve the correct slugs. Multiple user-named groups are all passed through.
+
+The `rag_search` two-phase design ensures group filtering never narrows results — it only boosts group-matching documents to the top. The RAG agent prompt enforces short, focused queries (3-8 words each, one concept per query) instead of keyword-stuffed long strings.
 
 Authentication: `Deps.mcp_token` (CKAN API token) is always created via `get_user_token()`, used both for MCP and for chunk file fetching. Set in `views.py` and `api.py` regardless of MCP availability.
 

@@ -355,7 +355,7 @@ class LiteratureRoundtripTest(ChatRoundtripTest):
         pkg_ids = {}
         for filename, title, content, ds_name in DOCUMENTS:
             self._chat(
-                f"Create a dataset with name '{ds_name}', "
+                f"Create a public dataset with name '{ds_name}', "
                 f"title '{title}', "
                 f"notes 'Test document for literature roundtrip', "
                 f"in the organization with id '{org_id}', "

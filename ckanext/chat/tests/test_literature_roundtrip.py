@@ -477,7 +477,8 @@ class LiteratureRoundtripTest(ChatRoundtripTest):
         )
 
         # Check content quality (clean reply)
-        clean = re.sub(r"\[status\].*?\[/status\]", "", reply, flags=re.DOTALL).lower()
+        clean = re.sub(r"\[ref\][^\[]*\[/ref\]", "", reply, flags=re.DOTALL)
+        clean = re.sub(r"\[status\].*?\[/status\]", "", clean, flags=re.DOTALL).lower()
 
         found_heidelbeer = "heidelbeer" in clean
         found_machine = any(
@@ -507,6 +508,20 @@ class LiteratureRoundtripTest(ChatRoundtripTest):
             f"group '{GROUP_NAME}' {'found' if found_group_selected else 'not found'} in status output",
         )
 
+        # Check [ref] markers are emitted with expected resource filenames
+        ref_markers = re.findall(r"\[ref\]([^|]*)\|([^\[]*)\[/ref\]", reply)
+        expected_filenames = [fn for fn, _, _, _ in DOCUMENTS]
+        matched_filenames = [
+            fn for fn in expected_filenames
+            if any(fn in url for _, url in ref_markers)
+        ]
+        self._check(
+            "ref markers contain resource URLs",
+            len(ref_markers) >= 1,
+            f"found {len(ref_markers)} [ref] markers, "
+            f"matched filenames: {matched_filenames}",
+        )
+
     def step_4b_literature_search_with_group(self):
         """Search with explicit group reference to test group-aware filtering."""
         print("\n[Step 4b] Literature search with group filter")
@@ -518,7 +533,8 @@ class LiteratureRoundtripTest(ChatRoundtripTest):
             timeout=300,
         )
 
-        clean = re.sub(r"\[status\].*?\[/status\]", "", reply, flags=re.DOTALL).lower()
+        clean = re.sub(r"\[ref\][^\[]*\[/ref\]", "", reply, flags=re.DOTALL)
+        clean = re.sub(r"\[status\].*?\[/status\]", "", clean, flags=re.DOTALL).lower()
 
         found_heidelbeer = "heidelbeer" in clean
         found_machine = any(
@@ -540,6 +556,20 @@ class LiteratureRoundtripTest(ChatRoundtripTest):
             f"region={'yes' if found_region else 'no'}",
         )
 
+        # Check [ref] markers are emitted with expected resource filenames
+        ref_markers = re.findall(r"\[ref\]([^|]*)\|([^\[]*)\[/ref\]", reply)
+        expected_filenames = [fn for fn, _, _, _ in DOCUMENTS]
+        matched_filenames = [
+            fn for fn in expected_filenames
+            if any(fn in url for _, url in ref_markers)
+        ]
+        self._check(
+            "group search ref markers contain resource URLs",
+            len(ref_markers) >= 1,
+            f"found {len(ref_markers)} [ref] markers, "
+            f"matched filenames: {matched_filenames}",
+        )
+
     def step_5_follow_up_analysis(self):
         """Follow-up in same conversation triggering literature_analyse."""
         print("\n[Step 5] Follow-up document analysis (literature_analyse)")
@@ -551,7 +581,8 @@ class LiteratureRoundtripTest(ChatRoundtripTest):
             timeout=300,
         )
 
-        clean = re.sub(r"\[status\].*?\[/status\]", "", reply, flags=re.DOTALL).lower()
+        clean = re.sub(r"\[ref\][^\[]*\[/ref\]", "", reply, flags=re.DOTALL)
+        clean = re.sub(r"\[status\].*?\[/status\]", "", clean, flags=re.DOTALL).lower()
 
         found_yield = "3,4" in clean or "3.4" in clean
         found_svensson = "svensson" in clean

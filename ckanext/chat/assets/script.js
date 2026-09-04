@@ -21,6 +21,8 @@ ckan.module("chat-module", function ($, _) {
             return ""; // Rückgabe eines leeren Strings, wenn der Input kein String ist.
           }
 
+          item = item.replace(/\[ref\][^\[]*\[\/ref\]\n?/g, "");
+
           var rawHtml = marked.parse(item);
           return DOMPurify.sanitize(rawHtml, {
             ALLOWED_TAGS: [
@@ -53,6 +55,8 @@ ckan.module("chat-module", function ($, _) {
         console.error("Content is not a string:", content);
         return ""; // Rückgabe eines leeren Strings, wenn der Input kein String ist.
       }
+
+      content = content.replace(/\[ref\][^\[]*\[\/ref\]\n?/g, "");
 
       var rawHtml = marked.parse(content);
       cleanHtml = DOMPurify.sanitize(rawHtml, {

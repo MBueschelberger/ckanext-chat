@@ -209,7 +209,37 @@ class Pipe:
                                             if part.get(
                                                 "part_kind"
                                             ) == "text" and part.get("content"):
-                                                yield part["content"]
+                                                text_buf = part["content"]
+                                                while True:
+                                                    rm = re.search(
+                                                        r"\[ref\]([^|]*)\|([^\[]*)\[/ref\]\n?",
+                                                        text_buf,
+                                                    )
+                                                    if not rm:
+                                                        break
+                                                    before = text_buf[: rm.start()]
+                                                    if before:
+                                                        yield before
+                                                    ref_title = rm.group(1).strip()
+                                                    ref_url = rm.group(2).strip()
+                                                    yield {
+                                                        "event": {
+                                                            "type": "citation",
+                                                            "data": {
+                                                                "document": [],
+                                                                "metadata": [
+                                                                    {"source": ref_title}
+                                                                ],
+                                                                "source": {
+                                                                    "name": ref_title,
+                                                                    "url": ref_url,
+                                                                },
+                                                            },
+                                                        }
+                                                    }
+                                                    text_buf = text_buf[rm.end() :]
+                                                if text_buf:
+                                                    yield text_buf
                             except json.JSONDecodeError:
                                 pass
 
@@ -292,7 +322,33 @@ class Pipe:
                             )
                             buf = buf[m.end() :]
 
-                        if "[status]" not in buf:
+                        while True:
+                            m = re.search(
+                                r"\[ref\]([^|]*)\|([^\[]*)\[/ref\]\n?", buf
+                            )
+                            if not m:
+                                break
+                            before = buf[: m.start()]
+                            if before:
+                                yield before
+                            ref_title = m.group(1).strip()
+                            ref_url = m.group(2).strip()
+                            yield {
+                                "event": {
+                                    "type": "citation",
+                                    "data": {
+                                        "document": [],
+                                        "metadata": [{"source": ref_title}],
+                                        "source": {
+                                            "name": ref_title,
+                                            "url": ref_url,
+                                        },
+                                    },
+                                }
+                            }
+                            buf = buf[m.end() :]
+
+                        if "[status]" not in buf and "[ref]" not in buf:
                             if buf:
                                 yield buf
                             buf = ""

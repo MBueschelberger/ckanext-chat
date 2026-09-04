@@ -140,6 +140,25 @@ The `/chat/v1/chat/completions` endpoint (SSE streaming mode) emits inline statu
 - Only active during streaming (`status_queue` is `None` for non-streaming requests)
 - `_run_agent_stream` in `api.py` runs the agent in a background task and polls both the status queue and text output queue every 200ms
 
+### Document Reference Protocol
+
+After literature search responses, the front_agent emits `[ref]` markers with
+resource download URLs for follow-up analysis:
+
+```
+[ref]Short Title|https://host/dataset/UUID/resource/UUID/download/file.md[/ref]
+```
+
+- Markers appear at the end of the response text, after the answer
+- Format: `[ref]Title|resource_download_url[/ref]`, one per source document
+- Clients handle them differently:
+  - **CKAN Chat UI** (`script.js`): stripped before rendering, preserved in localStorage history
+  - **Open WebUI** (`iwm_rag_streaming_v3.py`): converted to native citation events (footnotes)
+  - **Test client**: stripped before content assertions
+- They persist in CKAN Chat UI conversation history so follow-up turns can
+  call `literature_analyse` directly with the resource URL, bypassing `package_show`
+- In Open WebUI, follow-up falls back to UUID extraction from dataset URLs
+
 ### Implementation details
 
 - `Deps.status_queue: Optional[asyncio.Queue]` — set by `_run_agent_stream`, `None` otherwise

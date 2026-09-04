@@ -218,6 +218,7 @@ class Deps:
     orchestrator: str = "Front agent"
     ssl_verify: bool = field(default_factory=lambda: ssl_verify)
     seen_chunk_ids: set = field(default_factory=set)
+    document_refs: list = field(default_factory=list)
 
 
 def _push_status(deps, message: str):
@@ -851,6 +852,20 @@ group_selector_agent = Agent(
     ),
     model_settings=rag_model_settings,
 )
+
+
+@agent.system_prompt(dynamic=True)
+def _inject_document_refs(ctx: RunContext[Deps]) -> str:
+    if not ctx.deps.document_refs:
+        return ""
+    lines = "\n".join(f'- "{t}" → {u}' for t, u in ctx.deps.document_refs)
+    return (
+        "[Document references from previous searches — "
+        "use these URLs with literature_analyse for follow-up analysis:]\n"
+        f"{lines}"
+    )
+
+research_agent.system_prompt(dynamic=True)(_inject_document_refs)
 
 
 def convert_to_model_messages(history: str) -> List:

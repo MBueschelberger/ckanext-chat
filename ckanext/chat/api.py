@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 import time
 import uuid
 from distutils.util import strtobool
@@ -65,7 +66,24 @@ def _error_response(message: str, status: int = 400, error_type: str = "invalid_
     }), status
 
 
-def _openai_messages_to_prompt(messages: list) -> tuple[str, list]:
+_REF_PATTERN = re.compile(r'\[ref\]([^|]*)\|([^\[]*)\[/ref\]')
+
+
+def _extract_refs_from_messages(messages: list) -> list:
+    """Extract [ref]Title|URL[/ref] markers from assistant messages."""
+    refs = []
+    seen = set()
+    for msg in messages:
+        if msg.get("role") == "assistant":
+            for m in _REF_PATTERN.finditer(msg.get("content", "")):
+                url = m.group(2).strip()
+                if url not in seen:
+                    refs.append((m.group(1).strip(), url))
+                    seen.add(url)
+    return refs
+
+
+def _openai_messages_to_prompt(messages: list) -> tuple[str, list, list]:
     prompt = ""
     history_parts = []
 
@@ -91,10 +109,12 @@ def _openai_messages_to_prompt(messages: list) -> tuple[str, list]:
         if last.get("role") == "user":
             prompt = last.get("content", "")
 
-    return prompt, history_parts
+    refs = _extract_refs_from_messages(messages)
+
+    return prompt, history_parts, refs
 
 
-def _setup_agent_run(user_id: str, history_parts: list, research: bool):
+def _setup_agent_run(user_id: str, history_parts: list, research: bool, document_refs: list = None):
     from ckanext.chat.bot.agent import (
         Deps, agent, research_agent,
         mcp_available, get_user_token, config,
@@ -105,6 +125,8 @@ def _setup_agent_run(user_id: str, history_parts: list, research: bool):
         init_dynamic_models()
 
     deps = Deps(user_id=user_id)
+    if document_refs:
+        deps.document_refs = document_refs
 
     token = get_user_token(user_id)
     if token:
@@ -135,8 +157,8 @@ def _setup_agent_run(user_id: str, history_parts: list, research: bool):
     return active_agent, deps, msg_history, limits
 
 
-async def _run_agent_for_api(prompt: str, history_parts: list, user_id: str, research: bool = False) -> Any:
-    active_agent, deps, msg_history, limits = _setup_agent_run(user_id, history_parts, research)
+async def _run_agent_for_api(prompt: str, history_parts: list, user_id: str, research: bool = False, document_refs: list = None) -> Any:
+    active_agent, deps, msg_history, limits = _setup_agent_run(user_id, history_parts, research, document_refs=document_refs)
     return await active_agent.run(
         user_prompt=prompt,
         message_history=msg_history,
@@ -145,8 +167,8 @@ async def _run_agent_for_api(prompt: str, history_parts: list, user_id: str, res
     )
 
 
-async def _run_agent_stream(prompt: str, history_parts: list, user_id: str, research: bool = False):
-    active_agent, deps, msg_history, limits = _setup_agent_run(user_id, history_parts, research)
+async def _run_agent_stream(prompt: str, history_parts: list, user_id: str, research: bool = False, document_refs: list = None):
+    active_agent, deps, msg_history, limits = _setup_agent_run(user_id, history_parts, research, document_refs=document_refs)
 
     status_queue = asyncio.Queue()
     deps.status_queue = status_queue
@@ -256,7 +278,7 @@ def chat_completions():
     research = model_hint.lower() in ("research", "research_agent")
     stream = body.get("stream", False)
 
-    prompt, history_parts = _openai_messages_to_prompt(messages)
+    prompt, history_parts, document_refs = _openai_messages_to_prompt(messages)
     if not prompt:
         return _error_response("No user message found in messages array", 400, param="messages")
 
@@ -265,15 +287,15 @@ def chat_completions():
     debug = bool(strtobool(os.environ.get("DEBUG", "false")))
 
     if stream:
-        return _handle_stream(prompt, history_parts, user, research, completion_id, created, model_hint, debug)
+        return _handle_stream(prompt, history_parts, user, research, completion_id, created, model_hint, debug, document_refs)
     else:
-        return _handle_non_stream(prompt, history_parts, user, research, completion_id, created, model_hint, debug)
+        return _handle_non_stream(prompt, history_parts, user, research, completion_id, created, model_hint, debug, document_refs)
 
 
-def _handle_non_stream(prompt, history_parts, user, research, completion_id, created, model_hint, debug):
+def _handle_non_stream(prompt, history_parts, user, research, completion_id, created, model_hint, debug, document_refs=None):
     try:
         result = asyncio.run(
-            _run_agent_for_api(prompt, history_parts, user.id, research=research),
+            _run_agent_for_api(prompt, history_parts, user.id, research=research, document_refs=document_refs),
             debug=debug,
         )
         content = result.output if hasattr(result, "output") else str(result)
@@ -302,13 +324,13 @@ def _handle_non_stream(prompt, history_parts, user, research, completion_id, cre
         return _error_response(f"Agent error: {type(e).__name__}: {str(e)}", 500, "server_error")
 
 
-def _handle_stream(prompt, history_parts, user, research, completion_id, created, model_hint, debug):
+def _handle_stream(prompt, history_parts, user, research, completion_id, created, model_hint, debug, document_refs=None):
     def generate():
         try:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
-                stream_gen = _run_agent_stream(prompt, history_parts, user.id, research=research)
+                stream_gen = _run_agent_stream(prompt, history_parts, user.id, research=research, document_refs=document_refs)
                 ait = stream_gen.__aiter__()
                 while True:
                     try:

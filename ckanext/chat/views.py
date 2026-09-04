@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 from distutils.util import strtobool
@@ -250,6 +251,14 @@ async def _agent_worker(prompt: str, history: str, user_id: str,
         if research else
         UsageLimits(request_limit=config.REQUEST_LIMIT_FRONT_AGENT, total_tokens_limit=config.MAX_TOKENS_FRONT_AGENT)
     )
+
+    if history:
+        seen = set()
+        for m in re.finditer(r'\[ref\]([^|]*)\|([^\[]*)\[/ref\]', history):
+            url = m.group(2).strip()
+            if url not in seen:
+                deps.document_refs.append((m.group(1).strip(), url))
+                seen.add(url)
 
     r = await active_agent.run(
         user_prompt=prompt,

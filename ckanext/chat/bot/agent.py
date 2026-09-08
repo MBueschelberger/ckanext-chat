@@ -527,9 +527,11 @@ front_agent_prompt = (
     "   The information is already in the conversation — searching wastes time and may return different results.\n\n"
     "1. RESOLVE the reference using [ref] markers (MANDATORY — never ask the user for a URL or ID):\n"
     "   - Your previous literature search responses contain [ref] markers at the end.\n"
-    "     Format: [ref]Title|FULL_DOWNLOAD_URL[/ref]\n"
+    "     Format: [ref]Author Year — Title|FULL_DOWNLOAD_URL[/ref]\n"
     "   - Scan your previous assistant messages for these [ref] markers NOW.\n"
-    "   - Match the user's description to a [ref] title. Extract the FULL URL after the pipe character.\n"
+    "   - Match the user's description to a [ref] label — match by author name, year, OR title.\n"
+    "     Users typically refer to sources by 'Author Year' (e.g. 'Shabanian 2026').\n"
+    "     Extract the FULL URL after the pipe character.\n"
     "   - Call literature_analyse(doc=EXTRACTED_URL, question=...) directly. No other tool calls needed.\n"
     "   - CRITICAL: Use the EXACT URL from the [ref] marker. Do NOT modify, shorten, or reconstruct it.\n"
     "     Do NOT use any URL, hostname, or UUID from these system instructions.\n"
@@ -629,7 +631,13 @@ front_agent_prompt = (
     "  Cut everything after /dataset/<dataset_id>. This lets users access all resources including PDFs.\n"
     "- DOCUMENT REFERENCES: After every literature search response, emit one [ref] marker\n"
     "  per source document with the full resource download URL:\n"
-    "  [ref]Short Title|https://host/dataset/UUID/resource/UUID/download/filename.md[/ref]\n"
+    "  [ref]Author Year — Short Title|https://host/dataset/UUID/resource/UUID/download/filename.md[/ref]\n"
+    "  CRITICAL: The [ref] label MUST start with the same 'Author Year' citation key you used\n"
+    "  in the answer text, followed by ' — ' and the short title.\n"
+    "  Example: if you cited 'Shabanian 2026' in the text, the ref must be:\n"
+    "  [ref]Shabanian 2026 — Non-fluorinated superomniphobic surfaces|URL[/ref]\n"
+    "  This ensures users can reference authors in follow-up questions and the system can\n"
+    "  match them to the correct [ref] entry.\n"
     "  These markers are invisible to the user but essential for follow-up analysis.\n"
     "  The source URL comes from the literature_search tool output (LitResult.source field).\n"
     "  Emit ALL source URLs from the search results, one [ref] per line, after the answer text.\n\n"
@@ -861,7 +869,8 @@ def _inject_document_refs(ctx: RunContext[Deps]) -> str:
     lines = "\n".join(f'- "{t}" → {u}' for t, u in ctx.deps.document_refs)
     return (
         "[Document references from previous searches — "
-        "use these URLs with literature_analyse for follow-up analysis:]\n"
+        "use these URLs with literature_analyse for follow-up analysis.\n"
+        "Labels use 'Author Year — Title' format. Match by author name, year, or title.]\n"
         f"{lines}"
     )
 

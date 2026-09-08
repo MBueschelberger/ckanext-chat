@@ -222,21 +222,22 @@ class Pipe:
                                                         yield before
                                                     ref_title = rm.group(1).strip()
                                                     ref_url = rm.group(2).strip()
-                                                    yield {
-                                                        "event": {
-                                                            "type": "citation",
-                                                            "data": {
-                                                                "document": [],
-                                                                "metadata": [
-                                                                    {"source": ref_title}
-                                                                ],
-                                                                "source": {
-                                                                    "name": ref_title,
-                                                                    "url": ref_url,
+                                                    if __event_emitter__:
+                                                        await __event_emitter__(
+                                                            {
+                                                                "type": "citation",
+                                                                "data": {
+                                                                    "document": [ref_title],
+                                                                    "metadata": [
+                                                                        {"source": ref_title}
+                                                                    ],
+                                                                    "source": {
+                                                                        "name": ref_title,
+                                                                        "url": ref_url,
+                                                                    },
                                                                 },
-                                                            },
-                                                        }
-                                                    }
+                                                            }
+                                                        )
                                                     text_buf = text_buf[rm.end() :]
                                                 if text_buf:
                                                     yield text_buf
@@ -333,25 +334,38 @@ class Pipe:
                                 yield before
                             ref_title = m.group(1).strip()
                             ref_url = m.group(2).strip()
-                            yield {
-                                "event": {
-                                    "type": "citation",
-                                    "data": {
-                                        "document": [],
-                                        "metadata": [{"source": ref_title}],
-                                        "source": {
-                                            "name": ref_title,
-                                            "url": ref_url,
+                            if __event_emitter__:
+                                await __event_emitter__(
+                                    {
+                                        "type": "citation",
+                                        "data": {
+                                            "document": [ref_title],
+                                            "metadata": [
+                                                {"source": ref_title}
+                                            ],
+                                            "source": {
+                                                "name": ref_title,
+                                                "url": ref_url,
+                                            },
                                         },
-                                    },
-                                }
-                            }
+                                    }
+                                )
                             buf = buf[m.end() :]
 
                         if "[status]" not in buf and "[ref]" not in buf:
-                            if buf:
-                                yield buf
-                            buf = ""
+                            last_bracket = buf.rfind("[")
+                            if (
+                                last_bracket >= 0
+                                and len(buf) - last_bracket < 10
+                            ):
+                                safe = buf[:last_bracket]
+                                if safe:
+                                    yield safe
+                                buf = buf[last_bracket:]
+                            else:
+                                if buf:
+                                    yield buf
+                                buf = ""
 
                     if buf:
                         yield buf

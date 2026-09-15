@@ -190,6 +190,8 @@ async def _run_agent_stream(prompt: str, history_parts: list, user_id: str, rese
     deps.status_queue = status_queue
     if research:
         status_queue.put_nowait("Research agent ── deep research mode")
+    if deps.document_refs:
+        status_queue.put_nowait(f"Conversation context: {len(deps.document_refs)} source(s) from history")
     output_queue = asyncio.Queue()
 
     t0 = time.monotonic()

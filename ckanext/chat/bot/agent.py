@@ -640,12 +640,15 @@ front_agent_prompt = (
     "  your training knowledge as factual recommendations.\n"
     "- Citations: [Author Year](dataset_url) — no numbered refs, no footnotes\n"
     "- For CKAN results: include dataset URLs when available\n"
-    "- URL RULE: Always truncate resource/download URLs to the dataset URL.\n"
+    "- URL RULE (inline citations ONLY): Truncate resource/download URLs to the dataset URL.\n"
     "  Example: .../dataset/9fee1eac-.../resource/73f3aa3f-.../download/file.md → .../dataset/9fee1eac-...\n"
     "  Cut everything after /dataset/<dataset_id>. This lets users access all resources including PDFs.\n"
+    "  This rule applies ONLY to [Author Year](url) citations visible to the user.\n"
     "- DOCUMENT REFERENCES: After every literature search response, emit one [ref] marker\n"
-    "  per source document with the full resource download URL:\n"
+    "  per source document. Use the FULL resource download URL — do NOT truncate:\n"
     "  [ref]Author Year — Short Title|https://host/dataset/UUID/resource/UUID/download/filename.md[/ref]\n"
+    "  The URL RULE does NOT apply to [ref] markers — they need the full download path\n"
+    "  so follow-up analysis can load the document directly without extra API calls.\n"
     "  CRITICAL: The [ref] label MUST start with the same 'Author Year' citation key you used\n"
     "  in the answer text, followed by ' — ' and the short title.\n"
     "  Example: if you cited 'Shabanian 2026' in the text, the ref must be:\n"
@@ -754,9 +757,10 @@ research_agent_prompt = (
     "  'Zu [Thema] liegen keine Quellen in der Datenbank vor.'\n"
     "- Do NOT create sections presenting your training knowledge as recommendations\n"
     "  (e.g. 'Praxisnahe Alternativen', 'branchenüblich', 'zu validieren').\n"
-    "- URL RULE: Always truncate resource/download URLs to the dataset URL.\n"
+    "- URL RULE (inline citations ONLY): Truncate resource/download URLs to the dataset URL.\n"
     "  Example: .../dataset/9fee1eac-.../resource/73f3aa3f-.../download/file.md → .../dataset/9fee1eac-...\n"
-    "  Cut everything after /dataset/<dataset_id>. This lets users access all resources including PDFs.\n\n"
+    "  Cut everything after /dataset/<dataset_id>. This lets users access all resources including PDFs.\n"
+    "  This rule applies ONLY to [Author Year](url) citations visible to the user, NOT to [ref] markers.\n\n"
 
     "QUALITY STANDARDS:\n"
     "- 5+ distinct sources minimum\n"
@@ -1975,6 +1979,38 @@ async def literature_search(
 
     return json.dumps({"answer": "", "error": ["All literature_search retries exhausted"]})
 
+
+_DATASET_URL_RE = re.compile(
+    r'(https?://[^/]+)/dataset/([0-9a-f-]{36})(?:/resource/|/download/|$)'
+)
+
+
+async def _resolve_dataset_url_to_resource(deps, url: str) -> str:
+    """If url is a dataset URL (no /download/), resolve to the markdown resource."""
+    if '/download/' in url or '/resource/' in url:
+        return url
+    m = _DATASET_URL_RE.match(url)
+    if not m:
+        return url
+    dataset_id = m.group(2)
+    try:
+        response, _ = await _ckan_fetch_data(deps, "package_show", {"id": dataset_id})
+        resources = response.get("resources", []) if isinstance(response, dict) else []
+        md_res = next(
+            (r for r in resources if (r.get("format", "").lower() in ("md", "markdown", "txt", "text")
+                                      or r.get("url", "").endswith((".md", ".txt")))),
+            None,
+        )
+        if md_res and md_res.get("url"):
+            log.info(f"Resolved dataset URL to markdown resource: {md_res['url']}")
+            _push_status(deps, f"── Resolved dataset to resource: {md_res['url'].rsplit('/', 1)[-1]}")
+            return md_res["url"]
+        log.warning(f"No markdown resource found in dataset {dataset_id}")
+    except Exception as e:
+        log.warning(f"Failed to resolve dataset URL {url}: {e}")
+    return url
+
+
 @agent.tool
 @research_agent.tool
 async def literature_analyse(ctx: RunContext[Deps], doc: TextResource, question: str, ssl_verify: bool = None) -> list[str]:
@@ -1993,19 +2029,23 @@ async def literature_analyse(ctx: RunContext[Deps], doc: TextResource, question:
     if ssl_verify is None:
         ssl_verify = ctx.deps.ssl_verify
 
-    doc_filename = str(doc.url).rsplit('/', 1)[-1] if doc.url else "unknown"
+    doc_url = str(doc.url)
+    doc_url = await _resolve_dataset_url_to_resource(ctx.deps, doc_url)
+    doc = TextResource(url=doc_url)
+
+    doc_filename = doc_url.rsplit('/', 1)[-1] if doc_url else "unknown"
     _push_status(ctx.deps, f"Document analysis: {doc_filename}")
     start_time = datetime.now(timezone.utc)
-    log.info(f"literature_analyse starting: doc_url='{doc.url}', question='{question[:100]}...'")
+    log.info(f"literature_analyse starting: doc_url='{doc_url}', question='{question[:100]}...'")
 
     _push_status(ctx.deps, f"── Doc agent: loading {doc_filename}")
     try:
-        doc=await get_resource_file_contents(resource_url=str(doc.url),ssl_verify=ssl_verify)
+        doc = await get_resource_file_contents(resource_url=doc_url, ssl_verify=ssl_verify)
         log.debug(f"literature_analyse loaded document: length={doc.length} chars")
         _push_status(ctx.deps, f"── Doc agent: loaded {doc_filename} ({doc.length:,} chars)")
     except Exception as e:
         log.error(f"literature_analyse failed to load document: error={str(e)[:200]}")
-        return json.dumps({"answer": "", "source": str(doc.url), "error": [f"Failed to load document: {str(e)}"]})
+        return json.dumps({"answer": "", "source": doc_url, "error": [f"Failed to load document: {str(e)}"]})
     
     prompt = (
         f"Analyze the provided TextResource to determine whether it contains an answer to the question below.\n\n"

@@ -605,6 +605,67 @@ class LiteratureRoundtripTest(ChatRoundtripTest):
             f"peak_yield={'yes' if found_peak else 'no'}",
         )
 
+    def step_5b_follow_up_without_refs(self):
+        """Follow-up with [ref] markers stripped from history.
+
+        Simulates the Open WebUI scenario where [ref] markers are not
+        preserved in conversation history.  The agent must fall back to
+        extracting dataset URLs from inline markdown citations
+        [Author Year](dataset_url) and resolve them to resource download
+        URLs via package_show.
+        """
+        print("\n[Step 5b] Follow-up without [ref] markers (inline citation fallback)")
+
+        # Restore history to just the search result (first 2 messages)
+        # and strip [ref] markers to simulate Open WebUI behavior
+        search_history = self.history[:2]
+        self.history = []
+        for msg in search_history:
+            content = msg["content"]
+            if msg["role"] == "assistant":
+                content = re.sub(
+                    r'\[ref\][^\[]*\[/ref\]', '', content, flags=re.DOTALL
+                ).strip()
+            self.history.append({"role": msg["role"], "content": content})
+
+        if self.verbose:
+            has_refs = any(
+                "[ref]" in m["content"]
+                for m in self.history if m["role"] == "assistant"
+            )
+            has_md_links = any(
+                re.search(r'\[[^\]]+\]\(https?://[^\s)]+/dataset/', m["content"])
+                for m in self.history if m["role"] == "assistant"
+            )
+            print(f"  History: {len(self.history)} messages, "
+                  f"[ref] present={has_refs}, markdown links present={has_md_links}")
+
+        reply = self._chat(
+            "Analysiere das Dokument über die Heidelbeerernte im Südschwarzwald genauer. "
+            "Welche konkreten Ernteerträge wurden mit der BerryMaster 3000 erzielt, "
+            "und welche Investitionskosten fallen an?",
+            timeout=300,
+        )
+
+        clean = re.sub(r"\[ref\][^\[]*\[/ref\]", "", reply, flags=re.DOTALL)
+        clean = re.sub(r"\[status\].*?\[/status\]", "", clean, flags=re.DOTALL).lower()
+
+        found_yield = "2,8" in clean or "2.8" in clean
+        found_berry = "berrymaster" in clean
+        found_cost = "197.500" in clean or "197500" in clean or "197,500" in clean
+        found_roi = "4,1" in clean or "4.1" in clean
+
+        specific_facts = sum([found_yield, found_berry, found_cost, found_roi])
+
+        self._check(
+            "inline-citation follow-up contains document facts",
+            specific_facts >= 2,
+            f"yield={'yes' if found_yield else 'no'}, "
+            f"berrymaster={'yes' if found_berry else 'no'}, "
+            f"cost={'yes' if found_cost else 'no'}, "
+            f"roi={'yes' if found_roi else 'no'}",
+        )
+
     # -- cleanup ---------------------------------------------------------------
 
     def cleanup(self):
@@ -708,7 +769,13 @@ class LiteratureRoundtripTest(ChatRoundtripTest):
 
             self.step_4b_literature_search_with_group()
 
+            # Save history after search for step 5b (before step 5 modifies it)
+            search_history = [dict(m) for m in self.history]
+
             self.step_5_follow_up_analysis()
+
+            self.history = search_history
+            self.step_5b_follow_up_without_refs()
 
         finally:
             self.cleanup()

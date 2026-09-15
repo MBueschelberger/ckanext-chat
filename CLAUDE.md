@@ -157,7 +157,37 @@ resource download URLs for follow-up analysis:
   - **Test client**: stripped before content assertions
 - They persist in CKAN Chat UI conversation history so follow-up turns can
   call `literature_analyse` directly with the resource URL, bypassing `package_show`
-- In Open WebUI, follow-up falls back to UUID extraction from dataset URLs
+- In Open WebUI, `[ref]` markers are stripped from visible text and emitted as citation
+  events (footnotes). The download URLs survive only in Open WebUI's citation UI —
+  they are **not** preserved in the stored message content and **not** sent back to the
+  backend on subsequent turns.
+
+### Open WebUI Follow-up Problem
+
+In Open WebUI, follow-up questions like "describe Jacobs 2024 in more detail" lose access
+to resource download URLs because:
+
+1. The pipe strips `[ref]` markers (which contain download URLs) and emits citation events
+2. Open WebUI stores the message text **without** `[ref]` markers
+3. The inline markdown citations use **dataset URLs** (`/dataset/UUID`), not resource
+   download URLs — by design, so users land on the dataset page listing the PDF
+4. Citation events are stored in Open WebUI's DB but not forwarded back to the backend
+
+**Current workaround**: `_extract_refs_from_messages()` (in `api.py`) and `_agent_worker()`
+(in `views.py`) fall back to extracting CKAN dataset URLs from markdown links
+(`[Author Year](dataset-url)`) when no `[ref]` markers are found. `_inject_document_refs()`
+detects these are dataset URLs (no `/download/` path) and instructs the agent to call
+`package_show` first to resolve the markdown resource, then `literature_analyse`.
+
+**Limitations**:
+- Extra `package_show` tool call per follow-up (added latency)
+- Agent must identify the correct resource (markdown, not PDF)
+- Only works when the LLM formatted citations as `[Author Year](url)` — plain-text
+  mentions like "Jacobs 2024 beschreibt..." without a markdown link are not captured
+
+**Potential improvement**: Modify the pipe to re-inject download URLs into the yielded text
+in a format that survives Open WebUI storage (e.g. markdown reference-link definitions),
+so the backend can extract them directly without `package_show`.
 
 ### Implementation details
 

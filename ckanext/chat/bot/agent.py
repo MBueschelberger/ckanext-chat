@@ -889,11 +889,22 @@ group_selector_agent = Agent(
 def _inject_document_refs(ctx: RunContext[Deps]) -> str:
     if not ctx.deps.document_refs:
         return ""
+    has_download_urls = any('/download/' in u for _, u in ctx.deps.document_refs)
     lines = "\n".join(f'- "{t}" → {u}' for t, u in ctx.deps.document_refs)
+    if has_download_urls:
+        return (
+            "[Document references from previous searches — "
+            "use these URLs with literature_analyse for follow-up analysis.\n"
+            "Labels use 'Author Year — Title' format. Match by author name, year, or title.]\n"
+            f"{lines}"
+        )
     return (
         "[Document references from previous searches — "
-        "use these URLs with literature_analyse for follow-up analysis.\n"
-        "Labels use 'Author Year — Title' format. Match by author name, year, or title.]\n"
+        "these are DATASET URLs (not resource download URLs).\n"
+        "To analyse a document: call ckan_run('package_show', {'id': DATASET_ID}) "
+        "to find the markdown resource, then use its download URL with literature_analyse.\n"
+        "The DATASET_ID is the UUID after /dataset/ in the URL.\n"
+        "Match by author name, year, or title.]\n"
         f"{lines}"
     )
 

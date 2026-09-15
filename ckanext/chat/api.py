@@ -67,15 +67,31 @@ def _error_response(message: str, status: int = 400, error_type: str = "invalid_
 
 
 _REF_PATTERN = re.compile(r'\[ref\]([^|]*)\|([^\[]*)\[/ref\]')
+_CKAN_LINK_RE = re.compile(
+    r'\[([^\]\n]+)\]\((https?://[^\s)]+/dataset/[0-9a-f-]{36}[^\s)]*)\)'
+)
 
 
 def _extract_refs_from_messages(messages: list) -> list:
-    """Extract [ref]Title|URL[/ref] markers from assistant messages."""
+    """Extract [ref]Title|URL[/ref] markers from assistant messages.
+
+    Falls back to CKAN dataset URLs from markdown links when no [ref]
+    markers are found (e.g. Open WebUI strips them).
+    """
     refs = []
     seen = set()
     for msg in messages:
         if msg.get("role") == "assistant":
             for m in _REF_PATTERN.finditer(msg.get("content", "")):
+                url = m.group(2).strip()
+                if url not in seen:
+                    refs.append((m.group(1).strip(), url))
+                    seen.add(url)
+    if refs:
+        return refs
+    for msg in messages:
+        if msg.get("role") == "assistant":
+            for m in _CKAN_LINK_RE.finditer(msg.get("content", "")):
                 url = m.group(2).strip()
                 if url not in seen:
                     refs.append((m.group(1).strip(), url))

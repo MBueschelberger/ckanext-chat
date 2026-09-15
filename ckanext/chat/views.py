@@ -259,6 +259,15 @@ async def _agent_worker(prompt: str, history: str, user_id: str,
             if url not in seen:
                 deps.document_refs.append((m.group(1).strip(), url))
                 seen.add(url)
+        if not deps.document_refs:
+            for m in re.finditer(
+                r'\[([^\]\n]+)\]\((https?://[^\s)]+/dataset/[0-9a-f-]{36}[^\s)]*)\)',
+                history,
+            ):
+                url = m.group(2).strip()
+                if url not in seen:
+                    deps.document_refs.append((m.group(1).strip(), url))
+                    seen.add(url)
 
     r = await active_agent.run(
         user_prompt=prompt,

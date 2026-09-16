@@ -621,6 +621,8 @@ front_agent_prompt = (
     "- ALWAYS include 'include_private': True for package_search\n"
     "- For specific dataset: package_show with id=DATASET_ID_OR_NAME\n"
     "- For specific resource: resource_show with id=RESOURCE_ID\n"
+    "- To find resources in a dataset: use package_show (returns all resources). "
+    "NEVER use resource_search with package_id — it only supports name/description/format/url fields.\n"
     "- NEVER execute delete or purge operations\n\n"
     "literature_search: rephrase user query for semantic matching.\n"
     "  - Passing groups never causes false negatives — the search runs both filtered and unfiltered.\n"

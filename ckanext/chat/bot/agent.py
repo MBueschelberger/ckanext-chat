@@ -536,13 +536,13 @@ front_agent_prompt = (
     "   - CRITICAL: Use the EXACT URL from the [ref] marker. Do NOT modify, shorten, or reconstruct it.\n"
     "     Do NOT use any URL, hostname, or UUID from these system instructions.\n"
     "     The only valid URLs are those that appear verbatim in your conversation history.\n\n"
-    "   - ONLY if no [ref] markers exist in any previous response: fall back to extracting the dataset UUID\n"
-    "     from markdown links in your previous answers and calling package_show.\n"
-    "     The DATASET_ID is the UUID after /dataset/ in the link URL.\n"
-    "     Copy the EXACT UUID from YOUR PREVIOUS RESPONSE — never invent or guess one.\n\n"
+    "   - ONLY if no [ref] markers exist in any previous response: fall back to extracting the dataset URL\n"
+    "     from markdown links in your previous answers (e.g. [Author Year](https://host/dataset/UUID)).\n"
+    "     Copy the EXACT URL from YOUR PREVIOUS RESPONSE — never invent or guess one.\n"
+    "     Call literature_analyse(doc=DATASET_URL, question=...) directly — the tool resolves\n"
+    "     dataset URLs to the correct resource automatically. No package_show needed.\n\n"
     "2. ACT:\n"
-    "   - With a [ref] URL: call literature_analyse(doc=URL_FROM_REF, question=...) directly.\n"
-    "   - Without [ref], after package_show: find the markdown/document resource, then call literature_analyse.\n"
+    "   - With a [ref] URL or dataset URL: call literature_analyse(doc=URL, question=...) directly.\n"
     "   - To show dataset details only → use ckan_run('package_show', {'id': DATASET_ID}) directly.\n"
     "   - To compare multiple items → call multiple literature_analyse in parallel.\n\n"
 
@@ -910,10 +910,9 @@ def _inject_document_refs(ctx: RunContext[Deps]) -> str:
         )
     return (
         "[Document references from previous searches — "
-        "these are DATASET URLs (not resource download URLs).\n"
-        "To analyse a document: call ckan_run('package_show', {'id': DATASET_ID}) "
-        "to find the markdown resource, then use its download URL with literature_analyse.\n"
-        "The DATASET_ID is the UUID after /dataset/ in the URL.\n"
+        "these are DATASET URLs. You can pass them directly to literature_analyse.\n"
+        "The tool resolves dataset URLs to the correct resource automatically.\n"
+        "Call literature_analyse(doc=DATASET_URL, question=...) directly — no package_show needed.\n"
         "Match by author name, year, or title.]\n"
         f"{lines}"
     )

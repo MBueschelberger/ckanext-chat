@@ -11,7 +11,7 @@ import ckan.lib.api_token as api_token
 import ckan.plugins.toolkit as toolkit
 from flask import Blueprint, Response, jsonify, request, stream_with_context
 
-from ckanext.chat.views import _try_keycloak_auth
+from ckanext.chat.views import _try_keycloak_auth, _get_thread_loop, _cancel_stale_tasks
 from loguru import logger
 from pydantic_ai.messages import ModelMessagesTypeAdapter
 from pydantic_ai.usage import UsageLimits
@@ -312,9 +312,9 @@ def chat_completions():
 
 def _handle_non_stream(prompt, history_parts, user, research, completion_id, created, model_hint, debug, document_refs=None):
     try:
-        result = asyncio.run(
+        loop = _get_thread_loop()
+        result = loop.run_until_complete(
             _run_agent_for_api(prompt, history_parts, user.id, research=research, document_refs=document_refs),
-            debug=debug,
         )
         content = result.output if hasattr(result, "output") else str(result)
         usage = result.usage() if hasattr(result, "usage") else None
@@ -338,59 +338,57 @@ def _handle_non_stream(prompt, history_parts, user, research, completion_id, cre
         return jsonify(response)
 
     except Exception as e:
+        _cancel_stale_tasks(_get_thread_loop())
         log.error(f"chat_completions error: {type(e).__name__}: {str(e)[:200]}")
         return _error_response(f"Agent error: {type(e).__name__}: {str(e)}", 500, "server_error")
 
 
 def _handle_stream(prompt, history_parts, user, research, completion_id, created, model_hint, debug, document_refs=None):
     def generate():
+        loop = _get_thread_loop()
+        asyncio.set_event_loop(loop)
         try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                stream_gen = _run_agent_stream(prompt, history_parts, user.id, research=research, document_refs=document_refs)
-                ait = stream_gen.__aiter__()
-                while True:
-                    try:
-                        chunk_text = loop.run_until_complete(ait.__anext__())
-                    except StopAsyncIteration:
-                        break
+            stream_gen = _run_agent_stream(prompt, history_parts, user.id, research=research, document_refs=document_refs)
+            ait = stream_gen.__aiter__()
+            while True:
+                try:
+                    chunk_text = loop.run_until_complete(ait.__anext__())
+                except StopAsyncIteration:
+                    break
 
-                    if chunk_text == _SSE_KEEPALIVE:
-                        yield ": keepalive\n\n"
-                        continue
+                if chunk_text == _SSE_KEEPALIVE:
+                    yield ": keepalive\n\n"
+                    continue
 
-                    chunk = {
-                        "id": completion_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model_hint,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {"content": chunk_text},
-                            "finish_reason": None,
-                        }],
-                    }
-                    yield f"data: {json.dumps(chunk)}\n\n"
-
-                final_chunk = {
+                chunk = {
                     "id": completion_id,
                     "object": "chat.completion.chunk",
                     "created": created,
                     "model": model_hint,
                     "choices": [{
                         "index": 0,
-                        "delta": {},
-                        "finish_reason": "stop",
+                        "delta": {"content": chunk_text},
+                        "finish_reason": None,
                     }],
                 }
-                yield f"data: {json.dumps(final_chunk)}\n\n"
-                yield "data: [DONE]\n\n"
+                yield f"data: {json.dumps(chunk)}\n\n"
 
-            finally:
-                loop.close()
+            final_chunk = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_hint,
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop",
+                }],
+            }
+            yield f"data: {json.dumps(final_chunk)}\n\n"
+            yield "data: [DONE]\n\n"
 
         except Exception as e:
+            _cancel_stale_tasks(loop)
             log.error(f"chat_completions stream error: {type(e).__name__}: {str(e)[:200]}")
             error_msg = f"Stream error: {type(e).__name__}: {str(e)}"
             error_chunk = {

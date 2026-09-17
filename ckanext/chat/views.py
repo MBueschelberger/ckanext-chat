@@ -3,6 +3,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from distutils.util import strtobool
 from typing import Any
@@ -40,6 +41,36 @@ logger.add(
 blueprint = Blueprint("chat", __name__)
 
 global_ckan_app = None
+
+_thread_local = threading.local()
+
+
+def _get_thread_loop():
+    """Thread-local event loop that persists across requests.
+
+    Avoids closing and recreating loops, which causes httpx connection
+    pools in the pydantic-ai/openai client to become stale.
+    """
+    if not hasattr(_thread_local, 'loop') or _thread_local.loop.is_closed():
+        _thread_local.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_thread_local.loop)
+    return _thread_local.loop
+
+
+def _cancel_stale_tasks(loop):
+    """Cancel any tasks left on the persistent loop after an error."""
+    try:
+        pending = asyncio.all_tasks(loop)
+    except RuntimeError:
+        return
+    if not pending:
+        return
+    for task in pending:
+        task.cancel()
+    try:
+        loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+    except Exception:
+        pass
 
 
 @blueprint.before_request
@@ -180,10 +211,10 @@ def ask():
     debug = bool(strtobool(os.environ.get("DEBUG", "false")))
 
     try:
-        response = asyncio.run(
+        loop = _get_thread_loop()
+        response = loop.run_until_complete(
             _agent_worker(user_input, history, user_id=user_id,
                           research=research, uploaded_file=uploaded_file),
-            debug=debug,
         )
         messages = response.new_messages()
         [
@@ -197,6 +228,7 @@ def ask():
         return jsonify({"response": messages})
 
     except Exception as e:
+        _cancel_stale_tasks(_get_thread_loop())
         user_promt = user_input_to_model_request(user_input)
         error_response = exception_to_model_response(e)
         logger.error(error_response)
@@ -349,7 +381,7 @@ def ask_stream():
     uploaded_file = _extract_upload()
 
     def generate():
-        loop = asyncio.new_event_loop()
+        loop = _get_thread_loop()
         asyncio.set_event_loop(loop)
         try:
             gen = _stream_with_status(user_input, history, user_id, research,
@@ -382,8 +414,9 @@ def ask_stream():
                         [user_prompt, error_response], mode='json'
                     )
                     yield f"event: done\ndata: {json.dumps({'response': serialized})}\n\n"
-        finally:
-            loop.close()
+        except Exception:
+            _cancel_stale_tasks(loop)
+            raise
 
     return Response(
         stream_with_context(generate()),

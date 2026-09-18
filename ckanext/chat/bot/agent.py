@@ -488,6 +488,11 @@ doc_prompt = (
     "- Stop when you have 2-3 high-quality passages that answer the question\n"
     "- Quality over quantity\n\n"
     
+    "DUPLICATE MATCHES:\n"
+    "- Heading strings may appear multiple times (e.g. in a Table of Contents AND in the body)\n"
+    "- If a `precise_text_slice` result is unexpectedly short or lacks actual content,\n"
+    "  retry with `occurrence=2` to find the next match in the document\n\n"
+
     "IMPORTANT:\n"
     "- text_slice.url points to highlighted passages - use them for citations\n"
     "- Use exact substrings (10-20 chars) for start_str and end_str\n"
@@ -1427,53 +1432,61 @@ async def precise_text_slice(
     ctx: RunContext[TextResource],
     start_str: str,
     end_str: str,
+    occurrence: int = 1,
     threshold: float = 0.9
 ) -> TextSlice:
     """
-    Finds the start and end offsets of a text slice based on fuzzy matching of start and end strings.
+    Finds a text slice based on fuzzy matching of start and end strings.
 
     Args:
-        ctx (RunContext[Deps]): The context containing the dependencies.
-        start_str (str): The starting string to search for.
-        end_str (str): The ending string to search for.
-        threshold (float): The threshold for fuzzy matching (default is 0.9).
-
-    Returns:
-        Union[Tuple[int, int], str]: A tuple containing:
-            - The start and end offsets if both strings are found.
-            - An error message if the start string is not found.
+        start_str: The starting string to search for.
+        end_str: The ending string to search for.
+        occurrence: Which occurrence of start_str to use (1=first, 2=second, ...).
+            Use occurrence=2 to skip a Table-of-Contents match and find the
+            actual section heading in the document body.
+        threshold: The threshold for fuzzy matching (default is 0.9).
     """
     if not ctx.deps.text:
         log.debug("No file loaded in Deps")
         return "No file loaded in Deps"
 
     text = ctx.deps.text
-    offset = 0  # TextResource doesn't have an offset; use 0
+    offset = 0
     slice_length = ctx.deps.length
-    
+
+    def _build_slice(s: int, e: int) -> TextSlice:
+        position = float(e) / float(len(text))
+        return TextSlice(url=ctx.deps.url, text=text[s:e], doc_position=position)
+
     # Try exact match first
     lower_text = text.lower()
     lower_start_str = start_str.lower()
-    start_idx = lower_text.find(lower_start_str)
+    lower_end_str = end_str.lower()
+
+    # Find the Nth occurrence of start_str
+    search_pos = 0
+    start_idx = -1
+    for _ in range(occurrence):
+        idx = lower_text.find(lower_start_str, search_pos)
+        if idx == -1:
+            start_idx = -1
+            break
+        start_idx = idx
+        search_pos = idx + 1
+
     if start_idx != -1:
         start_end_idx = start_idx + len(start_str)
-        tail = text[start_end_idx:]
-        lower_tail = tail.lower()
-        lower_end_str = end_str.lower()
-        rel_end_idx = lower_tail.find(lower_end_str)
+        tail_lower = lower_text[start_end_idx:]
+        rel_end_idx = tail_lower.find(lower_end_str)
         if rel_end_idx != -1:
             abs_end_idx = start_end_idx + rel_end_idx + len(end_str)
-            # log.debug(
-            #     f"Exact match found for '{start_str}...{end_str}' at {start_idx}, end at {abs_end_idx}"
-            # )
-            return (offset + start_idx, offset + abs_end_idx)
+            return _build_slice(offset + start_idx, offset + abs_end_idx)
 
-    # Fall back to fuzzy search
+    # Fall back to fuzzy search (uses first match only)
     start_match, start_idx, start_end_idx = await fuzzy_search_early_cancel(
         start_str, text, threshold
     )
     if start_idx < 0:
-        #log.debug(f"Tried to start pattern: '{start_str}' - but didn't find a match")
         return f"Start string not found: '{start_str}'"
 
     tail = text[start_end_idx:]
@@ -1481,18 +1494,10 @@ async def precise_text_slice(
         end_str, tail, threshold
     )
     if rel_end_idx < 0:
-        #log.debug(f"Tried to end pattern: '{end_str}' - returning default span")
-        return (offset + start_idx, offset + slice_length)
+        return _build_slice(offset + start_idx, offset + slice_length)
 
     abs_end_idx = start_end_idx + rel_end_idx_end
-    # log.debug(
-    #     f"Fuzzy match found for '{start_str}...{end_str}' at {start_idx}, end at {abs_end_idx}"
-    # )
-    start,end=offset + start_idx, offset + abs_end_idx
-    position=float(end) / float(len(text))
-    text_slice=TextSlice(url=ctx.deps.url,text=text[start:end],doc_position=position)
-    log.debug(f"found: {text_slice}")
-    return text_slice
+    return _build_slice(offset + start_idx, offset + abs_end_idx)
 
 
 

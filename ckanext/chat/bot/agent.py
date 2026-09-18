@@ -292,8 +292,11 @@ class TextSlice:
 class TextResource:
     url: HttpUrl = None
     _text: Optional[str] = field(init=False, default=None)
-    status_queue: Optional[asyncio.Queue] = field(init=False, default=None)
-    orchestrator: Optional[str] = field(init=False, default=None)
+    length: int = field(init=False, default=0)
+
+    def __post_init__(self):
+        self.status_queue = None
+        self.orchestrator = None
 
     @property
     def text(self) -> Optional[str]:
@@ -303,8 +306,6 @@ class TextResource:
     def text(self, value: Optional[str]):
         self._text = value
         self.length = len(value) if value is not None else 0
-
-    length: int = field(init=False, default=0)
 
     def extract_substring(self, offset: int, length: int) -> TextSlice:
         if self.text is None:

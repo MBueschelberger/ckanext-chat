@@ -292,6 +292,8 @@ class TextSlice:
 class TextResource:
     url: HttpUrl = None
     _text: Optional[str] = field(init=False, default=None)
+    status_queue: Optional[asyncio.Queue] = field(init=False, default=None)
+    orchestrator: Optional[str] = field(init=False, default=None)
 
     @property
     def text(self) -> Optional[str]:
@@ -313,9 +315,9 @@ class TextResource:
         return TextSlice(url=self.url,text=text_slice, offset=offset, length=len(text_slice),doc_position=position)
     
     def __getstate__(self):
-        # Exclude _text from serialization
         state = self.__dict__.copy()
-        state["_text"] = None  # Don't serialize large text
+        state["_text"] = None
+        state["status_queue"] = None
         return state
     
 
@@ -1422,8 +1424,13 @@ async def get_resource_file_contents(
     except Exception as e:
         raise RuntimeError(f"Failed to download and add TextResource: {e}")
 
+def _push_doc_status(deps: TextResource, message: str):
+    _push_status(deps, f"── Doc agent: {message}")
+
+
 @doc_agent.tool
 async def get_text_slice(ctx: RunContext[TextResource], offset: int, length: int)->TextSlice:
+    _push_doc_status(ctx.deps, f"get_text_slice(offset={offset}, length={length})")
     return ctx.deps.extract_substring(offset=offset, length=length)
 
 
@@ -1446,6 +1453,9 @@ async def precise_text_slice(
             actual section heading in the document body.
         threshold: The threshold for fuzzy matching (default is 0.9).
     """
+    occ_info = f", occurrence={occurrence}" if occurrence > 1 else ""
+    _push_doc_status(ctx.deps, f"precise_text_slice(\"{start_str[:30]}\", \"{end_str[:30]}\"{occ_info})")
+
     if not ctx.deps.text:
         log.debug("No file loaded in Deps")
         return "No file loaded in Deps"
@@ -2040,13 +2050,15 @@ async def literature_analyse(ctx: RunContext[Deps], doc: TextResource, question:
     doc = TextResource(url=doc_url)
 
     doc_filename = doc_url.rsplit('/', 1)[-1] if doc_url else "unknown"
-    _push_status(ctx.deps, f"Document analysis: {doc_filename}")
+    _push_status(ctx.deps, f"Document analysis: {doc_filename} — \"{question}\"")
     start_time = datetime.now(timezone.utc)
     log.info(f"literature_analyse starting: doc_url='{doc_url}', question='{question[:100]}...'")
 
     _push_status(ctx.deps, f"── Doc agent: loading {doc_filename}")
     try:
         doc = await get_resource_file_contents(resource_url=doc_url, ssl_verify=ssl_verify)
+        doc.status_queue = ctx.deps.status_queue
+        doc.orchestrator = ctx.deps.orchestrator
         log.debug(f"literature_analyse loaded document: length={doc.length} chars")
         _push_status(ctx.deps, f"── Doc agent: loaded {doc_filename} ({doc.length:,} chars)")
     except Exception as e:

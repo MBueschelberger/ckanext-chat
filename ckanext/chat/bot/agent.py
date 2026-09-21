@@ -496,6 +496,13 @@ doc_prompt = (
     "- If a `precise_text_slice` result is unexpectedly short or lacks actual content,\n"
     "  retry with `occurrence=2` to find the next match in the document\n\n"
 
+    "FALLBACK STRATEGY:\n"
+    "- If `precise_text_slice` fails 2+ times (not found or only TOC snippets),\n"
+    "  switch to `get_text_slice(offset, length)` using an estimated character offset\n"
+    "- Estimate offset from document position: e.g. if ToC says section is on page N\n"
+    "  of a document with P pages, try offset ≈ (N/P) × total_chars\n"
+    "- Use length=15000 to capture a full section, then refine if needed\n\n"
+
     "IMPORTANT:\n"
     "- text_slice.url points to highlighted passages - use them for citations\n"
     "- Use exact substrings (10-20 chars) for start_str and end_str\n"
@@ -1467,7 +1474,10 @@ async def precise_text_slice(
 
     def _build_slice(s: int, e: int) -> TextSlice:
         position = float(e) / float(len(text))
-        return TextSlice(url=ctx.deps.url, text=text[s:e], doc_position=position)
+        return TextSlice(
+            url=ctx.deps.url, text=text[s:e],
+            offset=s, length=e - s, doc_position=position,
+        )
 
     # Try exact match first
     lower_text = text.lower()
@@ -1477,12 +1487,14 @@ async def precise_text_slice(
     # Find the Nth occurrence of start_str
     search_pos = 0
     start_idx = -1
+    last_found_end = 0
     for _ in range(occurrence):
         idx = lower_text.find(lower_start_str, search_pos)
         if idx == -1:
             start_idx = -1
             break
         start_idx = idx
+        last_found_end = idx + len(start_str)
         search_pos = idx + 1
 
     if start_idx != -1:
@@ -1493,12 +1505,19 @@ async def precise_text_slice(
             abs_end_idx = start_end_idx + rel_end_idx + len(end_str)
             return _build_slice(offset + start_idx, offset + abs_end_idx)
 
-    # Fall back to fuzzy search (uses first match only)
+    # Fall back to fuzzy search; skip past earlier exact matches when
+    # occurrence > 1 so we don't re-find the TOC entry
+    fuzzy_offset = last_found_end if (occurrence > 1 and last_found_end > 0) else 0
+    search_text = text[fuzzy_offset:]
+
     start_match, start_idx, start_end_idx = await fuzzy_search_early_cancel(
-        start_str, text, threshold
+        start_str, search_text, threshold
     )
     if start_idx < 0:
         return f"Start string not found: '{start_str}'"
+
+    start_idx += fuzzy_offset
+    start_end_idx += fuzzy_offset
 
     tail = text[start_end_idx:]
     end_match, rel_end_idx, rel_end_idx_end = await fuzzy_search_early_cancel(

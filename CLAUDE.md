@@ -23,7 +23,7 @@ ckanext/chat/
 ├── auth.py            # Authorization
 ├── helpers.py         # Template helpers
 ├── bot/
-│   ├── agent.py       # Multi-agent system (front_agent, research_agent, ckan_agent, rag_agent, doc_agent)
+│   ├── agent.py       # Multi-agent system (front_agent, research_agent, ckan_agent, doc_agent)
 │   └── utils.py       # CKAN action helpers, URL routing, fuzzy search, response truncation
 ├── templates/         # Jinja2 templates
 ├── assets/            # JS/CSS
@@ -34,25 +34,26 @@ ckanext/chat/
 
 ```
 front_agent / research_agent  (Orchestrator)
-  ├── ckan_explore(task)          → ckan_agent (autonomous multi-step CKAN exploration)
-  │     └── ckan_action()         (generic: any CKAN action via merge_with_smart_defaults)
-  ├── ckan_run(action, params)    → direct bypass (merge_with_smart_defaults, all actions incl. _create/_patch)
-  ├── find_relevant_groups(query) → group_selector_agent (paginates group_list, selects 1-2 relevant slugs)
-  ├── literature_search(q,groups) → rag_agent (budget-controlled vector search via Milvus, two-phase group filter)
-  │     └── rag_search()          (Milvus vector search + chunk text loading)
-  └── literature_analyse(doc)     → doc_agent (document analysis, only from orchestrator)
+  ├── ckan_explore(task)                        → ckan_agent (autonomous multi-step CKAN exploration)
+  │     └── ckan_action()                       (generic: any CKAN action via merge_with_smart_defaults)
+  ├── ckan_run(action, params)                  → direct bypass (merge_with_smart_defaults, all actions incl. _create/_patch)
+  ├── find_relevant_groups(query)               → group_selector_agent (paginates group_list, selects 1-2 relevant slugs)
+  ├── literature_search(q, queries, groups)     → direct pipeline: rag_search_direct + evaluation_agent
+  │     ├── rag_search_direct()                 (Milvus vector search + chunk text loading, no LLM)
+  │     └── evaluation_agent                    (structured-output LLM call for chunk assessment → LitSearchResult)
+  └── literature_analyse(doc)                   → doc_agent (document analysis, only from orchestrator)
 ```
 
-- `front_agent` — quick coordinator, delegates to tools (max ~3-4 tool calls, quick search only)
+- `front_agent` — quick coordinator, delegates to tools (max ~3-4 tool calls, quick search only). Formulates both `search_question` and `search_queries` for literature search.
 - `research_agent` — deep research mode (5-phase workflow, max ~25 tool calls, uses think_model)
 - `ckan_agent` — autonomous CKAN explorer with generic `ckan_action` tool → `CKANExploreResult`
 - `group_selector_agent` — selects 1-2 most relevant CKAN group slugs for a search topic → `GroupSelectorResult`
-- `rag_agent` — vector search via Milvus, budget-controlled (max_searches param) → `LitSearchResult`
+- `evaluation_agent` — evaluates vector search results, writes summaries per source → `LitSearchResult` (no tools, single structured-output call)
 - `doc_agent` — document analysis with fuzzy text extraction → `AnalyseResult`
 
-### RAG Search Pipeline (`rag_search`)
+### RAG Search Pipeline (`rag_search_direct`)
 
-`rag_search` returns `List[RagHit]` **grouped by source document** (not by chunk):
+`rag_search_direct` is called directly from `literature_search` (not an agent tool). It returns `List[RagHit]` **grouped by source document** (not by chunk):
 
 1. **Two-phase search**: if `groups` parameter is set, runs filtered (by CKAN group) + unfiltered Milvus search. Both phases always run — the group filter improves ranking but never causes false negatives. `seen_ids` prevents duplicate chunks across phases. Without `groups`, only the unfiltered phase runs.
 2. Milvus vector search with `output_fields` including dynamic fields `chunk_id` and `chunks` (URL to `.chunks` JSON file)
@@ -72,11 +73,11 @@ Before every `literature_search`, the orchestrator calls `find_relevant_groups(q
 1. **Pagination**: calls `group_list all_fields=True` in pages of 25 until exhausted — retrieves all groups regardless of instance size
 2. **Field reduction**: extracts only `name`, `title`, `description[:200]` per group (keeps context small)
 3. **Sub-agent selection**: `group_selector_agent` picks 1-2 group slugs that clearly match the topic, or returns an empty list if none fit
-4. **Propagation**: selected slugs are passed as `groups=[...]` to `literature_search` → `rag_agent` → `rag_search`
+4. **Propagation**: selected slugs are passed as `groups=[...]` to `literature_search` → `rag_search_direct`
 
 When the user explicitly names groups (by title or slug), the front agent passes that text as the query to `find_relevant_groups` so the sub-agent can resolve the correct slugs. Multiple user-named groups are all passed through.
 
-The `rag_search` two-phase design ensures group filtering never narrows results — it only boosts group-matching documents to the top. The RAG agent prompt enforces short, focused queries (3-8 words each, one concept per query) instead of keyword-stuffed long strings.
+The `rag_search_direct` two-phase design ensures group filtering never narrows results — it only boosts group-matching documents to the top. The orchestrator (front_agent / research_agent) formulates short, focused queries (3-8 words each, one concept per query) as `search_queries` for `literature_search`.
 
 Authentication: `Deps.mcp_token` (CKAN API token) is always created via `get_user_token()`, used both for MCP and for chunk file fetching. Set in `views.py` and `api.py` regardless of MCP availability.
 
@@ -195,7 +196,7 @@ so the backend can extract them directly without `package_show`.
 - `_push_status(deps, message)` helper in `bot/agent.py` — no-op when queue is `None`
 - `literature_analyse` was changed from `@agent.tool_plain` to `@agent.tool` to access `ctx.deps`
 - `_run_agent_stream` uses `asyncio.create_task` for the agent worker; main loop exits when `output_queue` receives `None` sentinel or `task.done()` (safety fallback)
-- Status-emitting tools: `ckan_run`, `rag_search`, `literature_search`, `literature_analyse`
+- Status-emitting functions: `ckan_run`, `rag_search_direct`, `literature_search`, `literature_analyse`
 - Intermediate status messages cover: parameter validation, embedding generation, vector DB search, data fetching (direct/MCP), response processing, document loading, passage extraction, and retries
 
 ## Authentication
@@ -256,7 +257,7 @@ The pipe function `iwm_rag_streaming.py` connects Open WebUI to the CKAN chat en
 
 ## Timeout & Retry Strategy
 
-- `literature_search`: timeout 90s, **no retry on timeout** (retrying a slow LLM compounds delay without improving results; other error types still retry up to `MAX_RETRIES_LITERATURE_SEARCH`)
+- `literature_search`: timeout 90s covers both `rag_search_direct` + `evaluation_agent` call combined, **no retry on timeout** (other error types still retry up to `MAX_RETRIES_LITERATURE_SEARCH`)
 - `literature_analyse`: timeout 180s (large documents like 50k+ char markdown need more processing time for the `doc_agent`)
 - `ckan_run`: timeout 90s (unchanged)
 

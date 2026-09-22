@@ -56,7 +56,7 @@ class AgentConfig:
     # Token limits
     MAX_TOKENS_RAG_MODEL: int = 16384
     MAX_TOKENS_CKAN_RUN: int = 128000
-    MAX_TOKENS_LITERATURE_SEARCH: int = 128000
+    MAX_TOKENS_EVALUATION: int = 128000
     MAX_TOKENS_LITERATURE_ANALYSE: int = 128000
     MAX_TOKENS_FRONT_AGENT: int = 200000
     MAX_TOKENS_RESEARCH_AGENT: int = 1000000
@@ -69,7 +69,6 @@ class AgentConfig:
     
     # Request limits (per run)
     REQUEST_LIMIT_CKAN_RUN: int = 25
-    REQUEST_LIMIT_LITERATURE_SEARCH: int = 10
     REQUEST_LIMIT_LITERATURE_ANALYSE: int = 50
     REQUEST_LIMIT_FRONT_AGENT: int = 10
     REQUEST_LIMIT_RESEARCH_AGENT: int = 50
@@ -396,50 +395,16 @@ class GroupSelectorResult(BaseModel):
     reasoning: str
 
 # --------------------- Updated RAG Agent Prompt ---------------------
-rag_prompt = (
-    "You perform literature retrieval using vector search and return high-quality scientific citations.\n\n"
-
-    "PROCESS:\n"
-    "Step 1: Formulate search queries\n"
-    "- Create 1-3 SHORT, FOCUSED search queries (3-8 words each)\n"
-    "- Each query should capture ONE key concept from the user's question\n"
-    "- Use the language of the domain (German terms for German topics, English for English)\n"
-    "- GOOD: ['maschinelle Heidelbeerernte Südschwarzwald', 'BerryMaster 3000 Erntemaschine']\n"
-    "- BAD: ['Blueberry mechanical harvest systems Over-the-Row harvester shaker vibration harvester robotic picker effects on yield bruising']\n"
-    "- Never stuff multiple concepts into one query — split them\n\n"
-
-    "Step 2: Execute rag_search ONCE\n"
-    "- Use limit parameter to control result count (default: 5 sources)\n"
-    "- If your task specifies groups=['...'], pass the groups parameter to rag_search to restrict results to those CKAN groups\n"
-    "- rag_search handles fallback automatically: if groups filter yields too few results, it retries without filter\n"
-    "- rag_search returns RagHit objects ALREADY GROUPED BY SOURCE DOCUMENT\n"
-    "- Each RagHit contains: distance (best similarity), entity (metadata), texts (list of matched chunk texts)\n"
-    "- Distance is cosine similarity: 1.0 = identical, 0.0 = unrelated. Higher = more relevant.\n\n"
-
-    "Step 3: Analyze results using chunk texts\n"
-    "- Each RagHit.texts contains the actual text content of matched chunks from that source\n"
-    "- READ these texts to write an informed summary for each source\n"
-    "- Create one LitResult per RagHit — return ALL sources, do NOT filter by relevance\n"
-    "- Write the summary based on the actual chunk content, not just the title\n"
-    "- Fill string_slices with start/end from RagHit.entity\n\n"
-
-    "Step 4: Quality check\n"
-    "- Count distinct sources found\n"
-    "- If < N distinct sources AND search was restrictive:\n"
-    "  * Broaden the query (remove filters, add synonyms)\n"
-    "  * Retry search ONCE with modified query\n"
-    "- Maximum 2 search attempts total\n\n"
-
-    "Step 5: Format citations\n"
-    "- Each source: [Author/Title](source_url)\n"
-    "- Add relevance summary (2-3 sentences) based on the chunk texts\n"
-    "- Include similarity score if available\n\n"
-
-    "IMPORTANT:\n"
-    "- Respect the max rag_search call limit given in your task (default: 1)\n"
-    "- Return ALL sources from rag_search — the calling agent decides relevance\n"
-    "- Always include metrics (similarity scores, source count)\n"
-    "- If searches yield few results, return what you have with explanation\n"
+evaluation_prompt = (
+    "You evaluate vector search results and create structured citations.\n\n"
+    "INPUT: A search question and a list of source documents with chunk texts.\n\n"
+    "TASK:\n"
+    "- Read each source's chunk texts carefully\n"
+    "- Write a 2-3 sentence summary per source based on actual content, not just title\n"
+    "- Create one LitResult per source — return ALL sources, do NOT filter by relevance\n"
+    "- Fill string_slices with start/end from entity metadata\n"
+    "- Format citations as [Author/Title](source_url)\n"
+    "- Include similarity scores\n"
 )
 
 # --------------------- Updated Document Agent Prompt ---------------------
@@ -573,8 +538,14 @@ front_agent_prompt = (
     "- If the user explicitly names groups (by title or slug), pass that as the query.\n"
     "- If find_relevant_groups returns an empty list, proceed without groups.\n\n"
     "Step 2 — SEARCH:\n"
-    "- Call literature_search with the user's question rephrased for semantic matching.\n"
-    "- Pass groups from Step 1 if available.\n\n"
+    "- Call literature_search with:\n"
+    "  - search_question: the user's question rephrased for relevance evaluation\n"
+    "  - search_queries: 1-3 SHORT, FOCUSED queries (3-8 words each) for vector search\n"
+    "    * Each query captures ONE key concept\n"
+    "    * Use domain language (German for German topics)\n"
+    "    * GOOD: [\"Entzinkung Messing Armaturen\", \"Spannungsrisskorrosion Messing Fittings\"]\n"
+    "    * BAD: [\"Blueberry mechanical harvest systems Over-the-Row harvester shaker vibration\"]\n"
+    "  - groups from Step 1 if available\n\n"
     "Step 3 — VERIFY:\n"
     "- literature_search results include summaries based on actual document content (chunk texts), not just titles.\n"
     "- Read each summary carefully and check: does the content actually address the user's question?\n"
@@ -644,7 +615,9 @@ front_agent_prompt = (
     "- To find resources in a dataset: use package_show (returns all resources). "
     "NEVER use resource_search with package_id — it only supports name/description/format/url fields.\n"
     "- NEVER execute delete or purge operations\n\n"
-    "literature_search: rephrase user query for semantic matching.\n"
+    "literature_search(search_question, search_queries, groups): vector search in literature database.\n"
+    "  - search_question: the user's question rephrased for evaluation\n"
+    "  - search_queries: 1-3 short queries (3-8 words each, one concept per query)\n"
     "  - Passing groups never causes false negatives — the search runs both filtered and unfiltered.\n"
     "literature_analyse: ONLY for analyzing existing CKAN resources with valid http(s) download URLs. Never for uploaded files.\n\n"
 
@@ -723,7 +696,8 @@ research_agent_prompt = (
     "  Pass all returned group slugs to literature_search via groups=[...]. If the result is empty, omit the groups parameter.\n"
     "  If the user explicitly names groups (by title or slug), include that in the query so the sub-agent resolves the correct slugs.\n"
     "  Passing groups never causes false negatives — the search runs both filtered and unfiltered.\n"
-    "- Use max_searches=4 to allow the rag_agent more search iterations\n"
+    "- Provide search_queries: 1-3 SHORT, FOCUSED queries (3-8 words each) for vector search.\n"
+    "  Each query captures ONE key concept. Use domain language.\n"
     "- Target: 5-7 distinct high-quality sources\n"
     "- Maximum 3 literature_search calls\n\n"
 
@@ -760,7 +734,7 @@ research_agent_prompt = (
     "Deduplicate — the same dataset may appear in multiple phases; mention it once with all relevant context.\n\n"
 
     "TOOL USAGE BUDGET:\n"
-    "- literature_search: max 3 calls (use max_searches=4 for deeper search)\n"
+    "- literature_search: max 3 calls (vary search_queries for broader coverage)\n"
     "- ckan_explore: typically 1 call with max_searches=10\n"
     "- literature_analyse: max 5 calls total across all phases\n"
     "- ckan_run: for direct single-action calls (package_show, resource_show, etc.)\n"
@@ -883,11 +857,10 @@ ckan_agent = Agent(
 )
 
 
-rag_agent = Agent(
+evaluation_agent = Agent(
     model=model,
-    deps_type=Deps,
     output_type=LitSearchResult,
-    instructions="".join(rag_prompt),
+    instructions=evaluation_prompt,
     model_settings=rag_model_settings,
 )
 
@@ -1364,7 +1337,6 @@ def extract_dataset_uuid(input_string: str) -> str:
 
 @agent.tool_plain
 @research_agent.tool_plain
-#@rag_agent.tool_plain
 async def get_resource_file_contents(
     resource_url: str,
     ssl_verify: bool = None,
@@ -1656,32 +1628,33 @@ def _group_hits_by_source(hits: list, chunk_texts: dict) -> List[RagHit]:
     return result
 
 
-@rag_agent.tool
-async def rag_search(
+async def rag_search_direct(
     ctx: RunContext[Deps], search_query: List[str], limit: int = 3, max_per_source: int = 3,
     groups: Optional[List[str]] = None,
 ) -> List[RagHit]:
-    """Vector rag search using Milvus vector store. Returns one RagHit per source document with chunk texts.
+    """Vector search using Milvus vector store. Returns one RagHit per source document with chunk texts.
+
+    Called directly from literature_search (not an agent tool).
 
     Args:
-        ctx (RunContext[Deps]): Instance of Agent dependencies at runtime, passed in by agent framework by default
-        search_query (List[str]): A list of strings for which to do the vector search with.
-        limit (int, optional): Limit for amount of source documents to be returned. Defaults to 3.
-        max_per_source (int, optional): Max chunks per source document. Defaults to 3.
-        groups (List[str], optional): Restrict results to documents belonging to these CKAN groups (by group name). Defaults to None (no restriction).
+        ctx: RunContext with Deps (passed through from literature_search)
+        search_query: A list of strings for which to do the vector search with.
+        limit: Limit for amount of source documents to be returned. Defaults to 3.
+        max_per_source: Max chunks per source document. Defaults to 3.
+        groups: Restrict results to documents belonging to these CKAN groups (by group name). Defaults to None.
 
     Returns:
-        List[RagHit]: List of RagHit instances grouped by source document, each with texts from matched chunks.
+        List of RagHit instances grouped by source document, each with texts from matched chunks.
     """
     if not ctx.deps.milvus_client or not ctx.deps.embeddings:
         return "The Milvus Client was not setup properly, no rag_search supported in the moment."
 
     queries_preview = " | ".join(search_query)
     groups_info = f", groups={groups}" if groups else ""
-    _push_status(ctx.deps, f"── RAG agent: vector search ({len(search_query)} queries, limit={limit}{groups_info}): {queries_preview}")
+    _push_status(ctx.deps, f"── Vector search ({len(search_query)} queries, limit={limit}{groups_info}): {queries_preview}")
     log.info(f"rag_search starting: queries={len(search_query)} limit={limit} max_per_source={max_per_source} groups={groups}")
     log.info(f"rag_search queries: {search_query}")
-    _push_status(ctx.deps, "── RAG agent: generating embeddings")
+    _push_status(ctx.deps, "── Generating embeddings")
     query_vectors = await get_embedding(
         search_query,
         model=ctx.deps.embedding_model,
@@ -1690,7 +1663,7 @@ async def rag_search(
         ssl_verify=ctx.deps.ssl_verify,
     )
     log.info(f"rag_search embedding done, starting milvus search")
-    _push_status(ctx.deps, "── RAG agent: searching vector database")
+    _push_status(ctx.deps, "── Searching vector database")
 
     output_fields = list(VectorMeta.__fields__.keys()) + ["chunk_id", "chunks"]
     raw_hits = []
@@ -1710,7 +1683,7 @@ async def rag_search(
 
     for phase_groups, phase_label in search_phases:
         if phase_label == "unfiltered" and groups:
-            _push_status(ctx.deps, "── RAG agent: supplementing with unfiltered search")
+            _push_status(ctx.deps, "── Supplementing with unfiltered search")
             log.info("rag_search: starting unfiltered supplement phase")
 
         while True:
@@ -1787,7 +1760,7 @@ async def rag_search(
 
             # --- Chunk fetch (only new URLs from non-denied datasets) ---
             new_urls = set(h.get("chunks_url", "") for h in batch_hits if h.get("chunks_url")) - set(chunk_texts.keys())
-            _push_status(ctx.deps, f"── RAG agent: loading chunk texts ({len(new_urls)} sources, round {round_num})")
+            _push_status(ctx.deps, f"── Loading chunk texts ({len(new_urls)} sources, round {round_num})")
             prev_denied = len(denied_datasets)
             for url in new_urls:
                 dataset_id = next((h.get("dataset_id", "") for h in batch_hits if h.get("chunks_url") == url), "")
@@ -1851,7 +1824,7 @@ async def rag_search(
         src_info += f" (+{len(accessible_hits) - 5} more)"
     n_from_filter = sum(1 for h in accessible_hits if str(h.entity.source) in filtered_sources)
     filter_info = f" ({n_from_filter} from group filter)" if filtered_sources else ""
-    _push_status(ctx.deps, f"── RAG agent: {len(accessible_hits)} sources found{filter_info}{src_info}")
+    _push_status(ctx.deps, f"── {len(accessible_hits)} sources found{filter_info}{src_info}")
     ctx.deps.seen_chunk_ids.update(seen_ids)
     log.info(f"rag_search completed: {len(accessible_hits)} accessible hits after {round_num} rounds, "
              f"filtered_sources={n_from_filter if filtered_sources else 'n/a'}, "
@@ -1922,19 +1895,45 @@ async def find_relevant_groups(ctx: RunContext[Deps], query: str) -> str:
     return json.dumps({"groups": selected, "reasoning": reasoning})
 
 
+def _serialize_hits_for_evaluation(hits: List[RagHit], search_question: str) -> str:
+    """Serialize RagHit list into text for the evaluation LLM call."""
+    parts = [f"Search question: {search_question}\n\nSources found ({len(hits)}):\n"]
+    for i, hit in enumerate(hits, 1):
+        entity = hit.entity
+        parts.append(f"\n--- Source {i} ---")
+        parts.append(f"Title: {entity.title or 'Unknown'}")
+        parts.append(f"Source URL: {entity.source or 'N/A'}")
+        if hit.distance is not None:
+            parts.append(f"Similarity: {hit.distance:.3f}")
+        if entity.start is not None and entity.end is not None:
+            parts.append(f"String slice: start={entity.start}, end={entity.end}")
+        if entity.dataset_id:
+            parts.append(f"Dataset ID: {entity.dataset_id}")
+        if entity.resource_id:
+            parts.append(f"Resource ID: {entity.resource_id}")
+        if hit.texts:
+            parts.append(f"\nChunk texts ({len(hit.texts)}):")
+            for j, text in enumerate(hit.texts):
+                parts.append(f"  [{j+1}] {text}")
+        else:
+            parts.append("No chunk texts available")
+    return "\n".join(parts)
+
+
 @agent.tool
 @research_agent.tool
 async def literature_search(
-    ctx: RunContext[Deps], search_question: str, num_results: int = 5, max_searches: int = 1,
+    ctx: RunContext[Deps], search_question: str, search_queries: List[str],
+    num_results: int = 5,
     groups: Optional[List[str]] = None,
 ) -> list[str]:
     """Search literature via vector database (Milvus).
 
     Args:
         ctx: Runtime context
-        search_question: Question rephrased for semantic matching
+        search_question: Question rephrased for relevance evaluation
+        search_queries: 1-3 short, focused queries (3-8 words each) for vector search
         num_results: Number of source documents to return (default 5)
-        max_searches: Max number of rag_search calls the agent may perform (default 1, research_agent uses up to 4)
         groups: Restrict results to documents in these CKAN groups (by group name). Defaults to None (no restriction).
 
     Returns:
@@ -1943,7 +1942,8 @@ async def literature_search(
     start_time = datetime.now(timezone.utc)
     groups_info = f", groups={groups}" if groups else ""
     _push_status(ctx.deps, f"Literature search: \"{search_question}\"{groups_info}")
-    log.info(f"literature_search starting: query='{search_question}...', num_results={num_results}, max_searches={max_searches}, groups={groups}")
+    log.info(f"literature_search starting: question='{search_question}', queries={search_queries}, "
+             f"num_results={num_results}, groups={groups}")
 
     for attempt in range(config.MAX_RETRIES_LITERATURE_SEARCH):
         seen_before = set(ctx.deps.seen_chunk_ids)
@@ -1951,38 +1951,39 @@ async def literature_search(
             if attempt > 0:
                 _push_status(ctx.deps, f"Literature search: retry (attempt {attempt+1})")
             log.debug(f"literature_search attempt {attempt+1}/{config.MAX_RETRIES_LITERATURE_SEARCH}")
-            groups_instruction = (
-                f" IMPORTANT: Restrict all rag_search calls to these CKAN groups by passing groups={groups}."
-                if groups else ""
-            )
-            r = await asyncio.wait_for(
-                rag_agent.run(
-                    f"Search for documents using this question: {search_question}. "
-                    f"Return {num_results} results. You may call rag_search up to {max_searches} times."
-                    f"{groups_instruction}",
-                    deps=ctx.deps,
+
+            async def _search_and_evaluate():
+                hits = await rag_search_direct(
+                    ctx, search_queries, limit=num_results, groups=groups,
+                )
+                if not hits:
+                    return LitSearchResult(answer="", results=[], search_str=search_queries)
+
+                _push_status(ctx.deps, "── Evaluating search results")
+                chunks_text = _serialize_hits_for_evaluation(hits, search_question)
+                r = await evaluation_agent.run(
+                    chunks_text,
                     usage_limits=UsageLimits(
-                        request_limit=max_searches + 4,
-                        total_tokens_limit=config.MAX_TOKENS_LITERATURE_SEARCH
+                        total_tokens_limit=config.MAX_TOKENS_EVALUATION,
                     ),
-                ),
-                timeout=config.LITERATURE_SEARCH_TIMEOUT
+                )
+                return r.output
+
+            result = await asyncio.wait_for(
+                _search_and_evaluate(),
+                timeout=config.LITERATURE_SEARCH_TIMEOUT,
             )
 
-            # Track usage metrics
-            usage = r.usage()
             duration_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
-            results = r.output.results or []
+            results = result.results or []
             src_titles = [" ".join(str(lr.title or lr.source or "?").split()) for lr in results[:5]]
             src_info = " → " + ", ".join(src_titles) if src_titles else ""
             if len(results) > 5:
                 src_info += f" (+{len(results) - 5} more)"
             _push_status(ctx.deps, f"Literature search complete ({duration_ms/1000:.1f}s, {len(results)} sources){src_info}")
-            log.info(f"literature_search completed: attempt={attempt+1}, "
-                    f"tokens=[request:{usage.request_tokens}, response:{usage.response_tokens}, total:{usage.total_tokens}], "
-                    f"duration_ms={duration_ms:.0f}")
-            output_json = r.output.model_dump_json()
-            log.debug(f"literature_search rag_agent output: {output_json[:2000]}")
+            log.info(f"literature_search completed: attempt={attempt+1}, duration_ms={duration_ms:.0f}")
+            output_json = result.model_dump_json()
+            log.debug(f"literature_search output: {output_json[:2000]}")
 
             return output_json
 

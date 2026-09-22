@@ -254,14 +254,115 @@ DOCUMENTS = [
 
 class LiteratureRoundtripTest(ChatRoundtripTest):
 
-    # -- override: parse SSE events from /chat/ask/stream properly --
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.step_timings = {}
+
+    # -- timing-aware chat methods --
+
+    def _chat(self, user_msg, timeout=300):
+        """Send a streaming message, capture status markers with timestamps."""
+        self.history.append({"role": "user", "content": user_msg})
+        payload = {
+            "model": "default",
+            "messages": self.history,
+            "stream": True,
+        }
+        if self.verbose:
+            print(f"\n  >>> {user_msg[:120]}...")
+
+        t_start = time.monotonic()
+        t_first_token = None
+        status_events = []
+        status_buf = ""
+        in_status = False
+
+        resp = requests.post(
+            self.chat_url,
+            json=payload,
+            headers={
+                "Authorization": f"Bearer {self.api_token}",
+                "Content-Type": "application/json",
+            },
+            timeout=timeout,
+            stream=True,
+        )
+        resp.raise_for_status()
+
+        assistant_msg = ""
+        for line in resp.iter_lines(decode_unicode=True):
+            if not line or not line.startswith("data: "):
+                continue
+            data_str = line[len("data: "):]
+            if data_str.strip() == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data_str)
+                delta = chunk["choices"][0].get("delta", {})
+                content = delta.get("content", "")
+                if content:
+                    if t_first_token is None:
+                        t_first_token = time.monotonic()
+                    assistant_msg += content
+                    if self.verbose:
+                        print(content, end="", flush=True)
+
+                    # Parse [status]...[/status] markers for timing
+                    scan = content
+                    while scan:
+                        if in_status:
+                            end_idx = scan.find("[/status]")
+                            if end_idx != -1:
+                                status_buf += scan[:end_idx]
+                                t_now = time.monotonic()
+                                status_events.append({
+                                    "message": status_buf.strip(),
+                                    "elapsed": t_now - t_start,
+                                    "delta": (t_now - status_events[-1]["_t"]
+                                              if status_events else t_now - t_start),
+                                    "_t": t_now,
+                                })
+                                status_buf = ""
+                                in_status = False
+                                scan = scan[end_idx + len("[/status]"):]
+                            else:
+                                status_buf += scan
+                                scan = ""
+                        else:
+                            start_idx = scan.find("[status]")
+                            if start_idx != -1:
+                                in_status = True
+                                scan = scan[start_idx + len("[status]"):]
+                            else:
+                                scan = ""
+
+            except (json.JSONDecodeError, KeyError, IndexError):
+                continue
+
+        if self.verbose:
+            print()
+
+        t_end = time.monotonic()
+        timing = {
+            "total": t_end - t_start,
+            "ttft": (t_first_token - t_start) if t_first_token else None,
+            "events": [{k: v for k, v in e.items() if k != "_t"}
+                       for e in status_events],
+        }
+        self._last_timing = timing
+
+        self.history.append({"role": "assistant", "content": assistant_msg})
+        return assistant_msg
 
     def _chat_upload(self, user_msg, file_bytes, filename,
                      content_type="text/csv", timeout=300):
-        """Send file upload to /chat/ask/stream, parse SSE response."""
+        """Send file upload to /chat/ask/stream, parse SSE response with timing."""
         url = f"{self.base_url}/chat/ask/stream"
         if self.verbose:
             print(f"\n  >>> [upload: {filename}] {user_msg[:120]}...")
+
+        t_start = time.monotonic()
+        status_events = []
 
         resp = requests.post(
             url,
@@ -283,10 +384,19 @@ class LiteratureRoundtripTest(ChatRoundtripTest):
                 elif line.startswith("data: "):
                     data_str = line[6:]
 
-            if event_type == "status" and data_str and self.verbose:
+            if event_type == "status" and data_str:
                 try:
                     msg = json.loads(data_str).get("message", "")
-                    print(f"  [status] {msg}")
+                    t_now = time.monotonic()
+                    status_events.append({
+                        "message": msg,
+                        "elapsed": t_now - t_start,
+                        "delta": (t_now - status_events[-1]["_t"]
+                                  if status_events else t_now - t_start),
+                        "_t": t_now,
+                    })
+                    if self.verbose:
+                        print(f"  [status] {msg}")
                 except json.JSONDecodeError:
                     pass
 
@@ -307,7 +417,60 @@ class LiteratureRoundtripTest(ChatRoundtripTest):
         if self.verbose and assistant_text:
             print(f"  <<< {assistant_text}")
 
+        t_end = time.monotonic()
+        self._last_timing = {
+            "total": t_end - t_start,
+            "ttft": None,
+            "events": [{k: v for k, v in e.items() if k != "_t"}
+                       for e in status_events],
+        }
+
         return assistant_text
+
+    def _record_step_timing(self, step_name):
+        """Save the last _chat/_chat_upload timing under a step name."""
+        if hasattr(self, "_last_timing"):
+            self.step_timings[step_name] = self._last_timing
+            self._last_timing = None
+
+    def _print_timing_summary(self):
+        """Print a timing report for all recorded steps."""
+        if not self.step_timings:
+            return
+
+        print(f"\n{'=' * 70}")
+        print("TIMING SUMMARY")
+        print(f"{'=' * 70}")
+
+        total_all = 0.0
+        for step_name, timing in self.step_timings.items():
+            total = timing["total"]
+            total_all += total
+            ttft = timing.get("ttft")
+            events = timing.get("events", [])
+
+            print(f"\n  {step_name}")
+            print(f"  {'─' * 60}")
+            if ttft is not None:
+                print(f"  {'Time to first token:':<45} {ttft:>6.1f}s")
+
+            for ev in events:
+                msg = ev["message"]
+                if len(msg) > 55:
+                    msg = msg[:52] + "..."
+                print(f"    {msg:<50} +{ev['delta']:>5.1f}s  @{ev['elapsed']:>6.1f}s")
+
+            # Time after last status event until stream end
+            if events:
+                last_elapsed = events[-1]["elapsed"]
+                tail = total - last_elapsed
+                print(f"    {'(answer generation)':<50} +{tail:>5.1f}s  @{total:>6.1f}s")
+
+            print(f"  {'TOTAL:':<45} {total:>6.1f}s")
+
+        print(f"\n  {'─' * 60}")
+        print(f"  {'ALL STEPS COMBINED:':<45} {total_all:>6.1f}s")
+        print(f"{'=' * 70}")
 
     # -- test steps ------------------------------------------------------------
 
@@ -475,6 +638,7 @@ class LiteratureRoundtripTest(ChatRoundtripTest):
             "Welche Studien und Ergebnisse gibt es dazu?",
             timeout=300,
         )
+        self._record_step_timing("Step 4: Literature search")
 
         # Check content quality (clean reply)
         clean = re.sub(r"\[ref\][^\[]*\[/ref\]", "", reply, flags=re.DOTALL)
@@ -532,6 +696,7 @@ class LiteratureRoundtripTest(ChatRoundtripTest):
             f"Heidelbeerernte. Welche Studien und Ergebnisse gibt es dazu?",
             timeout=300,
         )
+        self._record_step_timing("Step 4b: Literature search (group filter)")
 
         clean = re.sub(r"\[ref\][^\[]*\[/ref\]", "", reply, flags=re.DOTALL)
         clean = re.sub(r"\[status\].*?\[/status\]", "", clean, flags=re.DOTALL).lower()
@@ -580,6 +745,7 @@ class LiteratureRoundtripTest(ChatRoundtripTest):
             "und welcher Betrieb hatte den höchsten Einzelertrag?",
             timeout=300,
         )
+        self._record_step_timing("Step 5: Follow-up analysis")
 
         clean = re.sub(r"\[ref\][^\[]*\[/ref\]", "", reply, flags=re.DOTALL)
         clean = re.sub(r"\[status\].*?\[/status\]", "", clean, flags=re.DOTALL).lower()
@@ -646,6 +812,7 @@ class LiteratureRoundtripTest(ChatRoundtripTest):
             "und welche Investitionskosten fallen an?",
             timeout=300,
         )
+        self._record_step_timing("Step 5b: Follow-up without refs")
 
         clean = re.sub(r"\[ref\][^\[]*\[/ref\]", "", reply, flags=re.DOTALL)
         clean = re.sub(r"\[status\].*?\[/status\]", "", clean, flags=re.DOTALL).lower()
@@ -779,6 +946,8 @@ class LiteratureRoundtripTest(ChatRoundtripTest):
 
         finally:
             self.cleanup()
+
+        self._print_timing_summary()
 
         passed = sum(1 for _, p, _ in self.results if p)
         total = len(self.results)

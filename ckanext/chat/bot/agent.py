@@ -1983,6 +1983,7 @@ async def literature_search(
             _push_status(ctx.deps, f"Literature search complete ({duration_ms/1000:.1f}s, {len(results)} sources){src_info}")
             log.info(f"literature_search completed: attempt={attempt+1}, duration_ms={duration_ms:.0f}")
             output_json = result.model_dump_json()
+            _push_status(ctx.deps, f"Literature search Output {output_json[:2000]}")
             log.debug(f"literature_search output: {output_json[:2000]}")
 
             return output_json

@@ -56,7 +56,7 @@ class AgentConfig:
     # Token limits
     MAX_TOKENS_RAG_MODEL: int = 16384
     MAX_TOKENS_CKAN_RUN: int = 128000
-    MAX_TOKENS_EVALUATION: int = 128000
+    MAX_TOKENS_EVALUATION_SINGLE: int = 8000
     MAX_TOKENS_LITERATURE_ANALYSE: int = 128000
     MAX_TOKENS_FRONT_AGENT: int = 200000
     MAX_TOKENS_RESEARCH_AGENT: int = 1000000
@@ -338,6 +338,7 @@ class VectorMeta(BaseModel):
     source: Optional[HttpUrl] = None
     #view_url: Optional[list[HttpUrl]] = None
     title: Optional[str] = None
+    author: Optional[str] = None
 
 
 class RagHit(BaseModel):
@@ -354,6 +355,10 @@ class LitResult(BaseModel):
     string_slices: Optional[list[StringSlice]]
     source: Optional[HttpUrl] = None
     #view_url: Optional[list[HttpUrl]] = None
+
+
+class SourceSummary(BaseModel):
+    summary: str
 
 
 class LitSearchResult(BaseModel):
@@ -395,16 +400,12 @@ class GroupSelectorResult(BaseModel):
     reasoning: str
 
 # --------------------- Updated RAG Agent Prompt ---------------------
-evaluation_prompt = (
-    "You evaluate vector search results and create structured citations.\n\n"
-    "INPUT: A search question and a list of source documents with chunk texts.\n\n"
+summary_prompt = (
+    "Summarize this source document in relation to the given search question.\n\n"
     "TASK:\n"
-    "- Read each source's chunk texts carefully\n"
-    "- Write a 2-3 sentence summary per source based on actual content, not just title\n"
-    "- Create one LitResult per source — return ALL sources, do NOT filter by relevance\n"
-    "- Fill string_slices with start/end from entity metadata\n"
-    "- Format citations as [Author/Title](source_url)\n"
-    "- Include similarity scores\n"
+    "- Read the chunk texts carefully\n"
+    "- Write a 1-2 sentence summary highlighting specific findings, data, or conclusions\n"
+    "  that are relevant to the search question\n"
 )
 
 # --------------------- Updated Document Agent Prompt ---------------------
@@ -857,11 +858,16 @@ ckan_agent = Agent(
 )
 
 
-evaluation_agent = Agent(
+summary_model_settings = OpenAIModelSettings(
+    model_name=deployment,
+    max_tokens=512,
+)
+
+summary_agent = Agent(
     model=model,
-    output_type=LitSearchResult,
-    instructions=evaluation_prompt,
-    model_settings=rag_model_settings,
+    output_type=SourceSummary,
+    instructions=summary_prompt,
+    model_settings=summary_model_settings,
 )
 
 doc_agent = Agent(
@@ -1895,28 +1901,20 @@ async def find_relevant_groups(ctx: RunContext[Deps], query: str) -> str:
     return json.dumps({"groups": selected, "reasoning": reasoning})
 
 
-def _serialize_hits_for_evaluation(hits: List[RagHit], search_question: str) -> str:
-    """Serialize RagHit list into text for the evaluation LLM call."""
-    parts = [f"Search question: {search_question}\n\nSources found ({len(hits)}):\n"]
-    for i, hit in enumerate(hits, 1):
-        entity = hit.entity
-        parts.append(f"\n--- Source {i} ---")
-        parts.append(f"Title: {entity.title or 'Unknown'}")
-        parts.append(f"Source URL: {entity.source or 'N/A'}")
-        if hit.distance is not None:
-            parts.append(f"Similarity: {hit.distance:.3f}")
-        if entity.start is not None and entity.end is not None:
-            parts.append(f"String slice: start={entity.start}, end={entity.end}")
-        if entity.dataset_id:
-            parts.append(f"Dataset ID: {entity.dataset_id}")
-        if entity.resource_id:
-            parts.append(f"Resource ID: {entity.resource_id}")
-        if hit.texts:
-            parts.append(f"\nChunk texts ({len(hit.texts)}):")
-            for j, text in enumerate(hit.texts):
-                parts.append(f"  [{j+1}] {text}")
-        else:
-            parts.append("No chunk texts available")
+def _serialize_single_hit(hit: RagHit, search_question: str, max_chars_per_chunk: int = 600) -> str:
+    entity = hit.entity
+    parts = [
+        f"Search question: {search_question}\n",
+        f"Source title: {entity.title or 'Unknown'}",
+    ]
+    if hit.texts:
+        parts.append(f"\nChunk texts ({len(hit.texts)}):")
+        for j, text in enumerate(hit.texts):
+            if len(text) > max_chars_per_chunk:
+                text = text[:max_chars_per_chunk] + "..."
+            parts.append(f"  [{j+1}] {text}")
+    else:
+        parts.append("No chunk texts available")
     return "\n".join(parts)
 
 
@@ -1959,15 +1957,52 @@ async def literature_search(
                 if not hits:
                     return LitSearchResult(answer="", results=[], search_str=search_queries)
 
-                _push_status(ctx.deps, "── Evaluating search results")
-                chunks_text = _serialize_hits_for_evaluation(hits, search_question)
-                r = await evaluation_agent.run(
-                    chunks_text,
-                    usage_limits=UsageLimits(
-                        total_tokens_limit=config.MAX_TOKENS_EVALUATION,
-                    ),
+                n_hits = len(hits)
+                _push_status(ctx.deps, f"── Evaluating {n_hits} sources in parallel")
+
+                async def _summarize_one(hit: RagHit) -> SourceSummary:
+                    prompt_text = _serialize_single_hit(hit, search_question)
+                    r = await summary_agent.run(
+                        prompt_text,
+                        usage_limits=UsageLimits(
+                            total_tokens_limit=config.MAX_TOKENS_EVALUATION_SINGLE,
+                        ),
+                    )
+                    return r.output
+
+                results = await asyncio.gather(
+                    *[_summarize_one(hit) for hit in hits],
+                    return_exceptions=True,
                 )
-                return r.output
+
+                lit_results = []
+                for hit, summary_result in zip(hits, results):
+                    entity = hit.entity
+                    if isinstance(summary_result, Exception):
+                        log.warning(f"Summary failed for {entity.source}: {summary_result}")
+                        summary_text = f"Summary unavailable: {type(summary_result).__name__}"
+                    else:
+                        summary_text = summary_result.summary
+
+                    lit_results.append(LitResult(
+                        title=entity.title or "Unknown",
+                        summary=summary_text,
+                        authors=entity.author or "",
+                        string_slices=(
+                            [StringSlice(start=entity.start, end=entity.end)]
+                            if entity.start is not None and entity.end is not None
+                            else None
+                        ),
+                        source=entity.source,
+                    ))
+
+                _push_status(ctx.deps, f"── Evaluation complete: {sum(1 for r in results if not isinstance(r, Exception))}/{n_hits} summaries")
+
+                return LitSearchResult(
+                    answer="",
+                    search_str=search_queries,
+                    results=lit_results,
+                )
 
             result = await asyncio.wait_for(
                 _search_and_evaluate(),

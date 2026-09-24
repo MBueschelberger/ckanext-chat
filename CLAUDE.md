@@ -38,9 +38,9 @@ front_agent / research_agent  (Orchestrator)
   │     └── ckan_action()                       (generic: any CKAN action via merge_with_smart_defaults)
   ├── ckan_run(action, params)                  → direct bypass (merge_with_smart_defaults, all actions incl. _create/_patch)
   ├── find_relevant_groups(query)               → group_selector_agent (paginates group_list, selects 1-2 relevant slugs)
-  ├── literature_search(q, queries, groups)     → direct pipeline: rag_search_direct + evaluation_agent
+  ├── literature_search(q, queries, groups)     → direct pipeline: rag_search_direct + parallel summary_agent calls
   │     ├── rag_search_direct()                 (Milvus vector search + chunk text loading, no LLM)
-  │     └── evaluation_agent                    (structured-output LLM call for chunk assessment → LitSearchResult)
+  │     └── summary_agent × N                   (parallel per-source summary calls → SourceSummary, metadata from Milvus)
   └── literature_analyse(doc)                   → doc_agent (document analysis, only from orchestrator)
 ```
 
@@ -48,7 +48,7 @@ front_agent / research_agent  (Orchestrator)
 - `research_agent` — deep research mode (5-phase workflow, max ~25 tool calls, uses think_model)
 - `ckan_agent` — autonomous CKAN explorer with generic `ckan_action` tool → `CKANExploreResult`
 - `group_selector_agent` — selects 1-2 most relevant CKAN group slugs for a search topic → `GroupSelectorResult`
-- `evaluation_agent` — evaluates vector search results, writes summaries per source → `LitSearchResult` (no tools, single structured-output call)
+- `summary_agent` — per-source summary generation (parallel calls, one per RagHit) → `SourceSummary` (no tools, structured-output); metadata (title, source, authors, string_slices) comes from Milvus `VectorMeta`
 - `doc_agent` — document analysis with fuzzy text extraction → `AnalyseResult`
 
 ### RAG Search Pipeline (`rag_search_direct`)
@@ -257,7 +257,7 @@ The pipe function `iwm_rag_streaming.py` connects Open WebUI to the CKAN chat en
 
 ## Timeout & Retry Strategy
 
-- `literature_search`: timeout 90s covers both `rag_search_direct` + `evaluation_agent` call combined, **no retry on timeout** (other error types still retry up to `MAX_RETRIES_LITERATURE_SEARCH`)
+- `literature_search`: timeout 90s covers `rag_search_direct` + parallel `summary_agent` calls combined, **no retry on timeout** (other error types still retry up to `MAX_RETRIES_LITERATURE_SEARCH`)
 - `literature_analyse`: timeout 180s (large documents like 50k+ char markdown need more processing time for the `doc_agent`)
 - `ckan_run`: timeout 90s (unchanged)
 

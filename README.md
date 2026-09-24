@@ -18,7 +18,7 @@ User --> Chat UI (/chat)  --> front_agent / research_agent
          ckan_run /       find_relevant_groups   literature_search   literature_analyse
          mcp_call/mcp_tools       |                    |                   |
               |          group_selector_agent    rag_search_direct      doc_agent
-              v                   |              + evaluation_agent        |
+              v                   |              + summary_agent × N       |
       CKAN actions or     1-2 group slugs         Milvus vector       Document text
       MCP JSON-RPC        (all groups paged)      store (RAG)         extraction
 ```
@@ -28,7 +28,7 @@ User --> Chat UI (/chat)  --> front_agent / research_agent
 - **research_agent** -- deep multi-source research with literature search + analysis (max ~25 tool calls)
 - **ckan_agent** -- autonomous CKAN explorer for open-ended dataset discovery
 - **group_selector_agent** -- selects 1-2 relevant CKAN group slugs for a search topic; paginates `group_list` to cover all groups regardless of instance size
-- **evaluation_agent** -- evaluates vector search results, creates structured citations (single LLM call, no tools)
+- **summary_agent** -- per-source summary generation (parallel calls, one per search hit); metadata (title, authors, source) from Milvus
 - **doc_agent** -- targeted document section extraction and analysis
 
 ## ckanext-mcp Integration
@@ -240,13 +240,14 @@ Without these, the literature search agent relies on `package_search`.
 | `ckanext.chat.provider` | `azure` | `azure` or `openai` |
 | `ckanext.chat.base_url` | | Model provider endpoint URL |
 | `ckanext.chat.api_key` | | API key for the model provider |
-| `ckanext.chat.model_name` | `gpt-4o-mini` | Model for front_agent, ckan_agent, evaluation_agent, doc_agent, group_selector_agent |
+| `ckanext.chat.model_name` | `gpt-4o-mini` | Model for front_agent, ckan_agent, summary_agent, doc_agent, group_selector_agent |
 | `ckanext.chat.think_model_name` | | Model for research_agent (falls back to model_name) |
 | `ckanext.chat.api_version` | `2024-06-01` | Azure API version |
 | `ckanext.chat.milvus_url` | | Milvus vector store URL |
 | `ckanext.chat.collection_name` | | Milvus collection name |
 | `ckanext.chat.embedding_model` | `text-embedding-3-small` | Embedding model name |
 | `ckanext.chat.embedding_api` | | Embedding API endpoint |
+| `ckanext.chat.summary_max_tokens` | `4096` | Max tokens for per-source summary LLM calls |
 | `ckanext.chat.ssl_verify` | `true` | Verify SSL certificates for resource downloads |
 | `ckanext.chat.completion_url` | | (legacy) Azure endpoint, use `base_url` instead |
 | `ckanext.chat.api_token` | | (legacy) API key, use `api_key` instead |

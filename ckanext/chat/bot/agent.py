@@ -858,9 +858,10 @@ ckan_agent = Agent(
 )
 
 
+summary_max_tokens = int(toolkit.config.get("ckanext.chat.summary_max_tokens", 4096))
 summary_model_settings = OpenAIModelSettings(
     model_name=deployment,
-    max_tokens=512,
+    max_tokens=summary_max_tokens,
 )
 
 summary_agent = Agent(

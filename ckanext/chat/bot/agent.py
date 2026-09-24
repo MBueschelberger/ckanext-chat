@@ -410,68 +410,53 @@ summary_prompt = (
 # --------------------- Updated Document Agent Prompt ---------------------
 
 doc_prompt = (
-    "You analyze documents efficiently to answer questions using adaptive navigation strategies.\n\n"
-    
+    "You analyze documents efficiently to answer questions.\n\n"
+
     "PROCESS:\n"
-    "Step 1: Quick scan for structure (1 tool call)\n"
-    "- Use `get_text_slice(offset=0, length=10000)` to scan beginning\n"
-    "- Look for Table of Contents (ToC) or section headings\n"
-    "- If ToC exists: extract section names and estimate locations\n"
-    "- If no ToC: assume standard structure (Abstract, Intro, Methods, Results, Discussion, Conclusion)\n\n"
-    
-    "Step 2: Identify relevant sections (analysis, no tool calls)\n"
-    "- Based on the question, determine which 2-3 sections likely contain answers\n"
-    "- Prioritize: Results > Discussion > Methods > Introduction\n"
-    "- For definitions: Introduction or Methods\n"
-    "- For findings: Results or Discussion\n\n"
-    
-    "Step 3: Jump to relevant sections (2-3 tool calls)\n"
-    "- Use `precise_text_slice(start_str, end_str)` to navigate directly\n"
-    "- Use exact 10-20 character substrings from section headings\n"
-    "- Start with most promising section first\n"
-    "- Extract text_slice for each relevant passage\n"
-    "- IMPORTANT: Never change text_slice.url - it's auto-generated for highlighting\n\n"
-    
-    "Step 4: Refine best passages (1-2 tool calls if needed)\n"
-    "- If initial extraction is too broad, use precise_text_slice to narrow down\n"
-    "- Extract 2-5 most relevant passages total\n"
-    "- Each passage should directly answer part of the question\n"
-    "- Skip table of contents text - extract actual content\n\n"
-    
-    "Step 5: Synthesize answer\n"
+    "Step 1: Scan for structure (1 tool call)\n"
+    "- Use `get_text_slice(offset=0, length=10000)` to find ToC or section headings\n"
+    "- Identify ALL sections relevant to the question (2-4 sections)\n"
+    "- If no ToC: assume standard structure (Abstract, Intro, Methods, Results, Discussion, Conclusion)\n"
+    "- If document is short (<5000 chars), this single call may already contain the answer\n\n"
+
+    "Step 2: Batch-extract ALL relevant sections IN ONE TURN\n"
+    "- Call `precise_text_slice(...)` or `get_text_slice(...)` for EACH relevant section\n"
+    "- Return ALL tool calls in a SINGLE response — do NOT extract one section at a time\n"
+    "- The system executes parallel tool calls concurrently — no speed penalty\n"
+    "- Use exact 10-20 character substrings from section headings for start_str/end_str\n"
+    "- IMPORTANT: Never change text_slice.url — it is auto-generated for highlighting\n\n"
+
+    "Step 3: Synthesize answer (or one refinement batch)\n"
+    "- If all needed information is present: produce final answer\n"
+    "- If a section was insufficient (e.g. ToC snippet instead of body text):\n"
+    "  make ONE more batch of calls (e.g. with occurrence=2), then answer\n"
     "- Write coherent response synthesizing all findings\n"
     "- Cite every passage using: [Source Name](text_slice.url)\n"
     "- Every claim must have a citation\n"
     "- Include doc.url as source in output\n\n"
-    
+
     "STRICT LIMITS:\n"
-    "- Maximum 5 tool calls total (1 scan + 4 extractions)\n"
+    "- Maximum 3 turns total (1 scan + 1-2 extraction batches)\n"
+    "- Each batch may contain up to 4 parallel tool calls\n"
+    "- Maximum 8 tool calls total across all turns\n"
     "- Do NOT read linearly through the document\n"
-    "- Do NOT extract more than 5 passages\n"
-    "- If document is short (<5000 chars), one get_text_slice may suffice\n\n"
-    
-    "EFFICIENCY:\n"
-    "- Jump directly to relevant sections using ToC/headings\n"
-    "- Avoid redundant extractions\n"
-    "- Stop when you have 2-3 high-quality passages that answer the question\n"
-    "- Quality over quantity\n\n"
-    
+    "- Do NOT extract more than 5 passages\n\n"
+
     "DUPLICATE MATCHES:\n"
-    "- Heading strings may appear multiple times (e.g. in a Table of Contents AND in the body)\n"
-    "- If a `precise_text_slice` result is unexpectedly short or lacks actual content,\n"
-    "  retry with `occurrence=2` to find the next match in the document\n\n"
+    "- Heading strings may appear in ToC AND in the body\n"
+    "- If a result is unexpectedly short or lacks content, use `occurrence=2` in the next batch\n\n"
 
     "FALLBACK STRATEGY:\n"
-    "- If `precise_text_slice` fails 2+ times (not found or only TOC snippets),\n"
+    "- If `precise_text_slice` fails (not found or only ToC snippets),\n"
     "  switch to `get_text_slice(offset, length)` using an estimated character offset\n"
-    "- Estimate offset from document position: e.g. if ToC says section is on page N\n"
-    "  of a document with P pages, try offset ≈ (N/P) × total_chars\n"
-    "- Use length=15000 to capture a full section, then refine if needed\n\n"
+    "- Estimate offset from document position: if ToC says section is at relative position P,\n"
+    "  try offset ≈ P × total_chars\n"
+    "- Use length=15000 to capture a full section\n\n"
 
     "IMPORTANT:\n"
-    "- text_slice.url points to highlighted passages - use them for citations\n"
+    "- text_slice.url points to highlighted passages — use them for citations\n"
     "- Use exact substrings (10-20 chars) for start_str and end_str\n"
-    "- Simulate how a skilled researcher navigates, not linear reading\n"
+    "- Batch your extractions: one turn with 3-4 tool calls, not 3-4 turns with 1 call each\n"
 )
 
 

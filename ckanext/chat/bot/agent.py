@@ -354,7 +354,13 @@ class LitResult(BaseModel):
     authors: str = ""
     string_slices: Optional[list[StringSlice]]
     source: Optional[HttpUrl] = None
-    #view_url: Optional[list[HttpUrl]] = None
+    dataset_id: Optional[str] = None
+    resource_id: Optional[str] = None
+    notes: Optional[str] = None
+    tags: Optional[List[str]] = None
+    extras: Optional[Dict[str, str]] = None
+    groups: Optional[List[str]] = None
+    organization: Optional[str] = None
 
 
 class SourceSummary(BaseModel):
@@ -1925,6 +1931,34 @@ async def find_relevant_groups(ctx: RunContext[Deps], query: str) -> str:
     return json.dumps({"groups": selected, "reasoning": reasoning})
 
 
+async def _fetch_dataset_metadata(deps, dataset_ids: List[str]) -> Dict[str, dict]:
+    """Fetch CKAN package metadata for unique dataset IDs in parallel."""
+    if not dataset_ids:
+        return {}
+
+    async def _fetch_one(dataset_id: str):
+        try:
+            response, _ = await _ckan_fetch_data(deps, "package_show", {"id": dataset_id})
+            if isinstance(response, dict):
+                return dataset_id, response
+        except Exception as e:
+            log.warning(f"_fetch_dataset_metadata failed for {dataset_id}: {e}")
+        return dataset_id, None
+
+    results = await asyncio.gather(
+        *[_fetch_one(did) for did in dataset_ids],
+        return_exceptions=True,
+    )
+    metadata = {}
+    for result in results:
+        if isinstance(result, Exception):
+            continue
+        did, data = result
+        if data:
+            metadata[did] = data
+    return metadata
+
+
 def _serialize_single_hit(hit: RagHit, search_question: str, max_chars_per_chunk: int = 600) -> str:
     entity = hit.entity
     parts = [
@@ -1994,10 +2028,18 @@ async def literature_search(
                     )
                     return r.output
 
-                results = await asyncio.gather(
-                    *[_summarize_one(hit) for hit in hits],
-                    return_exceptions=True,
+                unique_dataset_ids = list(set(
+                    hit.entity.dataset_id for hit in hits if hit.entity.dataset_id
+                ))
+
+                summary_results, dataset_metadata = await asyncio.gather(
+                    asyncio.gather(
+                        *[_summarize_one(hit) for hit in hits],
+                        return_exceptions=True,
+                    ),
+                    _fetch_dataset_metadata(ctx.deps, unique_dataset_ids),
                 )
+                results = summary_results
 
                 lit_results = []
                 for hit, summary_result in zip(hits, results):
@@ -2008,6 +2050,7 @@ async def literature_search(
                     else:
                         summary_text = summary_result.summary
 
+                    pkg = dataset_metadata.get(entity.dataset_id, {})
                     lit_results.append(LitResult(
                         title=entity.title or "Unknown",
                         summary=summary_text,
@@ -2018,6 +2061,13 @@ async def literature_search(
                             else None
                         ),
                         source=entity.source,
+                        dataset_id=entity.dataset_id,
+                        resource_id=entity.resource_id,
+                        notes=pkg.get("notes"),
+                        tags=[t["name"] for t in pkg.get("tags", [])] if pkg.get("tags") else None,
+                        extras={e["key"]: e["value"] for e in pkg.get("extras", [])} if pkg.get("extras") else None,
+                        groups=[g["name"] for g in pkg.get("groups", [])] if pkg.get("groups") else None,
+                        organization=(pkg.get("organization") or {}).get("title"),
                     ))
 
                 _push_status(ctx.deps, f"── Evaluation complete: {sum(1 for r in results if not isinstance(r, Exception))}/{n_hits} summaries")

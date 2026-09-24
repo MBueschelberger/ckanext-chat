@@ -362,7 +362,6 @@ class SourceSummary(BaseModel):
 
 
 class LitSearchResult(BaseModel):
-    answer: str = ""
     search_str: Optional[list[str]] = None
     results: Optional[list[LitResult]] = None
     error: Optional[List[str]] = None
@@ -1956,7 +1955,7 @@ async def literature_search(
                     ctx, search_queries, limit=num_results, groups=groups,
                 )
                 if not hits:
-                    return LitSearchResult(answer="", results=[], search_str=search_queries)
+                    return LitSearchResult(results=[], search_str=search_queries)
 
                 n_hits = len(hits)
                 _push_status(ctx.deps, f"── Evaluating {n_hits} sources in parallel")
@@ -2000,7 +1999,6 @@ async def literature_search(
                 _push_status(ctx.deps, f"── Evaluation complete: {sum(1 for r in results if not isinstance(r, Exception))}/{n_hits} summaries")
 
                 return LitSearchResult(
-                    answer="",
                     search_str=search_queries,
                     results=lit_results,
                 )
@@ -2019,7 +2017,6 @@ async def literature_search(
             _push_status(ctx.deps, f"Literature search complete ({duration_ms/1000:.1f}s, {len(results)} sources){src_info}")
             log.info(f"literature_search completed: attempt={attempt+1}, duration_ms={duration_ms:.0f}")
             output_json = result.model_dump_json()
-            _push_status(ctx.deps, f"Literature search Output {json.dumps(output_json, indent=2)}")
             log.debug(f"literature_search output: {output_json[:2000]}")
 
             return output_json
@@ -2028,35 +2025,35 @@ async def literature_search(
             ctx.deps.seen_chunk_ids = seen_before
             duration_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
             log.warning(f"literature_search timeout on attempt {attempt+1}/{config.MAX_RETRIES_LITERATURE_SEARCH}, duration_ms={duration_ms:.0f}, seen_ids rolled back")
-            return json.dumps({"answer": "", "error": [f"Literature search timed out after {duration_ms/1000:.0f}s"]})
+            return json.dumps({"error": [f"Literature search timed out after {duration_ms/1000:.0f}s"]})
 
         except UsageLimitExceeded as e:
             ctx.deps.seen_chunk_ids = seen_before
             log.error(f"literature_search usage limit exceeded on attempt {attempt+1}: {e}, seen_ids rolled back")
-            return json.dumps({"answer": "", "error": [f"Token limit exceeded: {str(e)}"]})
+            return json.dumps({"error": [f"Token limit exceeded: {str(e)}"]})
 
         except ModelHTTPError as e:
             ctx.deps.seen_chunk_ids = seen_before
             log.error(f"literature_search API error on attempt {attempt+1}: status={e.status_code if hasattr(e, 'status_code') else 'unknown'}, seen_ids rolled back")
             if attempt == config.MAX_RETRIES_LITERATURE_SEARCH - 1:
-                return json.dumps({"answer": "", "error": [f"API error: {str(e)}"]})
+                return json.dumps({"error": [f"API error: {str(e)}"]})
             continue
 
         except UnexpectedModelBehavior as e:
             ctx.deps.seen_chunk_ids = seen_before
             log.error(f"literature_search model behavior error on attempt {attempt+1}: {str(e)[:200]}, seen_ids rolled back")
             if attempt == config.MAX_RETRIES_LITERATURE_SEARCH - 1:
-                return json.dumps({"answer": "", "error": [f"Model output validation failed: {str(e)}"]})
+                return json.dumps({"error": [f"Model output validation failed: {str(e)}"]})
             continue
 
         except Exception as e:
             ctx.deps.seen_chunk_ids = seen_before
             log.error(f"literature_search unexpected error on attempt {attempt+1}: error_type={type(e).__name__}, error={str(e)[:200]}, seen_ids rolled back")
             if attempt == config.MAX_RETRIES_LITERATURE_SEARCH - 1:
-                return json.dumps({"answer": "", "error": [f"Literature search failed: {type(e).__name__}: {str(e)[:200]}"]})
+                return json.dumps({"error": [f"Literature search failed: {type(e).__name__}: {str(e)[:200]}"]})
             continue
 
-    return json.dumps({"answer": "", "error": ["All literature_search retries exhausted"]})
+    return json.dumps({"error": ["All literature_search retries exhausted"]})
 
 
 _DATASET_URL_RE = re.compile(
